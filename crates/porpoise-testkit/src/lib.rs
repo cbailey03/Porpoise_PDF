@@ -199,27 +199,61 @@ pub fn minimal_pdf() -> Vec<u8> {
 /// rather than hardcoded, so this stays correct as the object bodies change.
 #[must_use]
 pub fn single_page_pdf(width_pt: u32, height_pt: u32) -> Vec<u8> {
-    let content = format!(
-        "0 0 1 rg\n20 20 {} {} re\nf\n",
-        width_pt.saturating_sub(40),
-        height_pt.saturating_sub(40)
-    )
-    .into_bytes();
+    multi_page_pdf(1, width_pt, height_pt)
+}
 
-    let mut stream_object = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
-    stream_object.extend_from_slice(&content);
-    stream_object.extend_from_slice(b"\nendstream");
+/// Synthesizes a valid PDF of `pages` identically sized pages.
+///
+/// Each page carries a filled rectangle whose height shrinks with the page index,
+/// so a rendering of page N is distinguishable from page M. Tests that navigate
+/// need that: a fixture whose pages are pixel-identical cannot tell a successful
+/// `go_to_page` from a silent no-op.
+///
+/// `pages` is clamped to at least one.
+#[must_use]
+pub fn multi_page_pdf(pages: usize, width_pt: u32, height_pt: u32) -> Vec<u8> {
+    let pages = pages.max(1);
 
-    let objects: Vec<Vec<u8>> = vec![
+    // Objects 1 and 2 are the catalog and the page tree; each page then takes two
+    // objects, a page dictionary followed by its content stream.
+    let first_page_object = 3;
+    let kids: Vec<String> = (0..pages)
+        .map(|index| format!("{} 0 R", first_page_object + index * 2))
+        .collect();
+
+    let mut objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
         format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width_pt} {height_pt}] \
-             /Contents 4 0 R /Resources << >> >>"
+            "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+            kids.join(" ")
         )
         .into_bytes(),
-        stream_object,
     ];
+
+    for index in 0..pages {
+        let page_object = first_page_object + index * 2;
+        let content_object = page_object + 1;
+
+        // Shrink the rectangle a little per page so renders differ visibly.
+        let inset = 20 + u32::try_from(index).unwrap_or(0) * 5;
+        let box_width = width_pt.saturating_sub(inset * 2).max(1);
+        let box_height = height_pt.saturating_sub(inset * 2).max(1);
+        let content =
+            format!("0 0 1 rg\n{inset} {inset} {box_width} {box_height} re\nf\n").into_bytes();
+
+        let mut stream_object = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream_object.extend_from_slice(&content);
+        stream_object.extend_from_slice(b"\nendstream");
+
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width_pt} {height_pt}] \
+                 /Contents {content_object} 0 R /Resources << >> >>"
+            )
+            .into_bytes(),
+        );
+        objects.push(stream_object);
+    }
 
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n");

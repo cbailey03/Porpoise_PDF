@@ -1,7 +1,8 @@
 # Goal 2 — Complete programmatic control
 
-**Status: planned, not started.** Written 2026-07-29, immediately after the Goal 1 audit
-(`goal-1-plan.md` §6b) and before any code moved.
+**Status: complete.** M7–M10 all shipped 2026-07-29. Written immediately after the Goal 1 audit
+(`goal-1-plan.md` §6b) and before any code moved; §10 records what building it actually taught us,
+including two design errors this document got wrong.
 
 Goal 1 built a viewer a person can use. Goal 2 makes every part of it reachable from code, so an AI
 agent can operate the program on a user's behalf. This document argues the design before the
@@ -291,10 +292,10 @@ controllable" — the build breaks if it is not.
 
 | | Deliverable | Proves |
 |---|---|---|
-| **M7** | `ViewCommand`, `ViewState`, `apply` in `porpoise-view`, pure and fully tested. `Viewer` rewired so keyboard and toolbar emit commands; direct method calls deleted. `Command` wrapper in `porpoise-app`. **No behaviour change** — the program does exactly what it does today. | One path into every state change. The foundation exists. |
-| **M8** | `ViewSnapshot`, the event stream, and `Idle`. Status bar reads the snapshot. Still no transport. | The program can describe itself. |
-| **M9** | `porpoise serve`: NDJSON over stdio, serde feature, command decoding hardened and fuzzed. | An outside process can drive it. |
-| **M10** | An end-to-end test in CI that launches the real binary, opens a document over stdio, navigates to a page, waits for `Idle`, captures, and asserts on the result. | **Goal 2 is real**, not asserted. |
+| **M7** ✅ | `ViewCommand`, `ViewState`, `apply` in `porpoise-view`, pure and fully tested. `Viewer` rewired so keyboard and toolbar emit commands; direct method calls deleted. `Command` wrapper in `porpoise-app`. **No behaviour change** — verified by re-running the screenshot, benchmark and time-to-first-page checks and comparing. | One path into every state change. The foundation exists. |
+| **M8** ✅ | `ViewSnapshot`, `Snapshot`, the event stream, and `Idle`. Status bar reads the snapshot. Still no transport. | The program can describe itself. |
+| **M9** ✅ | `porpoise serve`: NDJSON over stdio, `serde` as an optional feature of `porpoise-view`, hand-written decoding with per-command errors, a line-length cap, and resynchronization after a bad line. | An outside process can drive it. |
+| **M10** ✅ | Five end-to-end tests that launch the real binary and talk to it over a real pipe: navigate + capture + verify the PNG, open a document not on the command line, survive malformed input, refuse a bad page without moving, and exit when stdin closes. | **Goal 2 is real**, not asserted. |
 
 **M10 is not optional.** Without it, "an AI agent can drive the whole program" is exactly the kind of
 untested claim this project has refused everywhere else. It is also the milestone that will find the
@@ -307,12 +308,45 @@ and forms land, the same conversion is a rewrite nobody schedules.
 
 ---
 
+## 7a. What building it changed
+
+Three things this document got wrong or left out, recorded because the reasoning is more useful than
+the conclusion.
+
+**`current_page` did not round-trip with `GoToPage`, and M10 caught it in its first run.** It was
+defined as the page under the viewport's *centre*, which reads well in a status bar. But a viewport
+taller than a page — a small page, or any page at fit-width in a wide window — has its centre inside
+the *next* page. So `go_to_page(3)` scrolled correctly to 936 pt and then reported page 4. Three of
+the five end-to-end tests failed on this one cause.
+
+The fix was to anchor to the topmost visible page. Worth noting that the obvious alternative, "the
+page occupying most of the view", has the same flaw: after navigating to page N with three pages on
+screen, page N+1 can occupy more of the viewport than N does. Anchoring to the top is the only
+definition under which navigating somewhere and asking where you are agree — which is the first
+property an agent relies on, and was not a property this plan thought to state.
+
+**A zoom change has to force a scroll request even when the position is unchanged.** Scroll position
+is in points, which are zoom-independent; the shell's offset is in pixels, which are not. So after
+changing zoom, our position is the same by our own measure while egui's offset now points somewhere
+else in the document. Suppressing the "redundant" request left the view wherever the stale pixel
+offset landed. §2's ownership split is right, but it has this consequence and the plan did not say so.
+
+**Mode-dependence belongs in the key handler, and that fell out of the model rather than being
+designed.** `PageDown` means "next page" in paged mode and "next screenful" in free mode. Putting
+that inside `NextPage` would mean an agent could never be sure what the command would do, so the key
+handler chooses between `NextPage` and `ScrollByViewports` instead. `NextPage` is now unambiguous in
+every mode. This is a small thing that makes the command set much easier to reason about, and it only
+became visible once commands had to be nameable from outside.
+
 ## 8. Open decisions
 
-1. **Does an agent get a window at all?** A headless mode — commands and snapshots with no visible
-   window — is plainly useful for automation and testing, and `--screenshot` already proves the
-   render path works without a person watching. But it doubles the number of configurations to test.
-   Leaning: defer past M10, then reconsider with a real use case.
+1. **Does an agent get a window at all?** Still open, and now with a concrete cost attached: because
+   `porpoise serve` opens a window, M10 needs a display *and* a GPU adapter wgpu will accept. The
+   Windows CI runner supplies both. On Linux, xvfb gives a display but not an adapter — that needs a
+   software Vulkan or GL stack (lavapipe / llvmpipe) which is not wired up, so the end-to-end job
+   runs on Windows only. A headless mode would remove that asymmetry as a side effect. The tests skip
+   themselves loudly rather than silently when `PORPOISE_E2E` is unset, so a headless `cargo test`
+   neither fails nor pretends to have covered this.
 2. **How much history does the event stream keep?** An agent that connects late, or reads slowly,
    will miss events. A small ring buffer replayed on connect is the usual answer. Needs a decision
    before M9, not before M7.

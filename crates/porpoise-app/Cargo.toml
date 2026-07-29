@@ -15,14 +15,25 @@ path = "src/main.rs"
 [dependencies]
 porpoise-doc.workspace = true
 porpoise-render.workspace = true
-porpoise-view.workspace = true
+# `serde` here, not behind a feature of our own: this crate *is* the shell that
+# owns the wire format, so gating it would serve nobody.
+porpoise-view = { workspace = true, features = ["serde"] }
 clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 # Default features already select the wgpu backend in 0.35 (glow is now opt-in),
 # plus AccessKit, so there is nothing to override.
 eframe.workspace = true
+
+[dev-dependencies]
+# Fixtures for the end-to-end control test. Dev-only, so it cannot reach the
+# shipped binary — the `no-native-deps` CI job inspects `--edges normal` and would
+# catch it if it did.
+porpoise-testkit.workspace = true
+png.workspace = true
 
 [lints]
 workspace = true

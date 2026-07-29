@@ -14,6 +14,7 @@ publish = false
 porpoise-doc = { path = "crates/porpoise-doc" }
 porpoise-render = { path = "crates/porpoise-render" }
 porpoise-view = { path = "crates/porpoise-view" }
+porpoise-testkit = { path = "crates/porpoise-testkit" }
 
 # --- PDF: parsing and rendering (see docs/goal-1-plan.md, section 1) ---
 hayro = "0.7.1"
@@ -39,6 +40,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 clap = { version = "4.6", features = ["derive"] }
+# The control channel's wire format (docs/goal-2-plan.md, section 4). Both are
+# already in the tree via the eframe stack, so this adds a direct edge rather
+# than new code.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # Used directly rather than through `image`, which would require cloning the
 # whole page buffer to hand it an owned Vec. Already in the tree via hayro.
 png = "0.18"

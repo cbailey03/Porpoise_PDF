@@ -4,7 +4,10 @@
 //! and `render` rasterizes one page to a PNG. See `docs/goal-1-plan.md`,
 //! section 4.
 
+mod command;
+mod control;
 mod devtools;
+mod protocol;
 mod viewer;
 
 use std::error::Error;
@@ -86,12 +89,24 @@ enum Command {
     Info(InfoArgs),
     /// Rasterize a single page to a PNG.
     Render(RenderArgs),
+    /// Open a window driven by commands on stdin, reporting on stdout.
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
 struct InfoArgs {
     /// The PDF to inspect.
     file: PathBuf,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// A PDF to open immediately. Optional — send an `open` command instead.
+    file: Option<PathBuf>,
+
+    /// Open scrolled to this page, counting from 1.
+    #[arg(long, requires = "file")]
+    start_page: Option<usize>,
 }
 
 #[derive(Args)]
@@ -134,6 +149,7 @@ fn main() -> ExitCode {
     let outcome = match cli.command {
         Some(Command::Info(args)) => run_info(&args),
         Some(Command::Render(args)) => run_render(&args),
+        Some(Command::Serve(args)) => run_serve(&args),
         None => run_viewer(
             cli.file.as_deref(),
             cli.start_page,
@@ -249,29 +265,48 @@ fn run_viewer(
         Some(page) => Some(page_index(page, document.page_count(), file)?),
         None => None,
     };
-    let title = file.file_name().map_or_else(
-        || file.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
 
-    viewer::run(
-        document,
-        viewer::ViewerOptions {
-            title,
-            start_page: start_index,
-            devtools: viewer::DevOptions {
-                screenshot: screenshot.map(|path| devtools::ScreenshotRequest {
-                    path: path.to_path_buf(),
-                    // A few frames so the first real render is on screen before
-                    // capturing.
-                    warmup_frames: 3,
-                    budget_frames: 240,
-                }),
-                benchmark_frames: scroll_benchmark,
-                report_first_page_from,
-            },
+    viewer::run(viewer::ViewerOptions {
+        document: Some((file.to_path_buf(), document)),
+        start_page: start_index,
+        control: None,
+        devtools: viewer::DevOptions {
+            screenshot: screenshot.map(Path::to_path_buf),
+            benchmark_frames: scroll_benchmark,
+            report_first_page_from,
         },
-    )
+    })
+}
+
+/// Opens a window driven by commands on stdin.
+///
+/// The document is optional: an agent can send `open` instead. Diagnostics already
+/// go to stderr, so stdout carries nothing but the protocol.
+fn run_serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
+    let document = match &args.file {
+        Some(file) => {
+            let document = Document::open(file)?;
+            Some((file.clone(), document))
+        }
+        None => None,
+    };
+
+    let start_index = match (args.start_page, &document) {
+        (Some(page), Some((file, document))) => {
+            Some(page_index(page, document.page_count(), file)?)
+        }
+        // clap's `requires = "file"` makes this unreachable, but returning rather
+        // than panicking keeps the invariant local.
+        (Some(_), None) => return Err("--start-page needs a file".into()),
+        (None, _) => None,
+    };
+
+    viewer::run(viewer::ViewerOptions {
+        document,
+        start_page: start_index,
+        control: Some(control::Control::stdio()),
+        devtools: viewer::DevOptions::default(),
+    })
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {

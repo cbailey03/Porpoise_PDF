@@ -6,7 +6,7 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: Goal 1 is complete.** Open a PDF, scroll it freely or page by page,
+**Current state: Goals 1 and 2 are complete.** Open a PDF, scroll it freely or page by page,
 navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Pages rasterize on worker threads
 so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
 than four hundred pages' worth, and a synthetic scroll of 40 pages per second holds a 60 fps median
@@ -41,7 +41,7 @@ sections 1 and 6a.
 |---|---|
 | `porpoise-doc` | Opens a PDF; page count and per-page geometry. Knows nothing about rendering. |
 | `porpoise-render` | Rasterizes pages to RGBA, behind a swappable `Renderer` trait. |
-| `porpoise-view` | GUI-agnostic viewport logic: scroll layout, virtualization, cache policy. |
+| `porpoise-view` | GUI-agnostic viewport logic: scroll layout, virtualization, cache policy, and the command model. |
 | `porpoise-app` | The `porpoise` binary. |
 | `porpoise-testkit` | Fixtures, pixel diffing, and the malformed-input mutation harness. |
 
@@ -81,6 +81,42 @@ cargo run -p porpoise-app -- render path/to/file.pdf --page 1 --dpi 150 -o page1
 
 Page numbers start at 1. `--dpi` is a friendlier spelling of `--scale`, where `--scale 1.0` is
 72 DPI; the two conflict and cannot be combined.
+
+## Driving it from another program
+
+Every effect in the viewer is reachable by a named command, so a script or an AI
+agent can operate it. `porpoise serve` opens a window and reads newline-delimited
+JSON on stdin, replying and reporting events on stdout:
+
+```bash
+porpoise serve document.pdf
+```
+
+```text
+in   {"id":1,"command":"go_to_page","page":4}
+out  {"id":1,"ok":true,"outcome":"changed"}
+out  {"event":"page_rendered","page":4}
+out  {"event":"idle"}
+in   {"id":2,"command":"capture","path":"page5.png"}
+out  {"id":2,"ok":true,"outcome":"capturing"}
+out  {"event":"captured","path":"page5.png"}
+```
+
+Send `{"command":"commands"}` for the full list and `{"command":"snapshot"}` for the
+current state. The file argument is optional — send `{"command":"open","path":"…"}`
+instead.
+
+Two things worth knowing:
+
+- **Wait for `idle` before capturing or asserting.** It means nothing is queued and
+  everything visible is drawn. Acting before it gets you placeholder tiles.
+- **Closing stdin exits the program**, the way every other stdio protocol behaves.
+
+This is off unless you ask for it, and it is stdio only — no port is opened. Be
+clear about what you are granting: the controlling process can open any file you can
+read, see it rendered, and write a PNG anywhere you can write. It runs as you
+already, so this is not an escalation, but it is more than "a viewer". See
+`docs/goal-2-plan.md` section 5.
 
 ## Diagnostics
 

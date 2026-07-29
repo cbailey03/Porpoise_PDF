@@ -10,6 +10,18 @@ publish.workspace = true
 
 [dependencies]
 porpoise-doc.workspace = true
+thiserror.workspace = true
+# Optional so the wire format stays the shell's concern; this crate is worth
+# keeping dependency-light. See docs/goal-2-plan.md, section 4.
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dev-dependencies]
+# Only to prove the wire forms round-trip; the crate itself never encodes JSON.
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -18,11 +18,18 @@
 //! rasterizes on the CPU. So this needs no custom wgpu render pass; that only
 //! becomes relevant if we implement hayro's `Device` trait ourselves.
 //!
-//! Frame-time measurement and window capture live in [`crate::devtools`], not
-//! here.
+//! # Everything goes through a command
+//!
+//! Since Goal 2, no input path reaches view state directly. A key press, a
+//! toolbar click, and a message from an agent all produce a [`Command`], and
+//! [`Viewer::dispatch`] is the only thing that carries one out. That is what makes
+//! "every feature is programmatically controllable" structural rather than
+//! aspirational — there is no second way in to be forgotten about.
+//!
+//! Frame-time measurement and window capture live in [`crate::devtools`].
 
 use std::collections::HashMap;
-use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,12 +37,16 @@ use eframe::egui;
 use porpoise_doc::Document;
 use porpoise_render::{HayroRenderer, RenderError, RenderPool, RenderedPage};
 use porpoise_view::{
-    CacheKey, MAX_SCALE, MIN_SCALE, PageCache, ScrollLayout, ZoomBucket, request_order,
+    CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PageCache, ScrollLayout, ScrollMode, View,
+    ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
 };
 
+use crate::command::Command;
+use crate::control::Control;
 use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
 };
+use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 
 /// Vertical gap between pages, in PDF points.
 const PAGE_GAP_PT: f64 = 12.0;
@@ -88,6 +99,12 @@ const VIEWPORT_STEP_FRACTION: f64 = 0.9;
 /// How far an arrow key scrolls, in PDF points.
 const ARROW_STEP_PT: f64 = 48.0;
 
+/// Frames a command-triggered capture waits before asking.
+const CAPTURE_WARMUP_FRAMES: u32 = 3;
+
+/// Frames after which a capture gives up rather than leaving a window open.
+const CAPTURE_BUDGET_FRAMES: u32 = 240;
+
 /// A rasterization that failed, and whether it is worth another attempt.
 struct Failure {
     /// The renderer's own message, shown on the error tile.
@@ -132,42 +149,59 @@ impl Failure {
     }
 }
 
-/// How zoom is chosen each frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ZoomMode {
-    /// Fit the widest page to the viewport width.
-    FitWidth,
-    /// Fit the largest page entirely within the viewport.
-    FitPage,
-    /// An explicit factor, from the zoom keys or ctrl+wheel.
-    Fixed(f32),
+/// Everything that belongs to one open document.
+///
+/// Grouped so that opening another is a single replacement rather than eight
+/// fields to remember to reset — the kind of bookkeeping that goes wrong once a
+/// ninth is added.
+struct OpenDocument {
+    path: PathBuf,
+    document: Arc<Document>,
+    layout: ScrollLayout,
+    pool: RenderPool,
+    cache: PageCache<egui::TextureHandle>,
+    /// Requests submitted but not yet returned, so a page is not queued twice.
+    in_flight: Vec<CacheKey>,
+    /// Failures keyed by rasterization, not by page, so a different zoom is still
+    /// attempted. A timeout keeps a retry budget; see [`Failure::from_error`].
+    failures: HashMap<CacheKey, Failure>,
+    /// The rung work was last submitted for, to notice when zoom moves.
+    submitted_bucket: ZoomBucket,
 }
 
-impl ZoomMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::FitWidth => "fit width",
-            Self::FitPage => "fit page",
-            Self::Fixed(_) => "zoom",
+impl OpenDocument {
+    fn new(path: PathBuf, document: Document, bucket: ZoomBucket) -> Self {
+        let document = Arc::new(document);
+        let layout = ScrollLayout::vertical(document.geometry(), PAGE_GAP_PT);
+        let pool = RenderPool::new(
+            Arc::clone(&document),
+            HayroRenderer::new(),
+            RenderPool::recommended_workers(),
+            JOB_TIMEOUT,
+        );
+        Self {
+            path,
+            document,
+            layout,
+            pool,
+            cache: PageCache::new(TEXTURE_BUDGET_BYTES),
+            in_flight: Vec::new(),
+            failures: HashMap::new(),
+            submitted_bucket: bucket,
         }
     }
-}
 
-/// How navigation behaves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScrollMode {
-    /// Continuous scrolling; page-down moves by a viewport.
-    Free,
-    /// Page-down moves to the next page boundary.
-    Paged,
-}
+    /// Whether every requested page has arrived and nothing is outstanding.
+    fn settled(&self) -> bool {
+        self.in_flight.is_empty() && !self.pool.is_busy()
+    }
 
-impl ScrollMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Free => "free",
-            Self::Paged => "paged",
-        }
+    /// Rasterizations we have stopped trying to produce.
+    fn abandoned(&self) -> usize {
+        self.failures
+            .values()
+            .filter(|failure| failure.gave_up())
+            .count()
     }
 }
 
@@ -177,7 +211,7 @@ impl ScrollMode {
 #[derive(Default)]
 pub(crate) struct DevOptions {
     /// Capture the window to this path and exit.
-    pub(crate) screenshot: Option<ScreenshotRequest>,
+    pub(crate) screenshot: Option<PathBuf>,
     /// Scroll the whole document over this many frames, report, and exit.
     pub(crate) benchmark_frames: Option<u32>,
     /// Report time from this instant until the first page is painted, then exit.
@@ -186,36 +220,43 @@ pub(crate) struct DevOptions {
 
 /// How to open the viewer.
 pub(crate) struct ViewerOptions {
-    /// Window title, before the application name is appended.
-    pub(crate) title: String,
+    /// The document to show, if any. `None` opens an empty window, which is what
+    /// `porpoise serve` does when it expects an agent to send `open`.
+    pub(crate) document: Option<(PathBuf, Document)>,
     /// Scroll here on the first frame.
     pub(crate) start_page: Option<usize>,
+    /// An external process driving the program, if one asked to.
+    pub(crate) control: Option<Control>,
     /// See [`DevOptions`].
     pub(crate) devtools: DevOptions,
 }
 
 /// Opens the viewer window. Blocks until the window closes.
-pub(crate) fn run(
-    document: Document,
-    options: ViewerOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run(options: ViewerOptions) -> Result<(), Box<dyn std::error::Error>> {
     let wanted_screenshot = options.devtools.screenshot.is_some();
     let outcome: ScreenshotOutcome = Arc::new(Mutex::new(None));
+
+    let title = match &options.document {
+        Some((path, _)) => path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        None => "no document".to_owned(),
+    };
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([320.0, 240.0])
-            .with_title(format!("{} — Porpoise PDF", options.title)),
+            .with_title(format!("{title} — Porpoise PDF")),
         ..Default::default()
     };
 
-    let app_document = Arc::new(document);
     let app_outcome = Arc::clone(&outcome);
     eframe::run_native(
         "porpoise",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(Viewer::new(app_document, options, app_outcome)))),
+        Box::new(move |_cc| Ok(Box::new(Viewer::new(options, app_outcome)))),
     )?;
 
     if wanted_screenshot {
@@ -231,82 +272,65 @@ pub(crate) fn run(
 }
 
 struct Viewer {
-    document: Arc<Document>,
-    layout: ScrollLayout,
-    pool: RenderPool,
-
-    cache: PageCache<egui::TextureHandle>,
-    /// Requests submitted but not yet returned, so a page is not queued twice.
-    in_flight: Vec<CacheKey>,
-    /// Failures keyed by rasterization, not by page, so a different zoom is still
-    /// attempted. A timeout keeps a retry budget; see [`Failure::from_error`].
-    failures: HashMap<CacheKey, Failure>,
-
-    /// The zoom rung currently being rendered for.
-    bucket: ZoomBucket,
-    /// The unquantized display zoom, which is what pages are laid out at.
-    zoom: f32,
-    zoom_mode: ZoomMode,
-    scroll_mode: ScrollMode,
-
-    /// A scroll position requested by navigation, in points, applied next frame.
-    ///
-    /// Held in points rather than pixels so it stays correct if the zoom changes
-    /// in the same frame.
-    pending_scroll_pt: Option<f64>,
-    /// Top of the viewport as of the last frame, in points.
-    scroll_top_pt: f64,
-    /// Height of the viewport as of the last frame, in points.
-    viewport_height_pt: f64,
-
-    current_page: usize,
+    /// `None` until a document is opened.
+    open: Option<OpenDocument>,
+    /// Everything a command can change. The single source of truth for the view.
+    state: ViewState,
+    /// Measured from the window each frame; environment, not state.
+    viewport: Viewport,
 
     timing: FrameTiming,
 
-    /// Scroll here on the first frame, then leave the user in control.
+    /// Scroll here once a document is open, then leave the operator in control.
     start_page: Option<usize>,
     applied_start_page: bool,
 
     frame: u32,
     benchmark: Option<ScrollBenchmark>,
     screenshot: Option<Screenshotter>,
+    screenshot_outcome: ScreenshotOutcome,
     /// Set when asked to report launch-to-first-page; cleared once reported.
     first_page_from: Option<Instant>,
+
+    /// Present only under `porpoise serve`.
+    control: Option<Control>,
+    /// Events collected during a frame and flushed at the end of it.
+    pending_events: Vec<Event>,
+    /// The last state reported, so `ViewChanged` is emitted on change rather than
+    /// every frame.
+    last_reported: Option<Snapshot>,
+    /// Whether the pipeline was settled last frame, so `Idle` fires on the edge.
+    was_settled: bool,
 }
 
 impl Viewer {
-    fn new(document: Arc<Document>, options: ViewerOptions, outcome: ScreenshotOutcome) -> Self {
-        let layout = ScrollLayout::vertical(document.geometry(), PAGE_GAP_PT);
-        let devtools = options.devtools;
+    fn new(options: ViewerOptions, screenshot_outcome: ScreenshotOutcome) -> Self {
+        let state = ViewState::new();
+        let open = options
+            .document
+            .map(|(path, document)| OpenDocument::new(path, document, ZoomBucket::enclosing(1.0)));
 
-        let benchmark = devtools
-            .benchmark_frames
-            .map(|frames| ScrollBenchmark::new(frames, layout.content_height_pt()));
-        let screenshot = devtools
-            .screenshot
-            .map(|request| Screenshotter::new(request, outcome));
-        let pool = RenderPool::new(
-            Arc::clone(&document),
-            HayroRenderer::new(),
-            RenderPool::recommended_workers(),
-            JOB_TIMEOUT,
-        );
+        let benchmark = options.devtools.benchmark_frames.map(|frames| {
+            let height = open
+                .as_ref()
+                .map_or(0.0, |open| open.layout.content_height_pt());
+            ScrollBenchmark::new(frames, height)
+        });
+        let screenshot = options.devtools.screenshot.map(|path| {
+            Screenshotter::new(
+                ScreenshotRequest {
+                    path,
+                    warmup_frames: CAPTURE_WARMUP_FRAMES,
+                    budget_frames: CAPTURE_BUDGET_FRAMES,
+                },
+                Arc::clone(&screenshot_outcome),
+            )
+        });
 
         Self {
-            document,
-            layout,
-            pool,
-            cache: PageCache::new(TEXTURE_BUDGET_BYTES),
-            in_flight: Vec::new(),
-            failures: HashMap::new(),
-            bucket: ZoomBucket::enclosing(1.0),
-            zoom: 1.0,
-            zoom_mode: ZoomMode::FitWidth,
-            scroll_mode: ScrollMode::Free,
-            pending_scroll_pt: None,
-            scroll_top_pt: 0.0,
-            viewport_height_pt: 0.0,
-            current_page: 0,
+            open,
+            state,
+            viewport: Viewport::new(0.0, 0.0),
             timing: FrameTiming {
                 ui_ms: 0.0,
                 logic_ms: 0.0,
@@ -317,73 +341,218 @@ impl Viewer {
             frame: 0,
             benchmark,
             screenshot,
-            first_page_from: devtools.report_first_page_from,
+            screenshot_outcome,
+            first_page_from: options.devtools.report_first_page_from,
+            control: options.control,
+            pending_events: Vec::new(),
+            last_reported: None,
+            // Nothing has been requested yet, so the pipeline starts settled. Set
+            // deliberately: starting at `false` would emit a spurious `Idle` on the
+            // first frame, before anything had been asked for.
+            was_settled: true,
         }
     }
 
-    // --- Navigation ---------------------------------------------------------
-
-    /// Requests a scroll to `top_pt`, clamped to the document.
-    fn scroll_to_pt(&mut self, top_pt: f64) {
-        let furthest = (self.layout.content_height_pt() - self.viewport_height_pt).max(0.0);
-        let target = if top_pt.is_finite() {
-            top_pt.clamp(0.0, furthest)
-        } else {
-            0.0
-        };
-        self.pending_scroll_pt = Some(target);
-    }
-
-    fn scroll_by_pt(&mut self, delta_pt: f64) {
-        self.scroll_to_pt(self.scroll_top_pt + delta_pt);
-    }
-
-    fn go_to_page(&mut self, page: usize) {
-        let last = self.layout.page_count().saturating_sub(1);
-        if let Some(top_pt) = self.layout.page_top_pt(page.min(last)) {
-            self.scroll_to_pt(top_pt);
-        }
-    }
-
-    /// Moves one step forward or back, meaning a page or a viewport depending on
-    /// the scroll mode.
-    fn advance(&mut self, forward: bool) {
-        match self.scroll_mode {
-            ScrollMode::Paged => {
-                let target = if forward {
-                    self.current_page.saturating_add(1)
-                } else {
-                    self.current_page.saturating_sub(1)
-                };
-                self.go_to_page(target);
-            }
-            ScrollMode::Free => {
-                let step = self.viewport_height_pt * VIEWPORT_STEP_FRACTION;
-                self.scroll_by_pt(if forward { step } else { -step });
-            }
-        }
-    }
-
-    /// Switches zoom mode while keeping the current page in view.
+    /// Queues an event, if anyone is listening.
     ///
-    /// Without this a zoom change scrolls somewhere arbitrary, because the scroll
-    /// offset is in pixels and the same pixel offset means a different place in
-    /// the document at a different zoom.
-    fn set_zoom_mode(&mut self, mode: ZoomMode) {
-        self.zoom_mode = mode;
-        let anchor = self.current_page;
-        self.go_to_page(anchor);
+    /// Takes a closure so that building the event — which can allocate — costs
+    /// nothing when the program is being driven by a person.
+    fn emit(&mut self, event: impl FnOnce() -> Event) {
+        if self.control.is_some() {
+            self.pending_events.push(event());
+        }
     }
 
-    fn step_zoom(&mut self, rungs: i16) {
-        let current = ZoomBucket::enclosing(self.zoom);
-        let stepped = current.step(rungs).scale();
-        self.set_zoom_mode(ZoomMode::Fixed(stepped));
+    /// An empty layout, so the view can be read even with no document open.
+    ///
+    /// Takes the field rather than `&self` so that callers can hold this alongside
+    /// a mutable borrow of [`Viewer::state`] — which `dispatch` needs, since
+    /// applying a command reads the layout and writes the state at the same time.
+    fn layout_of(open: &Option<OpenDocument>) -> &ScrollLayout {
+        static EMPTY: std::sync::LazyLock<ScrollLayout> =
+            std::sync::LazyLock::new(|| ScrollLayout::vertical(&[], PAGE_GAP_PT));
+        open.as_ref().map_or(&EMPTY, |open| &open.layout)
     }
+
+    fn layout(&self) -> &ScrollLayout {
+        Self::layout_of(&self.open)
+    }
+
+    fn view(&self) -> View<'_> {
+        self.state.with(self.layout(), self.viewport)
+    }
+
+    /// Everything readable about the program right now.
+    fn snapshot(&self) -> Snapshot {
+        let mut failed_pages: Vec<usize> = self
+            .open
+            .as_ref()
+            .map(|open| {
+                open.failures
+                    .iter()
+                    .filter(|(_, failure)| failure.gave_up())
+                    .map(|(key, _)| key.page)
+                    .collect()
+            })
+            .unwrap_or_default();
+        failed_pages.sort_unstable();
+        failed_pages.dedup();
+
+        Snapshot {
+            document: self
+                .open
+                .as_ref()
+                .map(|open| open.path.display().to_string()),
+            view: self.view().snapshot(),
+            pages_cached: self.open.as_ref().map_or(0, |open| open.cache.len()),
+            cache_bytes: self.open.as_ref().map_or(0, |open| open.cache.used_bytes()),
+            renders_in_flight: self.open.as_ref().map_or(0, |open| open.in_flight.len()),
+            failed_pages,
+            idle: self.settled(),
+        }
+    }
+
+    /// Whether every requested page has arrived. Vacuously true with no document.
+    fn settled(&self) -> bool {
+        self.open.as_ref().is_none_or(OpenDocument::settled)
+    }
+
+    // --- Control channel ----------------------------------------------------
+
+    /// Carries out anything the controlling process asked for, and replies.
+    fn serve_control(&mut self, ctx: &egui::Context) {
+        let Some(control) = &mut self.control else {
+            return;
+        };
+        if control.hung_up() {
+            // Every other stdio protocol treats a closed stdin as "we are done".
+            tracing::info!("control channel closed; exiting");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        for incoming in control.poll() {
+            let request = match incoming {
+                Ok(request) => request,
+                Err(error) => {
+                    // A line we could not decode has no id to reply against, so the
+                    // best we can do is say what was wrong.
+                    let reply = Reply::failed(None, error);
+                    if let Some(control) = &mut self.control {
+                        control.send(&reply);
+                    }
+                    continue;
+                }
+            };
+
+            let reply = match request.body {
+                RequestBody::Snapshot => Reply::with_snapshot(request.id, self.snapshot()),
+                RequestBody::Commands => Reply::with_commands(request.id),
+                RequestBody::Command(command) => {
+                    let result = self.dispatch(ctx, command);
+                    result.into_reply(request.id)
+                }
+            };
+            if let Some(control) = &mut self.control {
+                control.send(&reply);
+            }
+        }
+    }
+
+    /// Emits state-change and idle events, then flushes the frame's events.
+    fn report_control(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+
+        // Coalesced to one per frame by comparing against what was last sent, which
+        // also catches changes the operator made by hand rather than by command.
+        let snapshot = self.snapshot();
+        if self.last_reported.as_ref() != Some(&snapshot) {
+            self.last_reported = Some(snapshot.clone());
+            self.pending_events.push(Event::ViewChanged {
+                snapshot: Box::new(snapshot),
+            });
+        }
+
+        // On the edge, not every frame: a client waiting for work to finish wants
+        // one signal, not a stream of them while nothing happens.
+        let settled = self.settled();
+        if settled && !self.was_settled {
+            self.pending_events.push(Event::Idle);
+        }
+        self.was_settled = settled;
+
+        let events = std::mem::take(&mut self.pending_events);
+        if let Some(control) = &mut self.control {
+            for event in events {
+                control.send(&event);
+            }
+        }
+    }
+
+    // --- Commands -----------------------------------------------------------
+
+    /// Carries out one command. The only path into view or document state.
+    fn dispatch(&mut self, ctx: &egui::Context, command: Command) -> DispatchResult {
+        match command {
+            Command::View(view) => {
+                let layout = Self::layout_of(&self.open);
+                let outcome = porpoise_view::apply(&mut self.state, layout, self.viewport, view);
+                if let Some(rejection) = outcome.rejected() {
+                    tracing::debug!(command = view.name(), %rejection, "command refused");
+                }
+                DispatchResult::View(outcome)
+            }
+            Command::Open { path } => match Document::open(&path) {
+                Ok(document) => {
+                    let bucket = self.view().bucket();
+                    let page_count = document.page_count();
+                    let reported = path.display().to_string();
+                    self.open = Some(OpenDocument::new(path, document, bucket));
+                    // A new document invalidates where we were looking.
+                    self.state = ViewState::new();
+                    self.applied_start_page = false;
+                    self.emit(|| Event::DocumentOpened {
+                        path: reported,
+                        page_count,
+                    });
+                    DispatchResult::Opened
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not open document");
+                    DispatchResult::Failed(error.to_string())
+                }
+            },
+            Command::Close => {
+                self.open = None;
+                self.state = ViewState::new();
+                self.emit(|| Event::DocumentClosed);
+                DispatchResult::Closed
+            }
+            Command::Capture { path } => {
+                self.screenshot = Some(Screenshotter::new(
+                    ScreenshotRequest {
+                        path,
+                        warmup_frames: CAPTURE_WARMUP_FRAMES,
+                        budget_frames: CAPTURE_BUDGET_FRAMES,
+                    },
+                    Arc::clone(&self.screenshot_outcome),
+                ));
+                DispatchResult::CaptureStarted
+            }
+            Command::Quit => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                DispatchResult::Quitting
+            }
+        }
+    }
+
+    // --- Input --------------------------------------------------------------
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        // Collect first, then act: the closure borrows egui's input state, and the
-        // handlers need `&mut self`.
+        // Collect first, then act: the closure borrows egui's input state, and
+        // dispatch needs `&mut self`.
         let (pressed, zoom_delta) = ctx.input(|input| {
             let pressed: Vec<(egui::Key, egui::Modifiers)> = input
                 .events
@@ -405,40 +574,24 @@ impl Viewer {
         });
 
         if (zoom_delta - 1.0).abs() > 0.001 {
-            // Applied as a continuous factor rather than a rung step, so a pinch
-            // feels proportional. Bucketing still bounds how often we re-render.
-            let target = (self.zoom * zoom_delta).clamp(MIN_SCALE, MAX_SCALE);
-            self.set_zoom_mode(ZoomMode::Fixed(target));
+            // A pinch is not a command of its own — it is a zoom with a computed
+            // factor, applied continuously so the gesture feels proportional.
+            // Bucketing still bounds how often we re-render.
+            let target = (self.view().zoom() * zoom_delta).clamp(MIN_SCALE, MAX_SCALE);
+            self.dispatch(
+                ctx,
+                ViewCommand::SetZoom {
+                    target: ZoomTarget::Fixed(target),
+                }
+                .into(),
+            );
         }
 
+        let mode = self.state.scroll_mode();
         for (key, modifiers) in pressed {
-            self.on_key(key, modifiers);
-        }
-    }
-
-    fn on_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
-        if modifiers.command || modifiers.ctrl {
-            match key {
-                egui::Key::Plus | egui::Key::Equals => self.step_zoom(1),
-                egui::Key::Minus => self.step_zoom(-1),
-                egui::Key::Num0 => self.set_zoom_mode(ZoomMode::FitWidth),
-                egui::Key::Num1 => self.set_zoom_mode(ZoomMode::Fixed(1.0)),
-                egui::Key::Num2 => self.set_zoom_mode(ZoomMode::FitPage),
-                _ => {}
+            if let Some(command) = command_for_key(key, modifiers, mode) {
+                self.dispatch(ctx, command);
             }
-            return;
-        }
-
-        match key {
-            egui::Key::PageDown => self.advance(true),
-            egui::Key::PageUp => self.advance(false),
-            // Space is the reader's page-down; shift reverses it.
-            egui::Key::Space => self.advance(!modifiers.shift),
-            egui::Key::Home => self.go_to_page(0),
-            egui::Key::End => self.go_to_page(self.layout.page_count().saturating_sub(1)),
-            egui::Key::ArrowDown => self.scroll_by_pt(ARROW_STEP_PT),
-            egui::Key::ArrowUp => self.scroll_by_pt(-ARROW_STEP_PT),
-            _ => {}
         }
     }
 
@@ -447,7 +600,7 @@ impl Viewer {
     /// Absorbs finished renders into the cache. Never blocks.
     fn collect_renders(&mut self, ctx: &egui::Context) {
         for _ in 0..MAX_RESULTS_PER_FRAME {
-            let Some(outcome) = self.pool.try_recv() else {
+            let Some(outcome) = self.open.as_ref().and_then(|open| open.pool.try_recv()) else {
                 break;
             };
 
@@ -458,12 +611,20 @@ impl Viewer {
                 continue;
             };
             let key = CacheKey::new(outcome.page_index, ZoomBucket::from_rung(rung));
-            self.in_flight.retain(|pending| *pending != key);
+            if let Some(open) = &mut self.open {
+                open.in_flight.retain(|pending| *pending != key);
+            }
 
             match outcome.result {
-                Ok(page) => self.accept_page(ctx, key, rung, &page),
+                Ok(page) => {
+                    self.accept_page(ctx, key, rung, &page);
+                    self.emit(|| Event::PageRendered {
+                        page: outcome.page_index,
+                    });
+                }
                 Err(error) => {
-                    let failure = Failure::from_error(&error, self.failures.get(&key));
+                    let Some(open) = &mut self.open else { continue };
+                    let failure = Failure::from_error(&error, open.failures.get(&key));
                     tracing::warn!(
                         page = outcome.page_index,
                         rung,
@@ -471,7 +632,14 @@ impl Viewer {
                         %error,
                         "page failed to rasterize"
                     );
-                    self.failures.insert(key, failure);
+                    let will_retry = !failure.gave_up();
+                    let reason = failure.message.clone();
+                    open.failures.insert(key, failure);
+                    self.emit(|| Event::PageFailed {
+                        page: outcome.page_index,
+                        reason,
+                        will_retry,
+                    });
                 }
             }
         }
@@ -479,7 +647,10 @@ impl Viewer {
 
     fn accept_page(&mut self, ctx: &egui::Context, key: CacheKey, rung: i16, page: &RenderedPage) {
         let bytes = page.rgba.len();
-        let Some(image) = to_color_image(page) else {
+        let image = to_color_image(page);
+        let Some(open) = &mut self.open else { return };
+
+        let Some(image) = image else {
             tracing::warn!(
                 page = key.page,
                 width = page.width,
@@ -487,7 +658,7 @@ impl Viewer {
                 bytes,
                 "renderer returned a buffer inconsistent with its dimensions"
             );
-            self.failures.insert(
+            open.failures.insert(
                 key,
                 Failure {
                     message: format!(
@@ -505,8 +676,8 @@ impl Viewer {
             image,
             egui::TextureOptions::LINEAR,
         );
-        self.cache.insert(key, handle, bytes);
-        self.failures.remove(&key);
+        open.cache.insert(key, handle, bytes);
+        open.failures.remove(&key);
 
         // Report on the first page to actually reach the cache, which is the
         // moment something is visible.
@@ -520,60 +691,77 @@ impl Viewer {
     }
 
     /// Queues anything visible or nearby that is not already cached or in flight.
-    fn request_missing(&mut self, visible: &Range<usize>, pixels_per_point: f32) {
-        let order = request_order(visible.clone(), PREFETCH_PAGES, self.layout.page_count());
-        let scale = self.bucket.scale() * pixels_per_point;
-        let tag = i64::from(self.bucket.rung());
+    fn request_missing(&mut self, pixels_per_point: f32) {
+        let bucket = self.view().bucket();
+        let visible = self.view().visible_pages();
+        let Some(open) = &mut self.open else { return };
+
+        if bucket != open.submitted_bucket {
+            // Queued work is for the old rung and no longer worth doing. Cached
+            // textures are kept deliberately — they are the fallback that stops a
+            // resize from flashing grey.
+            open.pool.cancel_pending();
+            open.in_flight.clear();
+            open.failures.clear();
+            open.submitted_bucket = bucket;
+        }
+
+        let order = request_order(visible, PREFETCH_PAGES, open.layout.page_count());
+        let scale = bucket.scale() * pixels_per_point;
+        let tag = i64::from(bucket.rung());
 
         for page in order {
-            let key = CacheKey::new(page, self.bucket);
-            if self.cache.contains(key) || self.in_flight.contains(&key) {
+            let key = CacheKey::new(page, bucket);
+            if open.cache.contains(key) || open.in_flight.contains(&key) {
                 continue;
             }
             // A failure with retries left earns another attempt, spending one.
             // Without a budget this would re-request a hopeless page every frame.
-            if let Some(failure) = self.failures.get_mut(&key)
+            if let Some(failure) = open.failures.get_mut(&key)
                 && !failure.take_retry()
             {
                 continue;
             }
-            if self.pool.submit(page, scale, tag) {
-                self.in_flight.push(key);
+            if open.pool.submit(page, scale, tag) {
+                open.in_flight.push(key);
             }
         }
     }
 
+    // --- Painting -----------------------------------------------------------
+
     /// The texture to draw for a page: the current rung, else the nearest cached
     /// rung, else nothing.
-    fn texture_for(&mut self, page: usize) -> Option<egui::TextureId> {
-        let key = CacheKey::new(page, self.bucket);
-        if let Some(texture) = self.cache.get(key) {
+    ///
+    /// Takes the cache mutably because a hit counts as a use — leaving LRU order
+    /// untouched here would make the byte budget evict pages that are on screen.
+    fn texture_for(
+        cache: &mut PageCache<egui::TextureHandle>,
+        page: usize,
+        bucket: ZoomBucket,
+    ) -> Option<egui::TextureId> {
+        let key = CacheKey::new(page, bucket);
+        if let Some(texture) = cache.get(key) {
             return Some(texture.id());
         }
         // Deliberately a second statement rather than `or_else`: the first borrow
-        // is mutable (it touches LRU order) and the second is not.
-        self.cache
-            .best_for_page(page, self.bucket)
+        // is mutable and the second is not. Slightly soft beats a grey flash while
+        // the right resolution renders.
+        cache
+            .best_for_page(page, bucket)
             .map(|(_, texture)| texture.id())
     }
 
-    /// Rasterizations we have stopped trying to produce.
-    fn abandoned(&self) -> usize {
-        self.failures
-            .values()
-            .filter(|failure| failure.gave_up())
-            .count()
-    }
-
-    // --- Painting -----------------------------------------------------------
-
     fn paint_page(
-        &self,
+        open: &OpenDocument,
         painter: &egui::Painter,
         page: usize,
+        bucket: ZoomBucket,
         rect: egui::Rect,
         texture: Option<egui::TextureId>,
     ) {
+        let key = CacheKey::new(page, bucket);
+
         if let Some(id) = texture {
             painter.image(id, rect, FULL_UV, egui::Color32::WHITE);
             return;
@@ -581,7 +769,7 @@ impl Viewer {
 
         // A failure with retries left is still pending, so claiming failure would
         // be premature — fall through to the placeholder instead.
-        if let Some(failure) = self.failures.get(&CacheKey::new(page, self.bucket))
+        if let Some(failure) = open.failures.get(&key)
             && failure.gave_up()
         {
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(52, 30, 30));
@@ -610,61 +798,54 @@ impl Viewer {
     }
 
     fn draw_pages(&mut self, ui: &mut egui::Ui) {
-        if self.layout.page_count() == 0 {
-            ui.label("This document has no pages.");
-            return;
-        }
-
         // Cloning the context is cheap (an `Arc` inside) and avoids holding an
         // immutable borrow of `ui` across the mutable calls below.
         let ctx = ui.ctx().clone();
         let pixels_per_point = ctx.pixels_per_point();
 
-        self.zoom = match self.zoom_mode {
-            ZoomMode::FitWidth => self.layout.fit_width_scale(ui.available_width()),
-            ZoomMode::FitPage => self
-                .layout
-                .fit_page_scale(ui.available_width(), ui.available_height()),
-            ZoomMode::Fixed(scale) => scale,
-        };
-        let wanted = ZoomBucket::enclosing(self.zoom);
-        if wanted != self.bucket {
-            // Queued work is for the old rung and no longer worth doing. Cached
-            // textures are kept deliberately — they are the fallback that stops a
-            // resize from flashing grey.
-            self.pool.cancel_pending();
-            self.in_flight.clear();
-            self.failures.clear();
-            self.bucket = wanted;
+        // The viewport is environment: measure it, do not store it as state.
+        self.viewport = Viewport::new(ui.available_width(), ui.available_height());
+
+        if self.open.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No document open. Pass a path, or send an `open` command.")
+            });
+            return;
         }
+        if self.layout().page_count() == 0 {
+            ui.centered_and_justified(|ui| ui.label("This document has no pages."));
+            return;
+        }
+
+        // Honour --start-page once, then hand control back to the operator.
+        if let (Some(page), false) = (self.start_page, self.applied_start_page) {
+            self.applied_start_page = true;
+            self.dispatch(&ctx, ViewCommand::GoToPage { page }.into());
+        }
+
+        let zoom = self.view().zoom();
+        let bucket = self.view().bucket();
 
         #[expect(
             clippy::cast_possible_truncation,
             reason = "content extents are page dimensions; f32 is what egui works in"
         )]
         let content_size = egui::vec2(
-            self.layout.content_width_pt() as f32 * self.zoom,
-            self.layout.content_height_pt() as f32 * self.zoom,
+            self.layout().content_width_pt() as f32 * zoom,
+            self.layout().content_height_pt() as f32 * zoom,
         );
 
         let mut scroll_area = egui::ScrollArea::vertical();
 
-        // Honour --start-page once, then hand control back to the user.
-        if let (Some(page), false) = (self.start_page, self.applied_start_page) {
-            if let Some(top_pt) = self.layout.page_top_pt(page) {
-                self.pending_scroll_pt = Some(top_pt);
-            }
-            self.applied_start_page = true;
-        }
-
-        // Only override the offset on frames where navigation asked for it, or the
-        // user could never scroll by hand.
-        if let Some(top_pt) = self.pending_scroll_pt.take() {
+        // Only override the offset on frames where a command asked for it, or the
+        // operator could never scroll by hand. See `ViewState`'s module docs on why
+        // egui keeps ownership of the live offset.
+        if let Some(top_pt) = self.state.take_requested_scroll_pt() {
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "scroll offsets are bounded by content height"
             )]
-            let offset = top_pt as f32 * self.zoom;
+            let offset = top_pt as f32 * zoom;
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
 
@@ -673,171 +854,183 @@ impl Viewer {
                 ui.allocate_exact_size(content_size, egui::Sense::hover());
 
             // `viewport` is in content coordinates, so dividing by zoom converts
-            // the scroll window back into PDF points.
-            let top_pt = f64::from(viewport.min.y / self.zoom);
-            let height_pt = f64::from(viewport.height() / self.zoom);
-            let visible = self.layout.visible_pages(top_pt, height_pt);
+            // the scroll window back into PDF points. This is the reconciliation
+            // point: egui tells us where it actually is.
+            self.state
+                .report_scroll_top_pt(f64::from(viewport.min.y / zoom));
 
-            // Remembered for navigation, which runs before the next frame's layout
-            // and so has no viewport of its own to consult.
-            self.scroll_top_pt = top_pt;
-            self.viewport_height_pt = height_pt;
+            self.request_missing(pixels_per_point);
 
-            self.current_page = self
-                .layout
-                .page_at_pt(top_pt + height_pt / 2.0)
-                .unwrap_or(0);
+            let visible = self.view().visible_pages();
+            let Some(open) = &mut self.open else { return };
 
-            self.request_missing(&visible, pixels_per_point);
+            // Resolved in a first pass because a cache hit is a *use* and updates
+            // LRU order, which needs the cache mutably — while painting needs the
+            // layout and geometry immutably.
+            let tiles: Vec<(usize, egui::Rect, Option<egui::TextureId>)> = visible
+                .clone()
+                .filter_map(|page| {
+                    let top_pt = open.layout.page_top_pt(page)?;
+                    let geometry = open.document.geometry().get(page).copied()?;
 
-            for page in visible.clone() {
-                let (Some(top_pt), Some(geometry)) = (
-                    self.layout.page_top_pt(page),
-                    self.document.geometry().get(page).copied(),
-                ) else {
-                    continue;
-                };
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "page offsets are bounded by content height"
+                    )]
+                    let rect = {
+                        let size = egui::vec2(geometry.width_pt * zoom, geometry.height_pt * zoom);
+                        // Centre each page in the column, so a narrow page among
+                        // wide ones does not sit flush left.
+                        let x = (content_size.x - size.x) * 0.5;
+                        egui::Rect::from_min_size(
+                            content_rect.min + egui::vec2(x, top_pt as f32 * zoom),
+                            size,
+                        )
+                    };
 
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "page offsets are bounded by content height"
-                )]
-                let page_rect = {
-                    let size = egui::vec2(
-                        geometry.width_pt * self.zoom,
-                        geometry.height_pt * self.zoom,
-                    );
-                    // Centre each page in the column, so a narrow page among wide
-                    // ones does not sit flush left.
-                    let x = (content_size.x - size.x) * 0.5;
-                    egui::Rect::from_min_size(
-                        content_rect.min + egui::vec2(x, top_pt as f32 * self.zoom),
-                        size,
-                    )
-                };
+                    let texture = Self::texture_for(&mut open.cache, page, bucket);
+                    Some((page, rect, texture))
+                })
+                .collect();
 
-                let texture = self.texture_for(page);
-                self.paint_page(ui.painter(), page, page_rect, texture);
+            for (page, rect, texture) in tiles {
+                Self::paint_page(open, ui.painter(), page, bucket, rect, texture);
             }
 
             // Keep memory proportional to the viewport rather than the document.
             let low = visible.start.saturating_sub(RETAIN_PAGES);
             let high = visible.end.saturating_add(RETAIN_PAGES);
-            self.cache.retain_pages(|page| (low..high).contains(&page));
+            open.cache.retain_pages(|page| (low..high).contains(&page));
         });
 
         // Keep frames coming while anything is still being drawn.
-        if self.pool.is_busy() || !self.in_flight.is_empty() {
+        if self.open.as_ref().is_some_and(|open| !open.settled()) {
             ctx.request_repaint();
         }
     }
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        // Collected rather than applied inline, because each handler needs
-        // `&mut self` while `ui` is borrowed.
-        let mut requested_zoom: Option<ZoomMode> = None;
-        let mut requested_page: Option<usize> = None;
-        let mut zoom_step: i16 = 0;
+        // Collected rather than dispatched inline, because dispatch needs
+        // `&mut self` while `ui` is borrowed. Note every button produces the same
+        // command an agent would send — there is no click-only path.
+        let mut issued: Vec<Command> = Vec::new();
+        let zoom_target = self.state.zoom_target();
+        let paged = self.state.scroll_mode() == ScrollMode::Paged;
 
         ui.horizontal(|ui| {
             if ui.button("⏮").on_hover_text("First page (Home)").clicked() {
-                requested_page = Some(0);
+                issued.push(ViewCommand::FirstPage.into());
             }
             if ui.button("⏭").on_hover_text("Last page (End)").clicked() {
-                requested_page = Some(self.layout.page_count().saturating_sub(1));
+                issued.push(ViewCommand::LastPage.into());
             }
             ui.separator();
 
             if ui.button("−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
-                zoom_step -= 1;
+                issued.push(ViewCommand::StepZoom { rungs: -1 }.into());
             }
             if ui.button("+").on_hover_text("Zoom in (Ctrl++)").clicked() {
-                zoom_step += 1;
+                issued.push(ViewCommand::StepZoom { rungs: 1 }.into());
             }
 
-            let fit_width = self.zoom_mode == ZoomMode::FitWidth;
             if ui
-                .selectable_label(fit_width, "Width")
+                .selectable_label(zoom_target == ZoomTarget::FitWidth, "Width")
                 .on_hover_text("Fit width (Ctrl+0)")
                 .clicked()
             {
-                requested_zoom = Some(ZoomMode::FitWidth);
+                issued.push(
+                    ViewCommand::SetZoom {
+                        target: ZoomTarget::FitWidth,
+                    }
+                    .into(),
+                );
             }
-            let fit_page = self.zoom_mode == ZoomMode::FitPage;
             if ui
-                .selectable_label(fit_page, "Page")
+                .selectable_label(zoom_target == ZoomTarget::FitPage, "Page")
                 .on_hover_text("Fit page (Ctrl+2)")
                 .clicked()
             {
-                requested_zoom = Some(ZoomMode::FitPage);
+                issued.push(
+                    ViewCommand::SetZoom {
+                        target: ZoomTarget::FitPage,
+                    }
+                    .into(),
+                );
             }
             ui.separator();
 
             // Paged versus free changes what PageDown and Space mean.
-            let paged = self.scroll_mode == ScrollMode::Paged;
             if ui
                 .selectable_label(paged, "Paged")
                 .on_hover_text("Page-by-page instead of continuous scrolling")
                 .clicked()
             {
-                self.scroll_mode = if paged {
+                let mode = if paged {
                     ScrollMode::Free
                 } else {
                     ScrollMode::Paged
                 };
+                issued.push(ViewCommand::SetScrollMode { mode }.into());
             }
         });
 
-        if zoom_step != 0 {
-            self.step_zoom(zoom_step);
-        }
-        if let Some(mode) = requested_zoom {
-            self.set_zoom_mode(mode);
-        }
-        if let Some(page) = requested_page {
-            self.go_to_page(page);
+        let ctx = ui.ctx().clone();
+        for command in issued {
+            self.dispatch(&ctx, command);
         }
     }
 
     fn draw_status(&self, ui: &mut egui::Ui) {
+        let view = self.view();
         ui.horizontal(|ui| {
-            ui.label(format!(
-                "page {} of {}",
-                self.current_page + 1,
-                self.layout.page_count()
-            ));
-            ui.separator();
-            ui.label(format!(
-                "{:.0}% {}",
-                self.zoom * 100.0,
-                self.zoom_mode.label()
-            ));
-            ui.separator();
-            ui.label(self.scroll_mode.label());
-            ui.separator();
-            // Proof of virtualization: both stay small however long the document.
-            ui.label(format!(
-                "{} cached, {:.1} MB",
-                self.cache.len(),
-                self.cache.used_bytes() as f64 / (1024.0 * 1024.0)
-            ));
-            ui.separator();
-            ui.label(format!(
-                "{} workers, {} in flight",
-                self.pool.worker_count(),
-                self.in_flight.len()
-            ));
-            ui.separator();
-            ui.label(format!(
-                "ui {:.1} ms, frame {:.1} ms",
-                self.timing.ui_ms, self.timing.frame_ms
-            ));
-            // Counts only what we have given up on, matching the error tiles. A
-            // page still being retried is not a failure yet.
-            let abandoned = self.abandoned();
-            if abandoned > 0 {
-                ui.separator();
-                ui.colored_label(ui.visuals().error_fg_color, format!("{abandoned} failed"));
+            match &self.open {
+                Some(open) => {
+                    ui.label(format!(
+                        "page {} of {}",
+                        view.current_page() + 1,
+                        open.layout.page_count()
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "{:.0}% {}",
+                        view.zoom() * 100.0,
+                        self.state.zoom_target().label()
+                    ));
+                    ui.separator();
+                    ui.label(self.state.scroll_mode().label());
+                    ui.separator();
+                    // Proof of virtualization: both stay small however long the
+                    // document.
+                    ui.label(format!(
+                        "{} cached, {:.1} MB",
+                        open.cache.len(),
+                        open.cache.used_bytes() as f64 / (1024.0 * 1024.0)
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "{} workers, {} in flight",
+                        open.pool.worker_count(),
+                        open.in_flight.len()
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "ui {:.1} ms, frame {:.1} ms",
+                        self.timing.ui_ms, self.timing.frame_ms
+                    ));
+                    // Counts only what we have given up on, matching the error
+                    // tiles. A page still being retried is not a failure yet.
+                    let abandoned = open.abandoned();
+                    if abandoned > 0 {
+                        ui.separator();
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("{abandoned} failed"),
+                        );
+                    }
+                }
+                None => {
+                    ui.label("no document");
+                }
             }
         });
     }
@@ -861,19 +1054,134 @@ impl Viewer {
         let step = benchmark.step_pt();
         // Keep frames coming at full rate; without this the app idles.
         ctx.request_repaint();
-        self.scroll_by_pt(step);
+        self.dispatch(ctx, ViewCommand::ScrollBy { points: step }.into());
     }
 
     fn drive_screenshot(&mut self, ctx: &egui::Context) {
-        let settled = !self.cache.is_empty() && self.in_flight.is_empty();
+        let ready = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.settled() && !open.cache.is_empty());
         let frame = self.frame;
         let Some(screenshotter) = &mut self.screenshot else {
             return;
         };
-        if screenshotter.drive(ctx, frame, settled) {
-            self.screenshot = None;
+        if !screenshotter.drive(ctx, frame, ready) {
+            return;
+        }
+        self.screenshot = None;
+
+        // Report the result to a controlling process. The CLI `--screenshot` path
+        // reads the same slot after the window closes, so both are served without
+        // the capture machinery knowing which asked for it.
+        if self.control.is_some() {
+            let captured = self
+                .screenshot_outcome
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            match captured {
+                Some(Ok(path)) => self.emit(|| Event::Captured {
+                    path: path.display().to_string(),
+                }),
+                Some(Err(error)) => self.emit(|| Event::CaptureFailed { error }),
+                None => {}
+            }
         }
     }
+}
+
+/// What a dispatched command did.
+///
+/// Coarse on purpose: a caller that needs detail reads the snapshot afterwards,
+/// which is the same thing an agent does.
+#[derive(Debug, Clone, PartialEq)]
+enum DispatchResult {
+    View(Outcome),
+    Opened,
+    Closed,
+    CaptureStarted,
+    Quitting,
+    Failed(String),
+}
+
+impl DispatchResult {
+    /// The reply to send for this result.
+    fn into_reply(self, id: Option<u64>) -> Reply {
+        match self {
+            Self::View(Outcome::Changed) => Reply::ok(id, "changed"),
+            Self::View(Outcome::Unchanged) => Reply::ok(id, "unchanged"),
+            Self::View(Outcome::Rejected(rejection)) => Reply::rejected(id, rejection),
+            Self::Opened => Reply::ok(id, "opened"),
+            Self::Closed => Reply::ok(id, "closed"),
+            // Deliberately not "captured": the capture has been *started*, and the
+            // file does not exist until the pipeline settles. An agent that treated
+            // this as completion would read a file that is not there yet, so it has
+            // to wait for the `captured` event.
+            Self::CaptureStarted => Reply::ok(id, "capturing"),
+            Self::Quitting => Reply::ok(id, "quitting"),
+            Self::Failed(error) => Reply::failed(id, error),
+        }
+    }
+}
+
+/// Translates a key press into a command.
+///
+/// Pure, and mode-aware on purpose. `PageDown` means "next page" in paged mode and
+/// "next screenful" in free mode — so the *key handler* decides which command that
+/// is. Putting the mode dependence inside a command would mean an agent could
+/// never be sure what `NextPage` was going to do.
+fn command_for_key(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    mode: ScrollMode,
+) -> Option<Command> {
+    if modifiers.command || modifiers.ctrl {
+        let command = match key {
+            egui::Key::Plus | egui::Key::Equals => ViewCommand::StepZoom { rungs: 1 },
+            egui::Key::Minus => ViewCommand::StepZoom { rungs: -1 },
+            egui::Key::Num0 => ViewCommand::SetZoom {
+                target: ZoomTarget::FitWidth,
+            },
+            egui::Key::Num1 => ViewCommand::SetZoom {
+                target: ZoomTarget::Fixed(1.0),
+            },
+            egui::Key::Num2 => ViewCommand::SetZoom {
+                target: ZoomTarget::FitPage,
+            },
+            _ => return None,
+        };
+        return Some(command.into());
+    }
+
+    // One screenful or one page, depending on the mode.
+    let advance = |forward: bool| -> ViewCommand {
+        let sign = if forward { 1.0 } else { -1.0 };
+        match mode {
+            ScrollMode::Paged if forward => ViewCommand::NextPage,
+            ScrollMode::Paged => ViewCommand::PreviousPage,
+            ScrollMode::Free => ViewCommand::ScrollByViewports {
+                fraction: VIEWPORT_STEP_FRACTION * sign,
+            },
+        }
+    };
+
+    let command = match key {
+        egui::Key::PageDown => advance(true),
+        egui::Key::PageUp => advance(false),
+        // Space is the reader's page-down; shift reverses it.
+        egui::Key::Space => advance(!modifiers.shift),
+        egui::Key::Home => ViewCommand::FirstPage,
+        egui::Key::End => ViewCommand::LastPage,
+        egui::Key::ArrowDown => ViewCommand::ScrollBy {
+            points: ARROW_STEP_PT,
+        },
+        egui::Key::ArrowUp => ViewCommand::ScrollBy {
+            points: -ARROW_STEP_PT,
+        },
+        _ => return None,
+    };
+    Some(command.into())
 }
 
 impl eframe::App for Viewer {
@@ -890,12 +1198,20 @@ impl eframe::App for Viewer {
         let started = Instant::now();
         self.collect_renders(ctx);
         self.handle_input(ctx);
+        self.serve_control(ctx);
         self.timing.logic_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         // Deliberately after the timing: these only bookkeep and would otherwise
         // charge instrumentation overhead to the pipeline.
         self.drive_benchmark(ctx);
         self.drive_screenshot(ctx);
+        self.report_control();
+
+        // A controlling process expects progress without a person moving the mouse,
+        // so keep frames coming rather than idling until the next input event.
+        if self.control.is_some() {
+            ctx.request_repaint();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -997,8 +1313,6 @@ mod tests {
 
     #[test]
     fn dimensions_that_would_overflow_are_refused() {
-        // width * height * 4 overflows usize on a 64-bit target only for absurd
-        // values, but the multiplication is checked so the guard holds regardless.
         assert!(to_color_image(&page(u32::MAX, u32::MAX, 16)).is_none());
     }
 
@@ -1087,5 +1401,190 @@ mod tests {
             "unhelpful message: {}",
             failure.message
         );
+    }
+
+    // --- Key translation -----------------------------------------------------
+
+    fn none() -> egui::Modifiers {
+        egui::Modifiers::NONE
+    }
+
+    fn ctrl() -> egui::Modifiers {
+        egui::Modifiers::CTRL
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers, mode: ScrollMode) -> Option<Command> {
+        command_for_key(key, modifiers, mode)
+    }
+
+    #[test]
+    fn page_down_means_a_page_in_paged_mode_and_a_screenful_in_free_mode() {
+        // This is the mode-dependence the command model deliberately keeps in the
+        // key handler rather than inside `NextPage`.
+        assert_eq!(
+            key(egui::Key::PageDown, none(), ScrollMode::Paged),
+            Some(ViewCommand::NextPage.into())
+        );
+        assert_eq!(
+            key(egui::Key::PageDown, none(), ScrollMode::Free),
+            Some(
+                ViewCommand::ScrollByViewports {
+                    fraction: VIEWPORT_STEP_FRACTION
+                }
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn page_up_reverses_the_direction_in_both_modes() {
+        assert_eq!(
+            key(egui::Key::PageUp, none(), ScrollMode::Paged),
+            Some(ViewCommand::PreviousPage.into())
+        );
+        assert_eq!(
+            key(egui::Key::PageUp, none(), ScrollMode::Free),
+            Some(
+                ViewCommand::ScrollByViewports {
+                    fraction: -VIEWPORT_STEP_FRACTION
+                }
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn space_pages_forward_and_shift_space_pages_back() {
+        assert_eq!(
+            key(egui::Key::Space, none(), ScrollMode::Paged),
+            Some(ViewCommand::NextPage.into())
+        );
+        assert_eq!(
+            key(egui::Key::Space, egui::Modifiers::SHIFT, ScrollMode::Paged),
+            Some(ViewCommand::PreviousPage.into())
+        );
+    }
+
+    #[test]
+    fn home_and_end_jump_to_the_ends_regardless_of_mode() {
+        for mode in [ScrollMode::Free, ScrollMode::Paged] {
+            assert_eq!(
+                key(egui::Key::Home, none(), mode),
+                Some(ViewCommand::FirstPage.into())
+            );
+            assert_eq!(
+                key(egui::Key::End, none(), mode),
+                Some(ViewCommand::LastPage.into())
+            );
+        }
+    }
+
+    #[test]
+    fn arrows_scroll_a_small_fixed_step() {
+        assert_eq!(
+            key(egui::Key::ArrowDown, none(), ScrollMode::Free),
+            Some(
+                ViewCommand::ScrollBy {
+                    points: ARROW_STEP_PT
+                }
+                .into()
+            )
+        );
+        assert_eq!(
+            key(egui::Key::ArrowUp, none(), ScrollMode::Free),
+            Some(
+                ViewCommand::ScrollBy {
+                    points: -ARROW_STEP_PT
+                }
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn ctrl_bindings_control_zoom() {
+        assert_eq!(
+            key(egui::Key::Num0, ctrl(), ScrollMode::Free),
+            Some(
+                ViewCommand::SetZoom {
+                    target: ZoomTarget::FitWidth
+                }
+                .into()
+            )
+        );
+        assert_eq!(
+            key(egui::Key::Num1, ctrl(), ScrollMode::Free),
+            Some(
+                ViewCommand::SetZoom {
+                    target: ZoomTarget::Fixed(1.0)
+                }
+                .into()
+            )
+        );
+        assert_eq!(
+            key(egui::Key::Num2, ctrl(), ScrollMode::Free),
+            Some(
+                ViewCommand::SetZoom {
+                    target: ZoomTarget::FitPage
+                }
+                .into()
+            )
+        );
+        assert_eq!(
+            key(egui::Key::Plus, ctrl(), ScrollMode::Free),
+            Some(ViewCommand::StepZoom { rungs: 1 }.into())
+        );
+        assert_eq!(
+            key(egui::Key::Minus, ctrl(), ScrollMode::Free),
+            Some(ViewCommand::StepZoom { rungs: -1 }.into())
+        );
+    }
+
+    #[test]
+    fn a_ctrl_binding_does_not_also_fire_its_unmodified_meaning() {
+        // Ctrl+End must not jump to the last page as a side effect of not being a
+        // zoom binding.
+        assert_eq!(key(egui::Key::End, ctrl(), ScrollMode::Free), None);
+        assert_eq!(key(egui::Key::Space, ctrl(), ScrollMode::Free), None);
+    }
+
+    #[test]
+    fn unbound_keys_produce_nothing() {
+        for k in [egui::Key::A, egui::Key::F5, egui::Key::Escape] {
+            assert_eq!(key(k, none(), ScrollMode::Free), None, "{k:?} is bound");
+        }
+    }
+
+    #[test]
+    fn every_key_binding_produces_a_command_an_agent_could_also_send() {
+        // The point of the model: nothing is reachable by keyboard alone. If a
+        // binding ever produced something outside the command set, this would be
+        // the place it showed up.
+        let bindings = [
+            (egui::Key::PageDown, none()),
+            (egui::Key::PageUp, none()),
+            (egui::Key::Space, none()),
+            (egui::Key::Home, none()),
+            (egui::Key::End, none()),
+            (egui::Key::ArrowDown, none()),
+            (egui::Key::ArrowUp, none()),
+            (egui::Key::Plus, ctrl()),
+            (egui::Key::Minus, ctrl()),
+            (egui::Key::Num0, ctrl()),
+            (egui::Key::Num1, ctrl()),
+            (egui::Key::Num2, ctrl()),
+        ];
+        let names = Command::all_names();
+        for (k, modifiers) in bindings {
+            for mode in [ScrollMode::Free, ScrollMode::Paged] {
+                let command = command_for_key(k, modifiers, mode)
+                    .unwrap_or_else(|| panic!("{k:?} produced no command"));
+                assert!(
+                    names.contains(&command.name()),
+                    "{k:?} produced {}, which is not in the command reference",
+                    command.name()
+                );
+            }
+        }
     }
 }

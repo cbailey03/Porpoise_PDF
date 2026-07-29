@@ -77,6 +77,26 @@ jobs:
       # covers the library crates and compiles the shell without running it.
       - run: cargo test --workspace --all-features
 
+  e2e:
+    name: agent control end to end
+    # Windows only, and that is a limitation rather than a choice. `porpoise serve`
+    # opens a real window, so this needs a display *and* a GPU adapter wgpu will
+    # accept. GitHub's Windows runners provide both. On Linux, xvfb supplies the
+    # display but not the adapter — that needs a software Vulkan or GL stack
+    # (lavapipe / llvmpipe) which is not wired up here, so claiming Linux coverage
+    # would be claiming something untested. Tracked in docs/goal-2-plan.md, §8.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The control tests skip themselves loudly without this, so that a headless
+      # `cargo test --workspace` neither fails nor pretends to have run them.
+      - name: Drive the real binary over stdio
+        env:
+          PORPOISE_E2E: "1"
+        run: cargo test -p porpoise-app --test control
+
   msrv:
     name: msrv (1.92)
     runs-on: ubuntu-latest

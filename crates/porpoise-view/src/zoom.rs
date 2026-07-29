@@ -75,6 +75,17 @@ impl ZoomBucket {
         self.0
     }
 
+    /// Moves `rungs` steps along the ladder, saturating at either end.
+    ///
+    /// One rung is about 9%, which is a comfortable single press of a zoom key or
+    /// one notch of a scroll wheel.
+    #[must_use]
+    pub fn step(self, rungs: i16) -> Self {
+        let floor = Self::enclosing(MIN_SCALE).0;
+        let ceiling = Self::enclosing(MAX_SCALE).0;
+        Self(self.0.saturating_add(rungs).clamp(floor, ceiling))
+    }
+
     /// Reconstructs a bucket from a [`Self::rung`].
     ///
     /// The render pipeline carries the rung through as an opaque integer tag, so
@@ -161,6 +172,33 @@ mod tests {
                 "zoom {zoom} drifted from {once:?} to {twice:?}"
             );
         }
+    }
+
+    #[test]
+    fn stepping_up_and_back_down_returns_to_the_same_rung() {
+        let start = ZoomBucket::enclosing(1.0);
+        assert_eq!(start.step(3).step(-3), start);
+    }
+
+    #[test]
+    fn one_step_changes_zoom_by_about_nine_percent() {
+        let start = ZoomBucket::enclosing(1.0);
+        let ratio = start.step(1).scale() / start.scale();
+        assert!(
+            (1.08..1.10).contains(&ratio),
+            "one rung changed zoom by a factor of {ratio}"
+        );
+    }
+
+    #[test]
+    fn stepping_saturates_at_both_ends_of_the_ladder() {
+        let floor = ZoomBucket::enclosing(MIN_SCALE);
+        let ceiling = ZoomBucket::enclosing(MAX_SCALE);
+
+        assert_eq!(floor.step(-1000), floor, "stepped below the floor");
+        assert_eq!(ceiling.step(1000), ceiling, "stepped above the ceiling");
+        assert_eq!(floor.step(i16::MIN), floor, "saturating_add overflowed");
+        assert_eq!(ceiling.step(i16::MAX), ceiling, "saturating_add overflowed");
     }
 
     #[test]

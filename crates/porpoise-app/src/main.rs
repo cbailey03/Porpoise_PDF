@@ -64,6 +64,11 @@ struct Cli {
     #[arg(long, requires = "file", hide = true)]
     screenshot: Option<PathBuf>,
 
+    /// Development aid: scroll the whole document over this many frames,
+    /// report frame-time percentiles, and exit.
+    #[arg(long, requires = "file", hide = true)]
+    scroll_benchmark: Option<u32>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -122,6 +127,7 @@ fn main() -> ExitCode {
             cli.file.as_deref(),
             cli.start_page,
             cli.screenshot.as_deref(),
+            cli.scroll_benchmark,
         ),
     };
 
@@ -142,6 +148,7 @@ fn run_viewer(
     file: Option<&Path>,
     start_page: Option<usize>,
     screenshot: Option<&Path>,
+    scroll_benchmark: Option<u32>,
 ) -> Result<(), Box<dyn Error>> {
     // There is no file dialog yet, so with no path there is nothing to show.
     // Opening an empty window would be worse than saying so.
@@ -178,7 +185,7 @@ fn run_viewer(
         budget_frames: 240,
     });
 
-    viewer::run(title, document, start_index, request)
+    viewer::run(title, document, start_index, request, scroll_benchmark)
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {

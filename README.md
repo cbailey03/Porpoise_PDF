@@ -6,13 +6,26 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: M4.** The viewer scrolls continuously through a whole document, rendering pages on
-worker threads so the UI never waits. A 400-page drawing set sits at around 16 MB of cached page
-textures rather than four hundred pages' worth. The CLI can also describe a document or rasterize a
-page to a PNG.
+**Current state: M5 — Goal 1 is feature-complete.** Open a PDF, scroll it freely or page by page,
+navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Pages rasterize on worker threads
+so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
+than four hundred pages' worth, and a synthetic scroll of 40 pages per second holds a 60 fps median
+with our own code using under 15% of the frame budget.
 
-Still to come: paged scrolling and keyboard navigation, explicit zoom controls, and a file dialog
-(M5), then hardening against a malformed-PDF corpus (M6).
+Still to come (M6): hardening against a malformed-PDF corpus, fuzzing the parse path, and the
+PDFium differential-rendering oracle. A file dialog is also still missing — a path is required.
+
+## Keys
+
+| | |
+|---|---|
+| `PageDown` / `Space` | Next page, or next screenful in free mode |
+| `PageUp` / `Shift+Space` | Previous |
+| `Home` / `End` | First / last page |
+| `↑` / `↓` | Small scroll step |
+| `Ctrl` + wheel, or pinch | Zoom |
+| `Ctrl` `+` / `Ctrl` `-` | Zoom by one step |
+| `Ctrl` `0` / `Ctrl` `1` / `Ctrl` `2` | Fit width / 100% / fit page |
 
 ## Crates
 

@@ -67,6 +67,7 @@ pub struct ScrollLayout {
     bottoms: Vec<f64>,
     content_height_pt: f64,
     content_width_pt: f64,
+    tallest_page_height_pt: f64,
 }
 
 impl ScrollLayout {
@@ -96,6 +97,7 @@ impl ScrollLayout {
         let mut bottoms = Vec::with_capacity(pages.len());
         let mut cursor_pt = 0.0_f64;
         let mut content_width_pt = 0.0_f64;
+        let mut tallest_page_height_pt = 0.0_f64;
 
         for page in pages {
             let height_pt = sanitize(page.height_pt);
@@ -103,6 +105,7 @@ impl ScrollLayout {
             bottoms.push(cursor_pt + height_pt);
             cursor_pt += height_pt + gap_pt;
             content_width_pt = content_width_pt.max(sanitize(page.width_pt));
+            tallest_page_height_pt = tallest_page_height_pt.max(height_pt);
         }
 
         // The column ends at the last page's bottom edge, not after a trailing gap.
@@ -113,6 +116,7 @@ impl ScrollLayout {
             bottoms,
             content_height_pt,
             content_width_pt,
+            tallest_page_height_pt,
         }
     }
 
@@ -190,6 +194,36 @@ impl ScrollLayout {
             height_pt: 1.0,
         };
         fit_scale(FitMode::Width, widest, viewport_width_pt, f32::INFINITY)
+    }
+
+    /// Height of the tallest page.
+    #[must_use]
+    pub fn tallest_page_height_pt(&self) -> f64 {
+        self.tallest_page_height_pt
+    }
+
+    /// Zoom at which the largest page fits entirely inside the viewport.
+    ///
+    /// Uses the bounding box across *all* pages — widest width, tallest height —
+    /// rather than the page currently on screen. Fitting the current page would
+    /// change the zoom every time you scrolled between two page sizes, which reads
+    /// as the document jumping around.
+    #[must_use]
+    pub fn fit_page_scale(&self, viewport_width_pt: f32, viewport_height_pt: f32) -> f32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "page dimensions are small; f32 is the precision the renderer works in"
+        )]
+        let largest = PageGeometry {
+            width_pt: self.content_width_pt as f32,
+            height_pt: self.tallest_page_height_pt as f32,
+        };
+        fit_scale(
+            FitMode::Page,
+            largest,
+            viewport_width_pt,
+            viewport_height_pt,
+        )
     }
 
     /// The page containing `y_pt`, saturating to the first or last page when
@@ -448,6 +482,56 @@ mod tests {
         // 1224 pt of content in a 1224 pt viewport is 1:1, not 2x.
         assert_eq!(layout.fit_width_scale(1224.0), 1.0);
         assert_eq!(layout.fit_width_scale(612.0), 0.5);
+    }
+
+    #[test]
+    fn tallest_page_is_tracked_independently_of_the_widest() {
+        // A landscape page can be the widest while a portrait one is the tallest.
+        let layout = ScrollLayout::vertical(&[page(1224.0, 400.0), letter()], 10.0);
+        assert_eq!(layout.content_width_pt(), 1224.0);
+        assert_eq!(layout.tallest_page_height_pt(), 792.0);
+    }
+
+    #[test]
+    fn fit_page_uses_the_bounding_box_across_all_pages() {
+        // Widest is 1224, tallest is 792. In a 1224x792 viewport that is exactly
+        // 1:1; anything larger than 1:1 would clip one of the two pages.
+        let layout = ScrollLayout::vertical(&[page(1224.0, 400.0), letter()], 10.0);
+        assert_eq!(layout.fit_page_scale(1224.0, 792.0), 1.0);
+
+        // Halving the viewport halves the zoom.
+        assert_eq!(layout.fit_page_scale(612.0, 396.0), 0.5);
+    }
+
+    #[test]
+    fn fit_page_is_never_larger_than_fit_width() {
+        // Fit-page has to satisfy the height constraint as well, so it can only be
+        // more restrictive.
+        let layout = ScrollLayout::vertical(&[letter(), page(792.0, 612.0)], 10.0);
+        for (width, height) in [(400.0, 300.0), (1000.0, 200.0), (2000.0, 5000.0)] {
+            let page_fit = layout.fit_page_scale(width, height);
+            let width_fit = layout.fit_width_scale(width);
+            assert!(
+                page_fit <= width_fit + f32::EPSILON,
+                "in {width}x{height}, fit-page {page_fit} exceeded fit-width {width_fit}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_page_survives_an_empty_or_degenerate_layout() {
+        let empty = ScrollLayout::vertical(&[], 10.0);
+        let scale = empty.fit_page_scale(1000.0, 1000.0);
+        assert!(scale.is_finite() && scale > 0.0, "got {scale}");
+
+        let degenerate = ScrollLayout::vertical(&[page(f32::NAN, 0.0)], 10.0);
+        for (width, height) in [(0.0, 0.0), (f32::NAN, f32::NAN), (-5.0, 10.0)] {
+            let scale = degenerate.fit_page_scale(width, height);
+            assert!(
+                scale.is_finite() && scale > 0.0,
+                "{width}x{height} gave {scale}"
+            );
+        }
     }
 
     #[test]

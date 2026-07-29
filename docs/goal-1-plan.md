@@ -2,7 +2,12 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M4 landed.** Rasterization is off the UI thread. The frame loop polls for finished pages,
+**Status: M5 landed — Goal 1 is feature-complete.** You can open a PDF, scroll it freely or page by
+page, navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Frame times under a
+synthetic 40-pages-per-second scroll are measured, not assumed: see the exit criteria. M6
+(hardening) is what remains.
+
+Rasterization is off the UI thread. The frame loop polls for finished pages,
 requests missing ones, and paints whatever the cache holds — it never waits. On the 400-page
 drawing set at page 200 that is 6 cached pages and **15.7 MB**, against a 192 MB budget and a
 500 MB target for the whole document.
@@ -248,18 +253,33 @@ free and prevents the monolith.
 | **M2** ✅ | eframe window (wgpu backend), page 1 fit-to-width, opened from a CLI path. Plus a hidden `--screenshot` flag so the window can be verified headlessly. No file dialog yet. | End-to-end pixels on screen. |
 | **M3** ✅ | Continuous scroll across all pages at one shared zoom, drawing only the visible set, with placeholders and texture eviction. Rasterization still synchronous, capped at 2 pages per frame. `--start-page` opens deep in a document. | Scroll geometry is right. Verified on a 400-page two-page-size document at pages 1, 200 and 400, holding **2 textures** throughout. |
 | **M4** ✅ | Async raster pipeline: `RenderPool` worker threads, byte-budgeted LRU `PageCache` keyed by page and zoom rung, prefetch margin, `ZoomBucket` quantization, queued-job cancellation, and stale-resolution fallback. | Smoothness. The UI thread never waits for a render. |
-| **M5** | Mode switch — paged (snap) vs free scroll. Keyboard nav (PgUp/PgDn, Home/End, arrows), ctrl+wheel zoom, fit-width/fit-page. | **Goal 1 feature-complete.** |
+| **M5** ✅ | Paged vs free scroll, keyboard navigation, ctrl+wheel and pinch zoom, fit-width/fit-page, a toolbar, and `--scroll-benchmark` for frame-time measurement. | **Goal 1 feature-complete.** |
 | **M6** | Hardening: malformed-PDF corpus run, `cargo-fuzz` targets on the parse path, PDFium differential pixel-diff. | It survives hostile input, and we have data on hayro's accuracy. |
 
 ### Exit criteria
 
 Goal 1 is done when, on a mid-range laptop:
 
-- Sustained 60 fps free-scrolling through a 400+ page document.
-- Resident memory bounded and roughly flat regardless of document length (target < 500 MB).
-- Time from launch to first page painted on a 100 MB PDF under 1 second.
-- Zero hangs, zero process crashes across the malformed corpus — broken pages render as error
-  placeholders.
+- ✅ **Sustained 60 fps free-scrolling through a 400+ page document.** Measured with
+  `--scroll-benchmark 600` over the whole 400-page document — a synthetic scroll of roughly 40
+  pages per second, far faster than anyone scrolls by hand. Frame interval **p50 16.66 ms
+  (60.0 fps), p95 17.9 ms, p99 20–23 ms**. Our own cost is **≤ 2.4 ms** of the 16.67 ms budget
+  (logic including GPU upload ≤ 2.1 ms, ui ≤ 0.4 ms), so roughly 86% of the frame is headroom.
+  See the caveat below.
+- ✅ **Resident memory bounded and roughly flat regardless of document length.** 15.7 MB of page
+  textures at page 200 of 400, against a 192 MB budget and the 500 MB target.
+- Time from launch to first page painted on a 100 MB PDF under 1 second — not yet measured.
+- Zero hangs, zero process crashes across the malformed corpus — M6.
+
+**Open performance item: an unattributed frame-time outlier.** Each 600-frame run shows a single
+frame around 150–160 ms. It is not our code: instrumenting `logic` and `ui` separately accounts for
+at most 2.4 ms of that frame. It is not startup either, since the benchmark discards 60 warmup
+frames and reports their worst separately (30–75 ms). The obvious hypothesis — that per-frame
+texture allocation churn stalls the driver — was **tested and disproved**: widening the retain
+window from 3 to 8 pages left the tail unchanged across repeated runs. So the cause lies below our
+layer, in eframe, wgpu, the driver, or the compositor, and is not yet explained. Worth chasing
+before calling the viewer world-class, but it does not block Goal 1: 99% of frames are within
+budget under a scroll rate no human generates.
 
 **Benchmark document.** The standing M4 performance target should be a document with roughly
 these properties: **400 pages, two distinct page sizes** (e.g. 792x612 and 1224x792), and

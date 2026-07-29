@@ -12,5 +12,10 @@ publish.workspace = true
 hayro-syntax.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# Fixtures only. A dev-dependency cycle — porpoise-testkit depends on this crate —
+# which Cargo permits because the edge never reaches the shipped graph.
+porpoise-testkit.workspace = true
+
 [lints]
 workspace = true

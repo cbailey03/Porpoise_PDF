@@ -507,6 +507,14 @@ twice as far as a screen.
   but the moment search or selection lands, the addressing scheme from §1 has to be designed
   properly. hayro has no text-extraction API (`goal-1-plan.md` §5), so this is a Goal 4 problem that
   Goal 2's constraint will shape.
+- **A window starved of frames stops answering.** `serve_control` runs inside `logic()`, so the
+  control channel only makes progress when a frame does. Found because eight end-to-end tests
+  opening eight GPU windows at once starved each other, and whichever test was waiting on a reply
+  timed out after a minute — the tests now take a lock so only one window exists at a time. The open
+  question is whether a *minimised or fully occluded* window hits the same thing in normal use. There
+  is a `ctx.request_repaint()` per frame whenever a control channel is attached, which should keep it
+  alive as long as the platform delivers any frames at all, but that has not been tested against a
+  minimised window on any platform.
 - **The ~150 ms frame outlier is still unexplained** (`goal-1-plan.md` §6b). It is not our code, and
   it does not block any of this — but an agent that waits on `Idle` and measures timings will see it,
   so it may finally get diagnosed by something other than a human noticing a hitch.

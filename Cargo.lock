@@ -2708,6 +2708,7 @@ name = "porpoise-doc"
 version = "0.1.0"
 dependencies = [
  "hayro-syntax",
+ "porpoise-testkit",
  "thiserror 2.0.19",
 ]
 
@@ -2718,6 +2719,7 @@ dependencies = [
  "hayro",
  "png",
  "porpoise-doc",
+ "porpoise-testkit",
  "thiserror 2.0.19",
  "tracing",
 ]

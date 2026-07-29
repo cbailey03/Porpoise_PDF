@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use porpoise_testkit::multi_page_pdf;
@@ -41,16 +42,36 @@ const PAGES: usize = 6;
 /// disagree, the assertion that uses it fails loudly rather than drifting.
 const PAGE_GAP_PT: f64 = 12.0;
 
-/// Whether the environment can open a window.
-fn e2e_enabled() -> bool {
-    std::env::var_os("PORPOISE_E2E").is_some()
-}
-
-/// Announces a skip rather than passing quietly.
+/// Serializes these tests against one another.
 ///
-/// A test that silently does nothing reads as coverage it is not providing.
-fn skip(name: &str) {
-    eprintln!("SKIPPED {name}: set PORPOISE_E2E=1 (needs a display) to run it");
+/// Each opens a real GPU window, and the control channel is serviced *inside the frame
+/// loop* — so a window starved of frames is a window that has stopped answering.
+/// Eight of them contending for one adapter starve each other, and whichever test is
+/// waiting on a reply then times out after a minute.
+///
+/// Measured, not guessed: run alone the offending test passed three times out of
+/// three, `--test-threads=1` passes all eight in 7.5 s, and the parallel run failed
+/// intermittently. A lock rather than a note asking for `--test-threads=1`, so it
+/// holds however cargo is invoked.
+static ONE_WINDOW_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Skips loudly when there is no display, and otherwise takes the window lock.
+///
+/// One call rather than a skip check and a separate lock, so the lock cannot be
+/// forgotten: there is no way past this line without holding it. A test that silently
+/// does nothing reads as coverage it is not providing, hence the message.
+fn e2e(name: &str) -> Option<MutexGuard<'static, ()>> {
+    if std::env::var_os("PORPOISE_E2E").is_none() {
+        eprintln!("SKIPPED {name}: set PORPOISE_E2E=1 (needs a display) to run it");
+        return None;
+    }
+    // Poisoning is ignored on purpose. A panicking test has already reported itself,
+    // and refusing the lock afterwards would turn one failure into eight.
+    Some(
+        ONE_WINDOW_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// A running `porpoise serve` and its two pipes.
@@ -204,10 +225,9 @@ fn scratch(name: &str) -> PathBuf {
 
 #[test]
 fn an_agent_can_open_navigate_and_capture() {
-    if !e2e_enabled() {
-        skip("an_agent_can_open_navigate_and_capture");
+    let Some(_window) = e2e("an_agent_can_open_navigate_and_capture") else {
         return;
-    }
+    };
 
     let document = fixture("e2e-navigate.pdf");
     let capture = scratch("e2e-capture.png");
@@ -308,10 +328,9 @@ fn an_agent_can_open_navigate_and_capture() {
 
 #[test]
 fn a_capture_leaves_the_window_open_for_more_commands() {
-    if !e2e_enabled() {
-        skip("a_capture_leaves_the_window_open_for_more_commands");
+    let Some(_window) = e2e("a_capture_leaves_the_window_open_for_more_commands") else {
         return;
-    }
+    };
 
     // The regression this exists for: `capture` closed the window, because the
     // capture machinery was written for the one-shot CLI `--screenshot` flag, where
@@ -373,10 +392,9 @@ fn a_capture_leaves_the_window_open_for_more_commands() {
 
 #[test]
 fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
-    if !e2e_enabled() {
-        skip("an_agent_can_open_a_document_that_was_not_on_the_command_line");
+    let Some(_window) = e2e("an_agent_can_open_a_document_that_was_not_on_the_command_line") else {
         return;
-    }
+    };
 
     // No file argument: the window starts empty, which is the case that matters for
     // an agent choosing what to look at.
@@ -437,10 +455,9 @@ fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
 
 #[test]
 fn an_empty_window_can_still_be_captured() {
-    if !e2e_enabled() {
-        skip("an_empty_window_can_still_be_captured");
+    let Some(_window) = e2e("an_empty_window_can_still_be_captured") else {
         return;
-    }
+    };
 
     // The regression: `capture` waited on `open.settled() && !cache.is_empty()`, which
     // with no document is false forever — so the request was never sent and the
@@ -496,10 +513,9 @@ fn an_empty_window_can_still_be_captured() {
 
 #[test]
 fn a_file_that_will_not_open_reports_a_visible_reason() {
-    if !e2e_enabled() {
-        skip("a_file_that_will_not_open_reports_a_visible_reason");
+    let Some(_window) = e2e("a_file_that_will_not_open_reports_a_visible_reason") else {
         return;
-    }
+    };
 
     // Goal 3's third part. Until the file picker existed, a bad path was a startup
     // error printed to a terminal; now it is something a person does at runtime, so
@@ -566,10 +582,9 @@ fn a_file_that_will_not_open_reports_a_visible_reason() {
 
 #[test]
 fn a_malformed_message_is_refused_without_killing_the_session() {
-    if !e2e_enabled() {
-        skip("a_malformed_message_is_refused_without_killing_the_session");
+    let Some(_window) = e2e("a_malformed_message_is_refused_without_killing_the_session") else {
         return;
-    }
+    };
 
     let document = fixture("e2e-malformed.pdf");
     let mut serve = Serve::start(&document);
@@ -608,10 +623,9 @@ fn a_malformed_message_is_refused_without_killing_the_session() {
 
 #[test]
 fn a_refused_command_explains_itself_and_changes_nothing() {
-    if !e2e_enabled() {
-        skip("a_refused_command_explains_itself_and_changes_nothing");
+    let Some(_window) = e2e("a_refused_command_explains_itself_and_changes_nothing") else {
         return;
-    }
+    };
 
     let document = fixture("e2e-refused.pdf");
     let mut serve = Serve::start(&document);
@@ -663,10 +677,9 @@ fn a_refused_command_explains_itself_and_changes_nothing() {
 
 #[test]
 fn closing_stdin_shuts_the_program_down() {
-    if !e2e_enabled() {
-        skip("closing_stdin_shuts_the_program_down");
+    let Some(_window) = e2e("closing_stdin_shuts_the_program_down") else {
         return;
-    }
+    };
 
     // The convention every stdio protocol follows: when the controller goes away,
     // so do we. Without it an abandoned window survives its agent.

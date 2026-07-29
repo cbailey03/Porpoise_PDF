@@ -15,5 +15,16 @@ png.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Fixtures and the mutation harness. This is a dependency *cycle* — porpoise-testkit
+# depends on this crate for `RenderedPage` — and Cargo permits it because the edge is
+# a dev-dependency, so it never reaches the shipped graph.
+#
+# Worth the cycle: these tests belong with the code they test. They previously lived
+# in porpoise-testkit/tests/, which meant `cargo test -p porpoise-render` reported
+# "0 passed" while 39 tests for it existed elsewhere. A green zero reads as "nothing
+# to check".
+porpoise-testkit.workspace = true
+
 [lints]
 workspace = true

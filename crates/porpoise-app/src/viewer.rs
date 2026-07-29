@@ -26,7 +26,23 @@
 //! "every feature is programmatically controllable" structural rather than
 //! aspirational — there is no second way in to be forgotten about.
 //!
-//! Frame-time measurement and window capture live in [`crate::devtools`].
+//! # What lives elsewhere
+//!
+//! This module is the *stateful shell*: the frame loop, dispatch, and painting. The
+//! pieces that do not need any of that state were pulled out, which is why they have
+//! unit tests and this does not:
+//!
+//! | Module | What |
+//! |---|---|
+//! | [`crate::input`] | Key press to [`Command`] — pure |
+//! | [`crate::failure`] | Whether a failed render is worth retrying — pure policy |
+//! | [`crate::tiles`] | Rasterized page to egui texture — the GPU boundary |
+//! | [`crate::picker`] | The file dialog, off the frame loop |
+//! | [`crate::devtools`] | Frame timing and window capture |
+//!
+//! What remains has no unit tests, and that is deliberate rather than an oversight:
+//! everything left needs a live `egui::Context`, a GPU adapter, or both. It is
+//! covered by `tests/control.rs`, which drives the real binary over a real pipe.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use porpoise_doc::Document;
-use porpoise_render::{HayroRenderer, RenderError, RenderPool, RenderedPage};
+use porpoise_render::{HayroRenderer, RenderPool, RenderedPage};
 use porpoise_view::{
     CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PAGE_GAP_PT, PageCache, PageNumber, ScrollLayout,
     ScrollMode, View, ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
@@ -46,8 +62,11 @@ use crate::control::Control;
 use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
 };
+use crate::failure::Failure;
+use crate::input::{command_for_key, opens_the_picker};
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
+use crate::tiles::{FULL_UV, to_color_image};
 
 /// Byte budget for cached page textures.
 ///
@@ -81,71 +100,11 @@ const MAX_RESULTS_PER_FRAME: usize = 8;
 /// show an error tile rather than leave a page blank for ten seconds.
 const JOB_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Extra attempts a page gets after a timeout, beyond the first.
-///
-/// Three attempts total, costing at most three [`JOB_TIMEOUT`] periods of one
-/// worker. Bounded because the failure might be the machine and might be the
-/// page, and we cannot tell which from here.
-const MAX_RENDER_RETRIES: u8 = 2;
-
-/// Fraction of the viewport a page-down moves in free-scroll mode.
-///
-/// Slightly less than a full screen so a line or two carries over, which makes it
-/// obvious nothing was skipped.
-const VIEWPORT_STEP_FRACTION: f64 = 0.9;
-
-/// How far an arrow key scrolls, in PDF points.
-const ARROW_STEP_PT: f64 = 48.0;
-
 /// Frames a command-triggered capture waits before asking.
 const CAPTURE_WARMUP_FRAMES: u32 = 3;
 
 /// Frames after which a capture gives up rather than leaving a window open.
 const CAPTURE_BUDGET_FRAMES: u32 = 240;
-
-/// A rasterization that failed, and whether it is worth another attempt.
-struct Failure {
-    /// The renderer's own message, shown on the error tile.
-    message: String,
-    /// Attempts remaining. Zero means we have given up on this rasterization.
-    retries_left: u8,
-}
-
-impl Failure {
-    /// The failure to record for `error`, carrying over whatever retries an
-    /// earlier attempt at the same rasterization had left.
-    ///
-    /// A timeout usually means the machine was momentarily busy rather than that
-    /// this page is unrenderable, so it earns another attempt. Every other failure
-    /// is deterministic — the index is out of range, the size is refused, or the
-    /// interpreter panicked — and retrying one only burns a worker to arrive at
-    /// the same answer.
-    fn from_error(error: &RenderError, previous: Option<&Self>) -> Self {
-        let retries_left = if matches!(error, RenderError::TimedOut { .. }) {
-            previous.map_or(MAX_RENDER_RETRIES, |failure| failure.retries_left)
-        } else {
-            0
-        };
-        Self {
-            message: error.to_string(),
-            retries_left,
-        }
-    }
-
-    /// Spends one retry, reporting whether there was one to spend.
-    fn take_retry(&mut self) -> bool {
-        if self.retries_left == 0 {
-            return false;
-        }
-        self.retries_left -= 1;
-        true
-    }
-
-    /// Whether this rasterization has been abandoned.
-    fn gave_up(&self) -> bool {
-        self.retries_left == 0
-    }
-}
 
 /// Everything that belongs to one open document.
 ///
@@ -1240,81 +1199,6 @@ impl DispatchResult {
     }
 }
 
-/// Whether this key press asks for the file dialog.
-///
-/// Separate from [`command_for_key`] because the dialog is not a command — see
-/// [`crate::picker`]. Pure, so the binding is testable without a window.
-fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bool {
-    (modifiers.command || modifiers.ctrl) && key == egui::Key::O
-}
-
-/// Translates a key press into a command.
-///
-/// Pure, and mode-aware on purpose. `PageDown` means "next page" in paged mode and
-/// "next screenful" in free mode — so the *key handler* decides which command that
-/// is. Putting the mode dependence inside a command would mean an agent could
-/// never be sure what `NextPage` was going to do.
-fn command_for_key(
-    key: egui::Key,
-    modifiers: egui::Modifiers,
-    mode: ScrollMode,
-) -> Option<Command> {
-    if modifiers.command || modifiers.ctrl {
-        let command = match key {
-            egui::Key::Plus | egui::Key::Equals => ViewCommand::StepZoom { rungs: 1 },
-            egui::Key::Minus => ViewCommand::StepZoom { rungs: -1 },
-            egui::Key::Num0 => ViewCommand::SetZoom {
-                target: ZoomTarget::FitWidth,
-            },
-            egui::Key::Num1 => ViewCommand::SetZoom {
-                target: ZoomTarget::Fixed(1.0),
-            },
-            egui::Key::Num2 => ViewCommand::SetZoom {
-                target: ZoomTarget::FitPage,
-            },
-            _ => return None,
-        };
-        return Some(command.into());
-    }
-
-    // One screenful or one page, depending on the mode.
-    let advance = |forward: bool| -> ViewCommand {
-        let sign = if forward { 1.0 } else { -1.0 };
-        match mode {
-            ScrollMode::Paged if forward => ViewCommand::NextPage,
-            ScrollMode::Paged => ViewCommand::PreviousPage,
-            ScrollMode::Free => ViewCommand::ScrollByViewports {
-                fraction: VIEWPORT_STEP_FRACTION * sign,
-            },
-        }
-    };
-
-    let command = match key {
-        egui::Key::PageDown => advance(true),
-        egui::Key::PageUp => advance(false),
-        // Space is the reader's page-down; shift reverses it.
-        egui::Key::Space => advance(!modifiers.shift),
-        egui::Key::Home => ViewCommand::FirstPage,
-        egui::Key::End => ViewCommand::LastPage,
-        egui::Key::ArrowDown => ViewCommand::ScrollBy {
-            points: ARROW_STEP_PT,
-        },
-        egui::Key::ArrowUp => ViewCommand::ScrollBy {
-            points: -ARROW_STEP_PT,
-        },
-        // Rejected as `Unchanged` when the document fits the window, so these are
-        // harmless at fit-width and useful the moment anyone zooms in.
-        egui::Key::ArrowRight => ViewCommand::PanBy {
-            points: ARROW_STEP_PT,
-        },
-        egui::Key::ArrowLeft => ViewCommand::PanBy {
-            points: -ARROW_STEP_PT,
-        },
-        _ => return None,
-    };
-    Some(command.into())
-}
-
 impl eframe::App for Viewer {
     // egui 0.34 replaced `App::update(ctx, frame)` with `App::ui(ui, frame)` plus
     // this optional pre-pass. `logic` may not paint, which makes it the right
@@ -1358,385 +1242,5 @@ impl eframe::App for Viewer {
         // Our own cost, as distinct from the frame interval. If this stays well
         // under the frame budget, the pipeline has headroom.
         self.timing.ui_ms = started.elapsed().as_secs_f32() * 1000.0;
-    }
-}
-
-/// The whole texture, for `Painter::image`.
-const FULL_UV: egui::Rect = egui::Rect {
-    min: egui::Pos2 { x: 0.0, y: 0.0 },
-    max: egui::Pos2 { x: 1.0, y: 1.0 },
-};
-
-/// Converts a rasterized page into an egui image, or `None` if it could not be
-/// turned into a texture safely.
-///
-/// This is the last thing between the renderer and the GPU, and it exists because
-/// both steps past it are fallible in ways that end the process rather than the
-/// page:
-///
-/// - `ColorImage::from_rgba_unmultiplied` *panics* on a length mismatch, and a
-///   panic on the UI thread takes down the window.
-/// - `load_texture` hands the result to wgpu, which validates dimensions. A
-///   zero-width or zero-height image passes the length check trivially — zero
-///   bytes is exactly what `0 * h * 4` asks for — and then fails validation.
-///
-/// `HayroRenderer` refuses a sub-pixel page before either of these is reached, so
-/// neither case is reachable through the shipped renderer today. The guard does
-/// not rely on that: it is the boundary's job to hold whatever the [`Renderer`]
-/// on the other side happens to return.
-///
-/// [`Renderer`]: porpoise_render::Renderer
-fn to_color_image(page: &RenderedPage) -> Option<egui::ColorImage> {
-    if page.width == 0 || page.height == 0 {
-        return None;
-    }
-    let width = usize::try_from(page.width).ok()?;
-    let height = usize::try_from(page.height).ok()?;
-    let expected = width.checked_mul(height)?.checked_mul(4)?;
-    if expected != page.rgba.len() {
-        return None;
-    }
-    // Our buffers are non-premultiplied, which is what this constructor wants.
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        [width, height],
-        &page.rgba,
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn page(width: u32, height: u32, bytes: usize) -> RenderedPage {
-        RenderedPage {
-            width,
-            height,
-            rgba: vec![0; bytes],
-        }
-    }
-
-    // --- to_color_image: the UI-thread panic guard ---------------------------
-
-    #[test]
-    fn a_consistent_buffer_converts() {
-        let image = to_color_image(&page(4, 3, 4 * 3 * 4)).expect("4x3 RGBA should convert");
-        assert_eq!(image.size, [4, 3]);
-    }
-
-    #[test]
-    fn a_short_buffer_is_refused_rather_than_panicking() {
-        // One byte short. `ColorImage::from_rgba_unmultiplied` would panic here,
-        // on the UI thread, closing the window.
-        assert!(to_color_image(&page(4, 3, 4 * 3 * 4 - 1)).is_none());
-    }
-
-    #[test]
-    fn a_long_buffer_is_refused_too() {
-        // Trailing bytes mean the renderer and the header disagree; we cannot tell
-        // which is right, so refuse rather than display a guess.
-        assert!(to_color_image(&page(4, 3, 4 * 3 * 4 + 1)).is_none());
-    }
-
-    #[test]
-    fn a_zero_sized_page_is_refused() {
-        assert!(to_color_image(&page(0, 3, 0)).is_none());
-        assert!(to_color_image(&page(4, 0, 0)).is_none());
-    }
-
-    #[test]
-    fn dimensions_that_would_overflow_are_refused() {
-        assert!(to_color_image(&page(u32::MAX, u32::MAX, 16)).is_none());
-    }
-
-    // --- Failure: the retry policy -------------------------------------------
-
-    fn timed_out() -> RenderError {
-        RenderError::TimedOut {
-            index: 3,
-            timeout_ms: 5_000,
-        }
-    }
-
-    fn panicked() -> RenderError {
-        RenderError::Panicked { index: 3 }
-    }
-
-    #[test]
-    fn a_timeout_starts_with_a_retry_budget() {
-        let failure = Failure::from_error(&timed_out(), None);
-        assert_eq!(failure.retries_left, MAX_RENDER_RETRIES);
-        assert!(
-            !failure.gave_up(),
-            "a first timeout must not abandon the page"
-        );
-    }
-
-    #[test]
-    fn a_deterministic_failure_is_not_retried() {
-        // Retrying a panic, a refused size, or a bad index only burns a worker to
-        // reach the same answer.
-        for error in [
-            panicked(),
-            RenderError::NoSuchPage { index: 3, count: 1 },
-            RenderError::AreaTooLarge {
-                index: 3,
-                width: 60_000,
-                height: 30_000,
-                total_pixels: 1_800_000_000,
-                max_total_pixels: 1 << 20,
-            },
-        ] {
-            let failure = Failure::from_error(&error, None);
-            assert!(failure.gave_up(), "{error:?} should not be retried");
-        }
-    }
-
-    #[test]
-    fn repeated_timeouts_exhaust_the_budget_and_then_give_up() {
-        // The exact loop the viewer runs: request spends a retry, the render fails,
-        // the new failure carries the reduced budget forward.
-        let mut failure = Failure::from_error(&timed_out(), None);
-        let mut attempts = 1;
-
-        while failure.take_retry() {
-            attempts += 1;
-            failure = Failure::from_error(&timed_out(), Some(&failure));
-        }
-
-        assert_eq!(
-            attempts,
-            usize::from(MAX_RENDER_RETRIES) + 1,
-            "expected one initial attempt plus {MAX_RENDER_RETRIES} retries"
-        );
-        assert!(failure.gave_up());
-        assert!(
-            !failure.take_retry(),
-            "an exhausted failure must stay exhausted"
-        );
-    }
-
-    #[test]
-    fn a_timeout_that_later_panics_stops_being_retried() {
-        // The budget must not survive a change of failure kind: if the page turns
-        // out to panic, retrying it is pointless however many timeouts preceded it.
-        let first = Failure::from_error(&timed_out(), None);
-        let second = Failure::from_error(&panicked(), Some(&first));
-        assert!(second.gave_up());
-    }
-
-    #[test]
-    fn the_failure_message_is_the_renderers_own() {
-        // It is shown on the error tile, so it has to say which failure this was.
-        let failure = Failure::from_error(&timed_out(), None);
-        assert!(
-            failure.message.contains("5000 ms"),
-            "unhelpful message: {}",
-            failure.message
-        );
-    }
-
-    // --- Key translation -----------------------------------------------------
-
-    fn none() -> egui::Modifiers {
-        egui::Modifiers::NONE
-    }
-
-    fn ctrl() -> egui::Modifiers {
-        egui::Modifiers::CTRL
-    }
-
-    fn key(key: egui::Key, modifiers: egui::Modifiers, mode: ScrollMode) -> Option<Command> {
-        command_for_key(key, modifiers, mode)
-    }
-
-    #[test]
-    fn ctrl_o_asks_for_the_file_dialog_and_is_not_a_command() {
-        assert!(opens_the_picker(egui::Key::O, ctrl()));
-        assert!(
-            key(egui::Key::O, ctrl(), ScrollMode::Free).is_none(),
-            "the dialog is not a command; `command_for_key` must not claim this key"
-        );
-    }
-
-    #[test]
-    fn a_bare_o_does_not_open_the_dialog() {
-        // Guards against the dialog appearing while someone is typing.
-        assert!(!opens_the_picker(egui::Key::O, none()));
-    }
-
-    #[test]
-    fn ctrl_with_another_key_does_not_open_the_dialog() {
-        assert!(!opens_the_picker(egui::Key::P, ctrl()));
-    }
-
-    #[test]
-    fn page_down_means_a_page_in_paged_mode_and_a_screenful_in_free_mode() {
-        // This is the mode-dependence the command model deliberately keeps in the
-        // key handler rather than inside `NextPage`.
-        assert_eq!(
-            key(egui::Key::PageDown, none(), ScrollMode::Paged),
-            Some(ViewCommand::NextPage.into())
-        );
-        assert_eq!(
-            key(egui::Key::PageDown, none(), ScrollMode::Free),
-            Some(
-                ViewCommand::ScrollByViewports {
-                    fraction: VIEWPORT_STEP_FRACTION
-                }
-                .into()
-            )
-        );
-    }
-
-    #[test]
-    fn page_up_reverses_the_direction_in_both_modes() {
-        assert_eq!(
-            key(egui::Key::PageUp, none(), ScrollMode::Paged),
-            Some(ViewCommand::PreviousPage.into())
-        );
-        assert_eq!(
-            key(egui::Key::PageUp, none(), ScrollMode::Free),
-            Some(
-                ViewCommand::ScrollByViewports {
-                    fraction: -VIEWPORT_STEP_FRACTION
-                }
-                .into()
-            )
-        );
-    }
-
-    #[test]
-    fn space_pages_forward_and_shift_space_pages_back() {
-        assert_eq!(
-            key(egui::Key::Space, none(), ScrollMode::Paged),
-            Some(ViewCommand::NextPage.into())
-        );
-        assert_eq!(
-            key(egui::Key::Space, egui::Modifiers::SHIFT, ScrollMode::Paged),
-            Some(ViewCommand::PreviousPage.into())
-        );
-    }
-
-    #[test]
-    fn home_and_end_jump_to_the_ends_regardless_of_mode() {
-        for mode in [ScrollMode::Free, ScrollMode::Paged] {
-            assert_eq!(
-                key(egui::Key::Home, none(), mode),
-                Some(ViewCommand::FirstPage.into())
-            );
-            assert_eq!(
-                key(egui::Key::End, none(), mode),
-                Some(ViewCommand::LastPage.into())
-            );
-        }
-    }
-
-    #[test]
-    fn arrows_scroll_a_small_fixed_step() {
-        assert_eq!(
-            key(egui::Key::ArrowDown, none(), ScrollMode::Free),
-            Some(
-                ViewCommand::ScrollBy {
-                    points: ARROW_STEP_PT
-                }
-                .into()
-            )
-        );
-        assert_eq!(
-            key(egui::Key::ArrowUp, none(), ScrollMode::Free),
-            Some(
-                ViewCommand::ScrollBy {
-                    points: -ARROW_STEP_PT
-                }
-                .into()
-            )
-        );
-    }
-
-    #[test]
-    fn ctrl_bindings_control_zoom() {
-        assert_eq!(
-            key(egui::Key::Num0, ctrl(), ScrollMode::Free),
-            Some(
-                ViewCommand::SetZoom {
-                    target: ZoomTarget::FitWidth
-                }
-                .into()
-            )
-        );
-        assert_eq!(
-            key(egui::Key::Num1, ctrl(), ScrollMode::Free),
-            Some(
-                ViewCommand::SetZoom {
-                    target: ZoomTarget::Fixed(1.0)
-                }
-                .into()
-            )
-        );
-        assert_eq!(
-            key(egui::Key::Num2, ctrl(), ScrollMode::Free),
-            Some(
-                ViewCommand::SetZoom {
-                    target: ZoomTarget::FitPage
-                }
-                .into()
-            )
-        );
-        assert_eq!(
-            key(egui::Key::Plus, ctrl(), ScrollMode::Free),
-            Some(ViewCommand::StepZoom { rungs: 1 }.into())
-        );
-        assert_eq!(
-            key(egui::Key::Minus, ctrl(), ScrollMode::Free),
-            Some(ViewCommand::StepZoom { rungs: -1 }.into())
-        );
-    }
-
-    #[test]
-    fn a_ctrl_binding_does_not_also_fire_its_unmodified_meaning() {
-        // Ctrl+End must not jump to the last page as a side effect of not being a
-        // zoom binding.
-        assert_eq!(key(egui::Key::End, ctrl(), ScrollMode::Free), None);
-        assert_eq!(key(egui::Key::Space, ctrl(), ScrollMode::Free), None);
-    }
-
-    #[test]
-    fn unbound_keys_produce_nothing() {
-        for k in [egui::Key::A, egui::Key::F5, egui::Key::Escape] {
-            assert_eq!(key(k, none(), ScrollMode::Free), None, "{k:?} is bound");
-        }
-    }
-
-    #[test]
-    fn every_key_binding_produces_a_command_an_agent_could_also_send() {
-        // The point of the model: nothing is reachable by keyboard alone. If a
-        // binding ever produced something outside the command set, this would be
-        // the place it showed up.
-        let bindings = [
-            (egui::Key::PageDown, none()),
-            (egui::Key::PageUp, none()),
-            (egui::Key::Space, none()),
-            (egui::Key::Home, none()),
-            (egui::Key::End, none()),
-            (egui::Key::ArrowDown, none()),
-            (egui::Key::ArrowUp, none()),
-            (egui::Key::Plus, ctrl()),
-            (egui::Key::Minus, ctrl()),
-            (egui::Key::Num0, ctrl()),
-            (egui::Key::Num1, ctrl()),
-            (egui::Key::Num2, ctrl()),
-        ];
-        let names = Command::all_names();
-        for (k, modifiers) in bindings {
-            for mode in [ScrollMode::Free, ScrollMode::Paged] {
-                let command = command_for_key(k, modifiers, mode)
-                    .unwrap_or_else(|| panic!("{k:?} produced no command"));
-                assert!(
-                    names.contains(&command.name()),
-                    "{k:?} produced {}, which is not in the command reference",
-                    command.name()
-                );
-            }
-        }
     }
 }

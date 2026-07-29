@@ -7,8 +7,11 @@
 mod command;
 mod control;
 mod devtools;
+mod failure;
+mod input;
 mod picker;
 mod protocol;
+mod tiles;
 mod viewer;
 
 use std::error::Error;

@@ -76,7 +76,7 @@ Supporting evidence for betting on it:
   issue tracker, and the pdfa.org large-scale corpus.
 - `hayro-interpret` exposes a **public `Device` trait** — we can receive drawing commands and
   drive our own renderer, and build a text/selection model from the same interpretation pass.
-  This matters a lot for the text layer (see §5), which is Goal 3.
+  This matters a lot for the text layer (see §5), which is Goal 4.
 - Permissive license, no C toolchain, no binary to ship.
 - Every other new pure-Rust PDF project (`stet`, `pdf_oxide`, `zpdf`) now consumes hayro's
   codec crates rather than reimplementing them. The ecosystem has converged here.
@@ -127,7 +127,7 @@ top recent committer accounts for only 11 of 84 commits.
 |---|---|
 | wgpu | On **wgpu 29** (current). `egui_wgpu::CallbackTrait` hands you `&mut RenderPass<'static>` inside normal layout — the most ergonomic custom-GPU-pass story of any Rust toolkit. |
 | Accessibility | AccessKit is **non-optional** since 0.34 and now load-bearing internally (0.35's inspection protocol reads the AccessKit tree). A world-class editor needs screen-reader support. |
-| Text selection | Cross-widget text selection already exists (`style.interaction.multi_widget_text_select`). Bare-bones, but a starting point for the text layer in Goal 3. |
+| Text selection | Cross-widget text selection already exists (`style.interaction.multi_widget_text_select`). Bare-bones, but a starting point for the text layer in Goal 4. |
 | Funding | Sponsored by Rerun; emilk is Rerun's co-founder and the Rerun Viewer is built on egui. Verifiable, unlike most alternatives. |
 | Cadence | 12 releases in 12 months. |
 
@@ -333,7 +333,7 @@ writing our own renderer now would be the single fastest way to never ship. What
   **per-glyph** — `draw_glyph(&mut self, glyph, transform, glyph_transform, paint, draw_mode)` —
   there is no `GlyphRun` batching, so per-call overhead is a real question to measure before
   committing.
-- **The text layer, Goal 3.** hayro has **no text-extraction API**; implementing `Device` and
+- **The text layer, Goal 4.** hayro has **no text-extraction API**; implementing `Device` and
   collecting positioned glyphs is the sanctioned workaround. Since each glyph arrives with its
   full transform, the same pass yields selection, search, and the AccessKit text tree. Worth
   knowing now because it validates the `porpoise-render` trait boundary.
@@ -492,7 +492,7 @@ Flagged rather than glossed, because each is a real risk:
   against a reader a human trusts — not a second engine wired into CI.
 - **hayro's documented gaps:** knockout groups, non-embedded CID fonts. Type 3 fonts render but
   [lack character-code access](https://github.com/LaurenzV/hayro/issues/1331) — that is a text
-  extraction problem for Goal 3, not a Goal 1 one.
+  extraction problem for Goal 4, not a Goal 1 one.
 - **Mesh shadings (PDF types 4–7)** — could not confirm whether hayro implements them.
 - **12- and 16-bit JPEG** — `zune-jpeg` hard-rejects any precision other than 8 bits, and no
   pure-Rust alternative was found. Rare in the wild, but a real hole.

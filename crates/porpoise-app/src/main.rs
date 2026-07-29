@@ -7,6 +7,7 @@
 mod command;
 mod control;
 mod devtools;
+mod picker;
 mod protocol;
 mod viewer;
 
@@ -254,21 +255,25 @@ fn run_viewer(
     scroll_benchmark: Option<u32>,
     report_first_page_from: Option<Instant>,
 ) -> Result<(), Box<dyn Error>> {
-    // There is no file dialog yet, so with no path there is nothing to show.
-    // Opening an empty window would be worse than saying so.
-    let Some(file) = file else {
-        return Err("no file given — try `porpoise <file.pdf>`, or `porpoise --help`".into());
-    };
-
-    let document = Document::open(file)?;
-
-    let start_page = match start_page {
-        Some(page) => Some(checked_page(page, document.page_count(), file)?),
+    // No path is no longer an error: the window opens empty and waits for the file
+    // picker. `serve` already behaved this way, so the two entry points now agree.
+    let document = match file {
+        Some(file) => Some((file.to_path_buf(), Document::open(file)?)),
         None => None,
     };
 
+    let start_page = match (start_page, &document) {
+        (Some(page), Some((file, document))) => {
+            Some(checked_page(page, document.page_count(), file)?)
+        }
+        // clap's `requires = "file"` makes this unreachable; returning keeps the
+        // invariant local rather than trusting the argument parser from here.
+        (Some(_), None) => return Err("--start-page needs a file".into()),
+        (None, _) => None,
+    };
+
     viewer::run(viewer::ViewerOptions {
-        document: Some((file.to_path_buf(), document)),
+        document,
         start_page,
         control: None,
         devtools: viewer::DevOptions {

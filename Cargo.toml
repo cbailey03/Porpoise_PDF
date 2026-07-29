@@ -40,6 +40,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 clap = { version = "4.6", features = ["derive"] }
+# The system file dialog (docs/goal-3-plan.md, section 2). Default features are
+# `xdg-portal` on Linux, *not* `gtk3` — so `gtk-sys`, `glib-sys` and `gobject-sys`
+# stay out of the tree and the dialog is pure Rust. On Windows it is COM through
+# `windows-sys`, which eframe already pulls in, so it costs one crate: `pollster`.
+rfd = "0.17.2"
 # The control channel's wire format (docs/goal-2-plan.md, section 4). Both are
 # already in the tree via the eframe stack, so this adds a direct edge rather
 # than new code.

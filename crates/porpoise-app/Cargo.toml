@@ -27,6 +27,7 @@ serde_json.workspace = true
 # Default features already select the wgpu backend in 0.35 (glow is now opt-in),
 # plus AccessKit, so there is nothing to override.
 eframe.workspace = true
+rfd.workspace = true
 
 [dev-dependencies]
 # Fixtures for the end-to-end control test. Dev-only, so it cannot reach the

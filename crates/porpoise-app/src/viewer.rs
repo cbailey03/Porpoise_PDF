@@ -46,6 +46,7 @@ use crate::control::Control;
 use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
 };
+use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 
 /// Vertical gap between pages, in PDF points.
@@ -285,6 +286,18 @@ struct Viewer {
     start_page: Option<PageNumber>,
     applied_start_page: bool,
 
+    /// The system file dialog, when one is open. See [`crate::picker`].
+    picker: FilePicker,
+
+    /// Why the last command failed, for the person to read.
+    ///
+    /// Failures used to go only to `tracing::warn!`, which for a windowed app means
+    /// nowhere. That was survivable while a bad path was a startup error printed to a
+    /// terminal; once a file can be chosen at runtime, "that would not open" is a
+    /// normal outcome and has to be visible. Also in [`Snapshot`], so an agent reads
+    /// exactly what a person sees.
+    last_error: Option<String>,
+
     frame: u32,
     benchmark: Option<ScrollBenchmark>,
     screenshot: Option<Screenshotter>,
@@ -341,6 +354,8 @@ impl Viewer {
             },
             start_page: options.start_page,
             applied_start_page: false,
+            picker: FilePicker::default(),
+            last_error: None,
             frame: 0,
             benchmark,
             screenshot,
@@ -411,6 +426,7 @@ impl Viewer {
             cache_bytes: self.open.as_ref().map_or(0, |open| open.cache.used_bytes()),
             renders_in_flight: self.open.as_ref().map_or(0, |open| open.in_flight.len()),
             failed_pages,
+            last_error: self.last_error.clone(),
             idle: self.settled(),
         }
     }
@@ -499,7 +515,23 @@ impl Viewer {
     // --- Commands -----------------------------------------------------------
 
     /// Carries out one command. The only path into view or document state.
+    ///
+    /// Wraps [`Self::carry_out`] purely to keep [`Self::last_error`] in step, so that
+    /// every producer — keyboard, toolbar, picker, control channel — reports failure
+    /// the same way rather than each remembering to.
     fn dispatch(&mut self, ctx: &egui::Context, command: Command) -> DispatchResult {
+        let result = self.carry_out(ctx, command);
+        match &result {
+            DispatchResult::Failed(message) => self.last_error = Some(message.clone()),
+            // A new or closed document is the natural point to clear it: whatever the
+            // message was about is no longer what is on screen.
+            DispatchResult::Opened | DispatchResult::Closed => self.last_error = None,
+            _ => {}
+        }
+        result
+    }
+
+    fn carry_out(&mut self, ctx: &egui::Context, command: Command) -> DispatchResult {
         match command {
             Command::View(view) => {
                 let layout = Self::layout_of(&self.open);
@@ -603,9 +635,27 @@ impl Viewer {
 
         let mode = self.state.scroll_mode();
         for (key, modifiers) in pressed {
+            // Ctrl+O is handled here rather than in `command_for_key`, and the reason
+            // is the point of the design: opening the dialog is not a command. That
+            // function's whole job is to turn a key into one, so a key that instead
+            // asks a person a question does not belong in it.
+            if opens_the_picker(key, modifiers) {
+                self.picker.open();
+                continue;
+            }
             if let Some(command) = command_for_key(key, modifiers, mode) {
                 self.dispatch(ctx, command);
             }
+        }
+    }
+
+    /// Turns a chosen path into an `Open` command. Never blocks.
+    fn collect_picked_file(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.picker.poll() {
+            // Through the normal dispatch, so it emits `DocumentOpened`, reaches the
+            // control channel, and reports failure exactly like an `open` from any
+            // other producer.
+            self.dispatch(ctx, Command::Open { path });
         }
     }
 
@@ -822,7 +872,7 @@ impl Viewer {
 
         if self.open.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.label("No document open. Pass a path, or send an `open` command.")
+                ui.label("No document open. Press Ctrl+O, or pass a path on the command line.")
             });
             return;
         }
@@ -956,8 +1006,20 @@ impl Viewer {
         let mut issued: Vec<Command> = Vec::new();
         let zoom_target = self.state.zoom_target();
         let paged = self.state.scroll_mode() == ScrollMode::Paged;
+        // Not pushed onto `issued`: the dialog is not a command. Collected the same
+        // way only because `ui` holds the borrow.
+        let mut open_picker = false;
 
         ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.picker.is_open(), egui::Button::new("Open…"))
+                .on_hover_text("Open a PDF (Ctrl+O)")
+                .clicked()
+            {
+                open_picker = true;
+            }
+            ui.separator();
+
             if ui.button("⏮").on_hover_text("First page (Home)").clicked() {
                 issued.push(ViewCommand::FirstPage.into());
             }
@@ -1015,6 +1077,9 @@ impl Viewer {
         });
 
         let ctx = ui.ctx().clone();
+        if open_picker {
+            self.picker.open();
+        }
         for command in issued {
             self.dispatch(&ctx, command);
         }
@@ -1069,8 +1134,15 @@ impl Viewer {
                     }
                 }
                 None => {
-                    ui.label("no document");
+                    ui.label("no document — Ctrl+O to open one");
                 }
+            }
+
+            // Last, and on every path: a failure with no document open is exactly the
+            // case the picker creates, so it must not live inside the `Some` arm.
+            if let Some(error) = &self.last_error {
+                ui.separator();
+                ui.colored_label(ui.visuals().error_fg_color, error);
             }
         });
     }
@@ -1098,10 +1170,16 @@ impl Viewer {
     }
 
     fn drive_screenshot(&mut self, ctx: &egui::Context) {
+        // `is_none_or`, not `is_some_and`: with no document there is no pipeline to
+        // wait for, so the window is as ready as it will ever be. Under
+        // `is_some_and` an empty window could never be captured at all — it would
+        // spin out the whole frame budget and report "no screenshot arrived". That
+        // did not matter while a path was mandatory; since Goal 3 an empty window is
+        // how the program starts.
         let ready = self
             .open
             .as_ref()
-            .is_some_and(|open| open.settled() && !open.cache.is_empty());
+            .is_none_or(|open| open.settled() && !open.cache.is_empty());
         let frame = self.frame;
         let Some(screenshotter) = &mut self.screenshot else {
             return;
@@ -1163,6 +1241,14 @@ impl DispatchResult {
             Self::Failed(error) => Reply::failed(id, error),
         }
     }
+}
+
+/// Whether this key press asks for the file dialog.
+///
+/// Separate from [`command_for_key`] because the dialog is not a command — see
+/// [`crate::picker`]. Pure, so the binding is testable without a window.
+fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    (modifiers.command || modifiers.ctrl) && key == egui::Key::O
 }
 
 /// Translates a key press into a command.
@@ -1245,6 +1331,7 @@ impl eframe::App for Viewer {
 
         let started = Instant::now();
         self.collect_renders(ctx);
+        self.collect_picked_file(ctx);
         self.handle_input(ctx);
         self.serve_control(ctx);
         self.timing.logic_ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -1463,6 +1550,26 @@ mod tests {
 
     fn key(key: egui::Key, modifiers: egui::Modifiers, mode: ScrollMode) -> Option<Command> {
         command_for_key(key, modifiers, mode)
+    }
+
+    #[test]
+    fn ctrl_o_asks_for_the_file_dialog_and_is_not_a_command() {
+        assert!(opens_the_picker(egui::Key::O, ctrl()));
+        assert!(
+            key(egui::Key::O, ctrl(), ScrollMode::Free).is_none(),
+            "the dialog is not a command; `command_for_key` must not claim this key"
+        );
+    }
+
+    #[test]
+    fn a_bare_o_does_not_open_the_dialog() {
+        // Guards against the dialog appearing while someone is typing.
+        assert!(!opens_the_picker(egui::Key::O, none()));
+    }
+
+    #[test]
+    fn ctrl_with_another_key_does_not_open_the_dialog() {
+        assert!(!opens_the_picker(egui::Key::P, ctrl()));
     }
 
     #[test]

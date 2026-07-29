@@ -34,9 +34,9 @@ something addressable by name is something assertable by name.
 
 ### Explicitly not in Goal 2
 
-- **Editing.** That becomes Goal 3. Note the ordering benefit: every edit operation will have to be
-  a command anyway, so doing the command model first means editing is built on it rather than
-  retrofitted into it.
+- **Editing.** That becomes Goal 4, after the file picker in Goal 3. Note the ordering benefit: every
+  edit operation will have to be a command anyway, so doing the command model first means editing is
+  built on it rather than retrofitted into it.
 - **A network-reachable API.** See §5.
 - **An embedded scripting language.** A command model plus a transport covers the need; a scripting
   runtime is a much larger dependency and answers no question we have.
@@ -505,7 +505,7 @@ twice as far as a screen.
   care around commands that depend on the previous one's derived result.
 - **How an agent should express "the text I can see."** Nothing in Goal 2 requires text extraction,
   but the moment search or selection lands, the addressing scheme from §1 has to be designed
-  properly. hayro has no text-extraction API (`goal-1-plan.md` §5), so this is a Goal 3 problem that
+  properly. hayro has no text-extraction API (`goal-1-plan.md` §5), so this is a Goal 4 problem that
   Goal 2's constraint will shape.
 - **The ~150 ms frame outlier is still unexplained** (`goal-1-plan.md` §6b). It is not our code, and
   it does not block any of this — but an agent that waits on `Idle` and measures timings will see it,

@@ -6,7 +6,7 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: Goals 1 and 2 are complete.** Open a PDF, scroll it freely or page by page,
+**Current state: Goals 1, 2 and 3 are complete.** Open a PDF, scroll it freely or page by page,
 navigate by keyboard, zoom by wheel, pinch, key, or fit mode, and pan sideways once a sheet is
 wider than the window. Pages rasterize on worker threads
 so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
@@ -17,7 +17,8 @@ Hardened against damaged input: 4,000 deterministic mutations plus every possibl
 of a valid PDF, all of which either open or return an error — none panic, none hang, and rejecting
 damaged input averages 7 µs.
 
-Still missing: a file dialog — a path is required.
+Open a file with `Ctrl+O` or the **Open…** button, or pass a path on the command line. Launching with
+no path opens an empty window rather than refusing to start.
 
 Rendering fidelity is validated against real documents and for determinism, not against another
 engine. Comparing output to PDFium is explicitly a non-goal: building this in pure Rust is the
@@ -28,6 +29,7 @@ sections 1 and 6a.
 
 | | |
 |---|---|
+| `Ctrl` `O` | Open a PDF |
 | `PageDown` / `Space` | Next page, or next screenful in free mode |
 | `PageUp` / `Shift+Space` | Previous |
 | `Home` / `End` | First / last page |

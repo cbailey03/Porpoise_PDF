@@ -237,6 +237,12 @@ pub(crate) struct Snapshot {
     pub(crate) renders_in_flight: usize,
     /// Pages we have stopped trying to render, counting from 1.
     pub(crate) failed_pages: Vec<PageNumber>,
+    /// Why the last command failed, or `None` if nothing has.
+    ///
+    /// The same string the status bar shows, so an agent reads what a person sees.
+    /// Cleared by the next successful open or close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_error: Option<String>,
     /// Nothing queued, nothing in flight, everything visible is drawn.
     ///
     /// The most useful field here. An agent that scrolls and then captures without

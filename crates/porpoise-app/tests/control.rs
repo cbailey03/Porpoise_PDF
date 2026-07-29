@@ -155,14 +155,18 @@ impl Serve {
         }
     }
 
-    /// Asks for a snapshot and returns its `view` object.
-    fn view(&mut self) -> Value {
+    /// Asks for a snapshot and returns the whole thing.
+    fn snapshot(&mut self) -> Value {
         let id = self.send("snapshot", &[]);
         let reply = self.reply_to(id);
         assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(true));
-        reply
-            .get("snapshot")
-            .and_then(|snapshot| snapshot.get("view"))
+        reply.get("snapshot").cloned().expect("a snapshot")
+    }
+
+    /// Asks for a snapshot and returns its `view` object.
+    fn view(&mut self) -> Value {
+        self.snapshot()
+            .get("view")
             .cloned()
             .expect("a snapshot with a view")
     }
@@ -426,6 +430,135 @@ fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
     assert_eq!(
         view.get("page_count").and_then(Value::as_u64),
         Some(PAGES as u64)
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn an_empty_window_can_still_be_captured() {
+    if !e2e_enabled() {
+        skip("an_empty_window_can_still_be_captured");
+        return;
+    }
+
+    // The regression: `capture` waited on `open.settled() && !cache.is_empty()`, which
+    // with no document is false forever — so the request was never sent and the
+    // attempt burned its whole frame budget before reporting "no screenshot arrived".
+    // Harmless while a path was mandatory. Since Goal 3 an empty window is how the
+    // program starts, so it is the first thing anyone would try to capture.
+    let capture = scratch("e2e-empty-window.png");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("porpoise should launch");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut serve = Serve {
+        child,
+        stdin,
+        lines,
+        next_id: 1,
+    };
+
+    let id = serve.send(
+        "capture",
+        &[("path", Value::from(capture.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    let event = serve.wait_for_event("captured");
+    assert!(
+        event.get("path").and_then(Value::as_str).is_some(),
+        "unexpected capture event: {event}"
+    );
+
+    let bytes = std::fs::read(&capture).expect("the capture should exist on disk");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = decoder.read_info().expect("should be a readable PNG");
+    assert!(reader.info().width > 100, "captured a sliver of a window");
+
+    serve.quit();
+}
+
+#[test]
+fn a_file_that_will_not_open_reports_a_visible_reason() {
+    if !e2e_enabled() {
+        skip("a_file_that_will_not_open_reports_a_visible_reason");
+        return;
+    }
+
+    // Goal 3's third part. Until the file picker existed, a bad path was a startup
+    // error printed to a terminal; now it is something a person does at runtime, so
+    // the reason has to be readable rather than going only to `tracing::warn!` — which
+    // for a windowed app means nowhere. The status bar and this field show the same
+    // string, so testing one covers what the other displays.
+    let document = fixture("e2e-open-failure.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    assert_eq!(
+        serve.snapshot().get("last_error"),
+        None,
+        "a healthy session reported an error"
+    );
+
+    let missing = scratch("e2e-does-not-exist.pdf");
+    let id = serve.send(
+        "open",
+        &[("path", Value::from(missing.to_string_lossy().as_ref()))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "opening a missing file claimed to succeed: {reply}"
+    );
+
+    let snapshot = serve.snapshot();
+    let reported = snapshot
+        .get("last_error")
+        .and_then(Value::as_str)
+        .expect("a failed open should leave a readable reason");
+    assert!(
+        reported.contains("e2e-does-not-exist"),
+        "the reason does not name the file: {reported}"
+    );
+
+    // The document that was already open stays open: a failed open must not also
+    // close what someone was reading.
+    assert_eq!(
+        serve.view().get("page_count").and_then(Value::as_u64),
+        Some(PAGES as u64),
+        "a failed open discarded the working document"
+    );
+
+    // And a successful open clears it, so a stale message cannot outlive its cause.
+    let id = serve.send(
+        "open",
+        &[("path", Value::from(document.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        serve.snapshot().get("last_error"),
+        None,
+        "the error survived a successful open"
     );
 
     serve.quit();

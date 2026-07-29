@@ -7,7 +7,8 @@ See [GOALS.md](GOALS.md) for what we're building and
 milestone plan.
 
 **Current state: Goals 1 and 2 are complete.** Open a PDF, scroll it freely or page by page,
-navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Pages rasterize on worker threads
+navigate by keyboard, zoom by wheel, pinch, key, or fit mode, and pan sideways once a sheet is
+wider than the window. Pages rasterize on worker threads
 so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
 than four hundred pages' worth, and a synthetic scroll of 40 pages per second holds a 60 fps median
 with our own code using under 15% of the frame budget.
@@ -31,6 +32,7 @@ sections 1 and 6a.
 | `PageUp` / `Shift+Space` | Previous |
 | `Home` / `End` | First / last page |
 | `↑` / `↓` | Small scroll step |
+| `←` / `→` | Pan sideways, once zoomed in past the window's width |
 | `Ctrl` + wheel, or pinch | Zoom |
 | `Ctrl` `+` / `Ctrl` `-` | Zoom by one step |
 | `Ctrl` `0` / `Ctrl` `1` / `Ctrl` `2` | Fit width / 100% / fit page |

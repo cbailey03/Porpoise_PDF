@@ -849,29 +849,53 @@ impl Viewer {
             self.layout().content_height_pt() as f32 * zoom,
         );
 
-        let mut scroll_area = egui::ScrollArea::vertical();
+        // Both axes, because zooming past fit-width makes the document wider than the
+        // window and the right-hand side of a landscape sheet is otherwise
+        // unreachable. `auto_shrink` defaults to true, which sizes the scroll area to
+        // its contents and puts the vertical scrollbar against the edge of the *page*
+        // rather than the edge of the window.
+        let mut scroll_area = egui::ScrollArea::both().auto_shrink([false; 2]);
 
         // Only override the offset on frames where a command asked for it, or the
         // operator could never scroll by hand. See `ViewState`'s module docs on why
         // egui keeps ownership of the live offset.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "scroll offsets are bounded by content extents"
+        )]
         if let Some(top_pt) = self.state.take_requested_scroll_pt() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "scroll offsets are bounded by content height"
-            )]
-            let offset = top_pt as f32 * zoom;
-            scroll_area = scroll_area.vertical_scroll_offset(offset);
+            scroll_area = scroll_area.vertical_scroll_offset(top_pt as f32 * zoom);
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "pan offsets are bounded by content width"
+        )]
+        if let Some(left_pt) = self.state.take_requested_scroll_left_pt() {
+            scroll_area = scroll_area.horizontal_scroll_offset(left_pt as f32 * zoom);
         }
 
         scroll_area.show_viewport(ui, |ui, viewport| {
-            let (content_rect, _response) =
-                ui.allocate_exact_size(content_size, egui::Sense::hover());
+            // Claim the full width even when the document is narrower, so the pages
+            // centre in the window rather than hugging the left edge with the
+            // scrollbar stranded out to the right of them.
+            let column_width = content_size.x.max(ui.available_width());
+            let (content_rect, _response) = ui.allocate_exact_size(
+                egui::vec2(column_width, content_size.y),
+                egui::Sense::hover(),
+            );
 
             // `viewport` is in content coordinates, so dividing by zoom converts
             // the scroll window back into PDF points. This is the reconciliation
             // point: egui tells us where it actually is.
             self.state
                 .report_scroll_top_pt(f64::from(viewport.min.y / zoom));
+            // The content column is at least as wide as the window, so when the
+            // document is narrower than the window the padding sits on both sides and
+            // the page's own left edge is not at x = 0. Report the offset relative to
+            // the page, not to the column, or panning would appear to start halfway.
+            let gutter = (column_width - content_size.x).max(0.0) * 0.5;
+            self.state
+                .report_scroll_left_pt(f64::from((viewport.min.x - gutter).max(0.0) / zoom));
 
             self.request_missing(pixels_per_point);
 
@@ -894,8 +918,10 @@ impl Viewer {
                     let rect = {
                         let size = egui::vec2(geometry.width_pt * zoom, geometry.height_pt * zoom);
                         // Centre each page in the column, so a narrow page among
-                        // wide ones does not sit flush left.
-                        let x = (content_size.x - size.x) * 0.5;
+                        // wide ones does not sit flush left. The column is at least
+                        // as wide as the window, so this also centres the whole
+                        // document when it is narrower than the window.
+                        let x = (column_width - size.x) * 0.5;
                         egui::Rect::from_min_size(
                             content_rect.min + egui::vec2(x, top_pt as f32 * zoom),
                             size,
@@ -1191,6 +1217,14 @@ fn command_for_key(
             points: ARROW_STEP_PT,
         },
         egui::Key::ArrowUp => ViewCommand::ScrollBy {
+            points: -ARROW_STEP_PT,
+        },
+        // Rejected as `Unchanged` when the document fits the window, so these are
+        // harmless at fit-width and useful the moment anyone zooms in.
+        egui::Key::ArrowRight => ViewCommand::PanBy {
+            points: ARROW_STEP_PT,
+        },
+        egui::Key::ArrowLeft => ViewCommand::PanBy {
             points: -ARROW_STEP_PT,
         },
         _ => return None,

@@ -72,6 +72,20 @@ pub enum ViewCommand {
     FirstPage,
     /// Scroll to the last page.
     LastPage,
+    /// Pan to an absolute horizontal offset, clamped to the content width.
+    ///
+    /// Separate commands rather than an axis field on [`Self::ScrollTo`], because the
+    /// coverage enforcement in `state.rs` works on *variants*: an axis field would be
+    /// a dimension no test was forced to cover.
+    PanTo {
+        /// Distance from the left edge of the content, in points.
+        points: f64,
+    },
+    /// Pan horizontally by a relative amount.
+    PanBy {
+        /// Points to move; negative goes left.
+        points: f64,
+    },
     /// Scroll to an absolute offset, clamped to the document.
     ScrollTo {
         /// Distance from the top of the document, in PDF points.
@@ -129,6 +143,8 @@ impl ViewCommand {
         Self::LastPage,
         Self::ScrollTo { points: 0.0 },
         Self::ScrollBy { points: 0.0 },
+        Self::PanTo { points: 0.0 },
+        Self::PanBy { points: 0.0 },
         Self::ScrollByViewports { fraction: 0.0 },
         Self::SetZoom {
             target: ZoomTarget::FitWidth,
@@ -150,6 +166,8 @@ impl ViewCommand {
             Self::LastPage => "last_page",
             Self::ScrollTo { .. } => "scroll_to",
             Self::ScrollBy { .. } => "scroll_by",
+            Self::PanTo { .. } => "pan_to",
+            Self::PanBy { .. } => "pan_by",
             Self::ScrollByViewports { .. } => "scroll_by_viewports",
             Self::SetZoom { .. } => "set_zoom",
             Self::StepZoom { .. } => "step_zoom",
@@ -234,6 +252,8 @@ mod tests {
                 | ViewCommand::LastPage
                 | ViewCommand::ScrollTo { .. }
                 | ViewCommand::ScrollBy { .. }
+                | ViewCommand::PanTo { .. }
+                | ViewCommand::PanBy { .. }
                 | ViewCommand::ScrollByViewports { .. }
                 | ViewCommand::SetZoom { .. }
                 | ViewCommand::StepZoom { .. }
@@ -245,7 +265,7 @@ mod tests {
         // but forgotten in `ALL` would slip through, so count them.
         assert_eq!(
             ViewCommand::ALL.len(),
-            11,
+            13,
             "ALL has {} entries; update this count deliberately when adding a command",
             ViewCommand::ALL.len()
         );

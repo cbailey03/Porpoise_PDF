@@ -412,8 +412,8 @@ mod tests {
         // `PageNumber` cannot hold zero, so deserialization refuses it. Worth a test
         // because the guarantee lives in a type rather than in code anybody reading
         // `decode` would see.
-        let failure = decode(r#"{"id":7,"command":"go_to_page","page":0}"#)
-            .expect_err("should be refused");
+        let failure =
+            decode(r#"{"id":7,"command":"go_to_page","page":0}"#).expect_err("should be refused");
         match failure.reason {
             DecodeError::BadArguments { command, .. } => assert_eq!(command, "go_to_page"),
             other => panic!("expected BadArguments, got {other:?}"),

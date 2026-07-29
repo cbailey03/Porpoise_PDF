@@ -27,10 +27,13 @@
 //!
 //! # Page numbers versus page indices
 //!
-//! Anything a person or an agent reads or writes is a [`PageNumber`], counting from
-//! 1. Anything that indexes a collection — `ScrollLayout`, the cache, the renderer —
-//! is a zero-based `usize`. [`PageNumber::index`] and [`PageNumber::from_index`] are
-//! the only way across, so an off-by-one cannot happen quietly.
+//! Anything a person or an agent reads or writes is a [`PageNumber`], where the first
+//! page is 1. Anything that indexes a collection — `ScrollLayout`, the cache, the
+//! renderer — is a zero-based `usize`. [`PageNumber::index`] and
+//! [`PageNumber::from_index`] are the only way across, so an off-by-one cannot happen
+//! quietly.
+//!
+//! Screen units are a third thing again, and [`Viewport`] documents that trap.
 //!
 //! The last two are Goal 2's foundation: every effect the viewer can produce is a
 //! [`ViewCommand`], and [`apply`] is the only thing that changes [`ViewState`].

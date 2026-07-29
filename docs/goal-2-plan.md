@@ -427,6 +427,52 @@ hang was in the test's own `reply_to`, which is what a real client's wait loop l
 re-read; the fix is a type that makes the id impossible to drop rather than a comment asking
 future readers to remember.
 
+## 7e. Horizontal panning, and the unit bug it uncovered
+
+The scroll area was `ScrollArea::vertical()`, so zooming past fit-width on a 1224 pt landscape
+drawing put the right-hand side of the sheet permanently out of reach — clipped, with no scrollbar
+and no key to get there. Reported from a screenshot after a related fix moved the vertical scrollbar
+to the window edge.
+
+Adding it meant adding *commands*, not a gesture. A pan reachable only by mouse would be precisely
+the click-only feature §2 exists to make unrepresentable. So `PanTo`/`PanBy` join the command set,
+`ViewState` gains `scroll_left_pt` and `requested_scroll_left_pt` with the same
+requested-versus-actual split as the vertical axis, and the snapshot reports both plus
+`max_scroll_left_pt`. The coverage enforcement did its job immediately: the library compiled fine and
+the *tests* refused to, because `ViewCommand::ALL`'s exhaustive match and the
+every-command-has-a-behaviour-test map both failed on the two new variants.
+
+Separate variants rather than an `axis` field on `ScrollTo`, because that enforcement works on
+variants — an axis field would have been a dimension nothing forced a test to cover.
+
+### The real find: pixels were being used as points
+
+`Viewport`'s fields were named `width_pt`/`height_pt` and held **egui points**, which are screen
+units. Everything else in the crate means **PDF points**, 1/72 inch. Two different things with the
+same name, and they are equal only at zoom 1.0.
+
+Two places consumed them as PDF points:
+
+- `max_scroll_pt` = `content_height_pt - viewport.height()`
+- `visible_pages(scroll_top_pt, viewport.height())`
+
+Both wrong at every zoom but 1.0. Measured on a real document at fit-width, zoom 0.8366: the viewer
+reported `max_scroll_pt` 7304 where the truth is 7162.6, and reported one page on screen where two
+were visible — so a page a person could see was never requested and showed as a placeholder.
+
+Why it survived: the default test viewport is 612 px against 612 pt pages, so fit-width computes
+*exactly* 1.0 and every existing assertion was taken at the one zoom where the bug is invisible. Two
+tests now pin it at other zooms.
+
+`Viewport`'s fields are `width_px`/`height_px`, `View::visible_height_pt`/`visible_width_pt` divide
+by zoom, and the snapshot's `viewport_*_pt` fields became `viewport_*_px`. This is the third bug in
+this family — after `force_scroll` in §7a and this one's two consequences — which is enough to treat
+"pixels and points are both called points" as the sharpest edge in the codebase rather than a passing
+inconvenience.
+
+`ScrollByViewports` was silently affected too: a "screenful" was a pixel count, so at 2x it advanced
+twice as far as a screen.
+
 ## 8. Open decisions
 
 1. **Does an agent get a window at all?** Still open, and now with a concrete cost attached: because

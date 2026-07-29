@@ -59,22 +59,33 @@ impl ScrollMode {
     }
 }
 
-/// The visible window, in PDF points.
+/// The visible window, in the shell's layout pixels.
 ///
 /// Environment rather than state: it comes from the window manager and the user's
 /// mouse, so nothing here sets it and no command changes it.
+///
+/// # Not PDF points
+///
+/// These fields used to be called `width_pt`/`height_pt`, and the collision is
+/// genuinely easy to fall into: egui calls its own device-independent unit a
+/// "point" too. But an egui point is a *screen* unit, while everything else in this
+/// crate is a *PDF* point of 1/72 inch, and the two are only equal at zoom 1.0.
+///
+/// The distinction is not cosmetic. `content_height_pt - viewport.height()` reads
+/// perfectly, was what the code did, and is wrong at every zoom but 1.0. Use
+/// [`View::visible_height_pt`] and [`View::visible_width_pt`], which divide by zoom.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
-    /// Usable width in points.
-    pub width_pt: f32,
-    /// Usable height in points.
-    pub height_pt: f32,
+    /// Usable width in layout pixels.
+    pub width_px: f32,
+    /// Usable height in layout pixels.
+    pub height_px: f32,
 }
 
 impl Viewport {
     /// A viewport of the given size, treating degenerate values as zero.
     #[must_use]
-    pub fn new(width_pt: f32, height_pt: f32) -> Self {
+    pub fn new(width_px: f32, height_px: f32) -> Self {
         let sane = |value: f32| {
             if value.is_finite() && value > 0.0 {
                 value
@@ -83,15 +94,41 @@ impl Viewport {
             }
         };
         Self {
-            width_pt: sane(width_pt),
-            height_pt: sane(height_pt),
+            width_px: sane(width_px),
+            height_px: sane(height_px),
         }
     }
 
-    /// Height as `f64`, which is the precision scroll offsets use.
+    /// Width as `f64`, the precision offsets use.
+    #[must_use]
+    pub fn width(self) -> f64 {
+        f64::from(self.width_px)
+    }
+
+    /// Height as `f64`, the precision offsets use.
     #[must_use]
     pub fn height(self) -> f64 {
-        f64::from(self.height_pt)
+        f64::from(self.height_px)
+    }
+}
+
+/// Converts a viewport extent in pixels into the document extent it covers.
+///
+/// The whole reason [`Viewport`] is measured in pixels and not points. A zoom factor
+/// is *window pixels per page point*, so fitting needs pixels — but a scroll bound
+/// needs points, and this is the only way across.
+///
+/// Getting this wrong does not look wrong. `content_height_pt - viewport.height()`
+/// reads perfectly and is correct at zoom 1.0, which is where most testing happens.
+/// At any other zoom it silently understates or overstates how far the document can
+/// scroll, and how many pages are on screen. Same family as the pixels-versus-points
+/// bug in `force_scroll`; see `docs/goal-2-plan.md` section 7a.
+fn extent_pt(pixels: f64, zoom: f32) -> f64 {
+    let zoom = f64::from(zoom);
+    if zoom.is_finite() && zoom > 0.0 {
+        pixels / zoom
+    } else {
+        pixels
     }
 }
 
@@ -100,6 +137,8 @@ impl Viewport {
 pub struct ViewState {
     scroll_top_pt: f64,
     requested_scroll_pt: Option<f64>,
+    scroll_left_pt: f64,
+    requested_scroll_left_pt: Option<f64>,
     zoom_target: ZoomTarget,
     scroll_mode: ScrollMode,
 }
@@ -109,6 +148,8 @@ impl Default for ViewState {
         Self {
             scroll_top_pt: 0.0,
             requested_scroll_pt: None,
+            scroll_left_pt: 0.0,
+            requested_scroll_left_pt: None,
             zoom_target: ZoomTarget::FitWidth,
             scroll_mode: ScrollMode::Free,
         }
@@ -171,6 +212,39 @@ impl ViewState {
         self.requested_scroll_pt.take()
     }
 
+    /// Where the viewport's left edge actually is, as last reported by the shell.
+    ///
+    /// Only meaningful when the document is wider than the window, which happens as
+    /// soon as anyone zooms past fit-width on a landscape sheet.
+    #[must_use]
+    pub fn scroll_left_pt(&self) -> f64 {
+        self.scroll_left_pt
+    }
+
+    /// A horizontal position asked for but not yet realized.
+    #[must_use]
+    pub fn requested_scroll_left_pt(&self) -> Option<f64> {
+        self.requested_scroll_left_pt
+    }
+
+    /// Where the view will be horizontally once any pending request is honoured.
+    #[must_use]
+    pub fn effective_scroll_left_pt(&self) -> f64 {
+        self.requested_scroll_left_pt.unwrap_or(self.scroll_left_pt)
+    }
+
+    /// Records where the shell actually panned to.
+    pub fn report_scroll_left_pt(&mut self, left_pt: f64) {
+        if left_pt.is_finite() {
+            self.scroll_left_pt = left_pt;
+        }
+    }
+
+    /// Takes any pending horizontal request, for the shell to apply.
+    pub fn take_requested_scroll_left_pt(&mut self) -> Option<f64> {
+        self.requested_scroll_left_pt.take()
+    }
+
     /// Reads this state together with the layout and viewport it means something
     /// against.
     #[must_use]
@@ -198,10 +272,10 @@ impl View<'_> {
     #[must_use]
     pub fn zoom(&self) -> f32 {
         match self.state.zoom_target {
-            ZoomTarget::FitWidth => self.layout.fit_width_scale(self.viewport.width_pt),
+            ZoomTarget::FitWidth => self.layout.fit_width_scale(self.viewport.width_px),
             ZoomTarget::FitPage => self
                 .layout
-                .fit_page_scale(self.viewport.width_pt, self.viewport.height_pt),
+                .fit_page_scale(self.viewport.width_px, self.viewport.height_px),
             // Clamped here as well as on the way in: a `Fixed` target can be set
             // from a wire message, and this is the boundary that matters.
             ZoomTarget::Fixed(scale) if scale.is_finite() => scale.clamp(MIN_SCALE, MAX_SCALE),
@@ -215,11 +289,23 @@ impl View<'_> {
         ZoomBucket::enclosing(self.zoom())
     }
 
+    /// How much document the window covers vertically, in points.
+    #[must_use]
+    pub fn visible_height_pt(&self) -> f64 {
+        extent_pt(self.viewport.height(), self.zoom())
+    }
+
+    /// How much document the window covers horizontally, in points.
+    #[must_use]
+    pub fn visible_width_pt(&self) -> f64 {
+        extent_pt(self.viewport.width(), self.zoom())
+    }
+
     /// The pages currently on screen.
     #[must_use]
     pub fn visible_pages(&self) -> Range<usize> {
         self.layout
-            .visible_pages(self.state.scroll_top_pt, self.viewport.height())
+            .visible_pages(self.state.scroll_top_pt, self.visible_height_pt())
     }
 
     /// The topmost page on screen, as a zero-based index.
@@ -253,7 +339,16 @@ impl View<'_> {
     /// The furthest the view can scroll before running out of document.
     #[must_use]
     pub fn max_scroll_pt(&self) -> f64 {
-        (self.layout.content_height_pt() - self.viewport.height()).max(0.0)
+        (self.layout.content_height_pt() - self.visible_height_pt()).max(0.0)
+    }
+
+    /// The furthest the view can pan before running out of page.
+    ///
+    /// Zero until zoom takes the document wider than the window, which is why
+    /// horizontal panning is invisible at fit-width and essential past it.
+    #[must_use]
+    pub fn max_scroll_left_pt(&self) -> f64 {
+        (self.layout.content_width_pt() - self.visible_width_pt()).max(0.0)
     }
 
     /// Everything about the view, in one readable value.
@@ -285,13 +380,17 @@ impl View<'_> {
             last_visible_page,
             scroll_top_pt: self.state.scroll_top_pt,
             pending_scroll_pt: self.state.requested_scroll_pt,
+            scroll_left_pt: self.state.scroll_left_pt,
+            pending_scroll_left_pt: self.state.requested_scroll_left_pt,
             content_height_pt: self.layout.content_height_pt(),
+            content_width_pt: self.layout.content_width_pt(),
             max_scroll_pt: self.max_scroll_pt(),
+            max_scroll_left_pt: self.max_scroll_left_pt(),
             zoom: self.zoom(),
             zoom_target: self.state.zoom_target,
             scroll_mode: self.state.scroll_mode,
-            viewport_width_pt: self.viewport.width_pt,
-            viewport_height_pt: self.viewport.height_pt,
+            viewport_width_px: self.viewport.width_px,
+            viewport_height_px: self.viewport.height_px,
         }
     }
 }
@@ -324,20 +423,33 @@ pub struct ViewSnapshot {
     pub scroll_top_pt: f64,
     /// Where a command has asked it to go but the shell has not yet moved it.
     pub pending_scroll_pt: Option<f64>,
+    /// Where the viewport's left edge is, in points.
+    pub scroll_left_pt: f64,
+    /// Where a command has asked it to pan but the shell has not yet moved it.
+    pub pending_scroll_left_pt: Option<f64>,
     /// Total scrollable height, in points.
     pub content_height_pt: f64,
+    /// Width of the widest page, in points.
+    pub content_width_pt: f64,
     /// The largest useful value of [`Self::scroll_top_pt`].
     pub max_scroll_pt: f64,
+    /// The largest useful value of [`Self::scroll_left_pt`]. Zero when the document
+    /// fits the window's width, which is the normal case at fit-width.
+    pub max_scroll_left_pt: f64,
     /// The zoom factor in force.
     pub zoom: f32,
     /// What the zoom factor was derived from.
     pub zoom_target: ZoomTarget,
     /// How navigation behaves.
     pub scroll_mode: ScrollMode,
-    /// Viewport width in points.
-    pub viewport_width_pt: f32,
-    /// Viewport height in points.
-    pub viewport_height_pt: f32,
+    /// Viewport width in layout **pixels**, not points.
+    ///
+    /// Pixels because that is what a zoom factor is measured against. Divide by
+    /// [`Self::zoom`] for the extent of document it covers — or just read
+    /// [`Self::max_scroll_left_pt`], which has already done it.
+    pub viewport_width_px: f32,
+    /// Viewport height in layout **pixels**. See [`Self::viewport_width_px`].
+    pub viewport_height_px: f32,
 }
 
 /// Carries out `command`, reporting what it did.
@@ -402,12 +514,31 @@ pub fn apply(
                     argument: "fraction",
                 });
             }
-            let points = viewport.height() * fraction;
+            // A screenful is however much document the window covers, which is a
+            // pixel height divided by zoom -- not the pixel height itself.
+            let points = state.with(layout, viewport).visible_height_pt() * fraction;
             request_scroll(
                 state,
                 layout,
                 viewport,
                 state.effective_scroll_pt() + points,
+            )
+        }
+        ViewCommand::PanTo { points } => {
+            if !points.is_finite() {
+                return Outcome::Rejected(Rejection::NotFinite { argument: "points" });
+            }
+            request_pan(state, layout, viewport, points)
+        }
+        ViewCommand::PanBy { points } => {
+            if !points.is_finite() {
+                return Outcome::Rejected(Rejection::NotFinite { argument: "points" });
+            }
+            request_pan(
+                state,
+                layout,
+                viewport,
+                state.effective_scroll_left_pt() + points,
             )
         }
         ViewCommand::SetZoom { target } => set_zoom(state, layout, viewport, target),
@@ -470,7 +601,7 @@ fn request_scroll(
     viewport: Viewport,
     target_pt: f64,
 ) -> Outcome {
-    if (clamp_scroll(layout, viewport, target_pt) - state.effective_scroll_pt()).abs()
+    if (clamp_scroll(state, layout, viewport, target_pt) - state.effective_scroll_pt()).abs()
         < SCROLL_EPSILON_PT
     {
         return Outcome::Unchanged;
@@ -492,12 +623,44 @@ fn request_scroll(
 /// points. Suppressing it because "the position is the same" would leave the view
 /// wherever the stale pixel offset happens to land.
 fn force_scroll(state: &mut ViewState, layout: &ScrollLayout, viewport: Viewport, target_pt: f64) {
-    state.requested_scroll_pt = Some(clamp_scroll(layout, viewport, target_pt));
+    state.requested_scroll_pt = Some(clamp_scroll(state, layout, viewport, target_pt));
 }
 
-fn clamp_scroll(layout: &ScrollLayout, viewport: Viewport, target_pt: f64) -> f64 {
-    let furthest = (layout.content_height_pt() - viewport.height()).max(0.0);
-    target_pt.clamp(0.0, furthest)
+fn clamp_scroll(
+    state: &ViewState,
+    layout: &ScrollLayout,
+    viewport: Viewport,
+    target_pt: f64,
+) -> f64 {
+    target_pt.clamp(0.0, state.with(layout, viewport).max_scroll_pt())
+}
+
+/// Asks the shell to pan, but only if that would actually move the view.
+fn request_pan(
+    state: &mut ViewState,
+    layout: &ScrollLayout,
+    viewport: Viewport,
+    target_pt: f64,
+) -> Outcome {
+    if (clamp_pan(state, layout, viewport, target_pt) - state.effective_scroll_left_pt()).abs()
+        < SCROLL_EPSILON_PT
+    {
+        return Outcome::Unchanged;
+    }
+    force_pan(state, layout, viewport, target_pt);
+    Outcome::Changed
+}
+
+/// Asks the shell to pan even if the position is unchanged.
+///
+/// Needed after a zoom change for exactly the reason [`force_scroll`] is: our
+/// position is in points and the shell's offset is in pixels.
+fn force_pan(state: &mut ViewState, layout: &ScrollLayout, viewport: Viewport, target_pt: f64) {
+    state.requested_scroll_left_pt = Some(clamp_pan(state, layout, viewport, target_pt));
+}
+
+fn clamp_pan(state: &ViewState, layout: &ScrollLayout, viewport: Viewport, target_pt: f64) -> f64 {
+    target_pt.clamp(0.0, state.with(layout, viewport).max_scroll_left_pt())
 }
 
 fn set_zoom(
@@ -524,10 +687,15 @@ fn set_zoom(
     // That also makes the anchor independent of the viewport, which matters because
     // a command can arrive before the first frame has measured one.
     let anchor = layout.page_at_pt(state.effective_scroll_pt()).unwrap_or(0);
+    let left_pt = state.effective_scroll_left_pt();
     state.zoom_target = target;
     if let Some(top_pt) = layout.page_top_pt(anchor) {
         force_scroll(state, layout, viewport, top_pt);
     }
+    // The horizontal axis needs the same treatment, and additionally needs
+    // re-clamping: zooming out can make the document narrower than the window, which
+    // takes `max_scroll_left_pt` to zero and makes any pan offset invalid.
+    force_pan(state, layout, viewport, left_pt);
     Outcome::Changed
 }
 
@@ -570,13 +738,36 @@ mod tests {
         apply(state, &ten_pages(), viewport(), command)
     }
 
-    /// Applies a command and settles the resulting request, as a frame would.
+    /// Applies a command and settles the resulting requests, as a frame would.
+    ///
+    /// Both axes, because a frame honours both — and because `set_zoom` produces a
+    /// request on each.
     fn run_and_settle(state: &mut ViewState, command: ViewCommand) -> Outcome {
         let outcome = run(state, command);
         if let Some(top) = state.take_requested_scroll_pt() {
             state.report_scroll_top_pt(top);
         }
+        if let Some(left) = state.take_requested_scroll_left_pt() {
+            state.report_scroll_left_pt(left);
+        }
         outcome
+    }
+
+    /// A view at 2x, where the 612 pt page is twice as wide as the 612 px window.
+    ///
+    /// Panning only exists past fit-width: *at* fit-width the document is exactly the
+    /// window's width by definition, so there is nowhere to pan. Every pan test needs
+    /// a zoom that overflows, which is the clearest statement of what the feature is
+    /// for.
+    fn zoomed_in() -> ViewState {
+        let mut state = ViewState::new();
+        run_and_settle(
+            &mut state,
+            ViewCommand::SetZoom {
+                target: ZoomTarget::Fixed(2.0),
+            },
+        );
+        state
     }
 
     // --- Coverage enforcement ------------------------------------------------
@@ -594,6 +785,8 @@ mod tests {
                 ViewCommand::LastPage => "last_page_goes_to_the_final_page",
                 ViewCommand::ScrollTo { .. } => "scroll_to_moves_to_an_absolute_offset",
                 ViewCommand::ScrollBy { .. } => "scroll_by_moves_relative_to_here",
+                ViewCommand::PanTo { .. } => "pan_to_moves_to_an_absolute_horizontal_offset",
+                ViewCommand::PanBy { .. } => "pan_by_moves_relative_to_here",
                 ViewCommand::ScrollByViewports { .. } => "scroll_by_viewports_uses_viewport_height",
                 ViewCommand::SetZoom { .. } => "set_zoom_changes_the_target_and_anchors",
                 ViewCommand::StepZoom { .. } => "step_zoom_moves_along_the_ladder",
@@ -612,10 +805,7 @@ mod tests {
     #[test]
     fn go_to_page_scrolls_to_that_pages_top() {
         let mut state = ViewState::new();
-        assert_eq!(
-            run(&mut state, go_to_index(3)),
-            Outcome::Changed
-        );
+        assert_eq!(run(&mut state, go_to_index(3)), Outcome::Changed);
         assert_eq!(state.requested_scroll_pt(), Some(3.0 * 792.0));
     }
 
@@ -748,6 +938,141 @@ mod tests {
             "got {}",
             state.scroll_top_pt()
         );
+    }
+
+    // --- Panning -------------------------------------------------------------
+
+    #[test]
+    fn panning_does_nothing_while_the_document_fits_the_window() {
+        // Why the arrow keys are harmless at fit-width rather than needing to be
+        // conditionally bound.
+        let mut state = ViewState::new();
+        assert_eq!(
+            state.with(&ten_pages(), viewport()).max_scroll_left_pt(),
+            0.0
+        );
+        assert_eq!(
+            run(&mut state, ViewCommand::PanTo { points: 100.0 }),
+            Outcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn pan_to_moves_to_an_absolute_horizontal_offset() {
+        let mut state = zoomed_in();
+        assert_eq!(
+            run_and_settle(&mut state, ViewCommand::PanTo { points: 120.0 }),
+            Outcome::Changed
+        );
+        assert_eq!(state.scroll_left_pt(), 120.0);
+    }
+
+    #[test]
+    fn pan_by_moves_relative_to_here() {
+        let mut state = zoomed_in();
+        run_and_settle(&mut state, ViewCommand::PanTo { points: 120.0 });
+        run_and_settle(&mut state, ViewCommand::PanBy { points: -50.0 });
+        assert_eq!(state.scroll_left_pt(), 70.0);
+    }
+
+    #[test]
+    fn panning_is_clamped_to_the_page_width() {
+        // A 612 pt page with 306 pt of it visible at 2x, so 306 is as far as it goes.
+        let mut state = zoomed_in();
+        run_and_settle(&mut state, ViewCommand::PanTo { points: 1.0e9 });
+        assert_eq!(state.scroll_left_pt(), 306.0);
+
+        run_and_settle(&mut state, ViewCommand::PanTo { points: -1.0e9 });
+        assert_eq!(state.scroll_left_pt(), 0.0);
+    }
+
+    #[test]
+    fn two_pans_in_one_frame_compose() {
+        // The same property batched navigation needs: both must not compute from the
+        // same stale position. See `effective_scroll_left_pt`.
+        let mut state = zoomed_in();
+        run(&mut state, ViewCommand::PanBy { points: 50.0 });
+        run(&mut state, ViewCommand::PanBy { points: 50.0 });
+        assert_eq!(state.requested_scroll_left_pt(), Some(100.0));
+    }
+
+    #[test]
+    fn zooming_out_pulls_a_pan_back_into_range() {
+        // The case that would strand the view: pan right at 2x, then return to
+        // fit-width where there is no horizontal room at all. A stale offset would
+        // leave the page shifted sideways with no scrollbar left to correct it.
+        let mut state = zoomed_in();
+        run_and_settle(&mut state, ViewCommand::PanTo { points: 306.0 });
+        run_and_settle(
+            &mut state,
+            ViewCommand::SetZoom {
+                target: ZoomTarget::FitWidth,
+            },
+        );
+        assert_eq!(state.scroll_left_pt(), 0.0);
+    }
+
+    #[test]
+    fn a_non_finite_pan_is_rejected_and_names_its_argument() {
+        let mut state = zoomed_in();
+        for points in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                run(&mut state, ViewCommand::PanTo { points }),
+                Outcome::Rejected(Rejection::NotFinite { argument: "points" })
+            );
+            assert_eq!(
+                run(&mut state, ViewCommand::PanBy { points }),
+                Outcome::Rejected(Rejection::NotFinite { argument: "points" })
+            );
+        }
+    }
+
+    // --- Pixels versus points ------------------------------------------------
+
+    #[test]
+    fn how_far_the_view_can_scroll_depends_on_zoom() {
+        // The bug this pins down: `max_scroll_pt` subtracted the viewport's *screen*
+        // height from the document's height in *PDF points*. Those agree only at zoom
+        // 1.0, which is exactly where the default test viewport sits, so every
+        // existing test passed. At 2x the window covers half as much document, so
+        // there is more of it left to scroll through.
+        let layout = ten_pages();
+        let mut state = ViewState::new();
+        assert_eq!(
+            state.with(&layout, viewport()).max_scroll_pt(),
+            7920.0 - 396.0
+        );
+
+        run_and_settle(
+            &mut state,
+            ViewCommand::SetZoom {
+                target: ZoomTarget::Fixed(2.0),
+            },
+        );
+        // 396 screen units at 2x is 198 pt of document.
+        assert_eq!(
+            state.with(&layout, viewport()).max_scroll_pt(),
+            7920.0 - 198.0
+        );
+    }
+
+    #[test]
+    fn how_many_pages_are_on_screen_depends_on_zoom() {
+        // The same bug's other consequence, and the more visible one: zoomed out far
+        // enough, pages that are genuinely on screen were not counted as visible, so
+        // they were never requested and showed as placeholders.
+        let layout = ten_pages();
+        let mut state = ViewState::new();
+        assert_eq!(state.with(&layout, viewport()).visible_pages(), 0..1);
+
+        run_and_settle(
+            &mut state,
+            ViewCommand::SetZoom {
+                target: ZoomTarget::Fixed(0.4),
+            },
+        );
+        // 396 screen units at 0.4 is 990 pt, which reaches into the second page.
+        assert_eq!(state.with(&layout, viewport()).visible_pages(), 0..2);
     }
 
     #[test]
@@ -895,12 +1220,7 @@ mod tests {
         let layout = ten_pages();
         let unmeasured = Viewport::new(0.0, 0.0);
 
-        apply(
-            &mut state,
-            &layout,
-            unmeasured,
-            go_to_index(3),
-        );
+        apply(&mut state, &layout, unmeasured, go_to_index(3));
         apply(
             &mut state,
             &layout,
@@ -1156,7 +1476,10 @@ mod tests {
                 page: PageNumber::FIRST,
             },
         );
-        assert_eq!(state.with(&layout, viewport()).snapshot().scroll_top_pt, 0.0);
+        assert_eq!(
+            state.with(&layout, viewport()).snapshot().scroll_top_pt,
+            0.0
+        );
         assert_eq!(
             state.with(&layout, viewport()).snapshot().current_page,
             PageNumber::new(1)

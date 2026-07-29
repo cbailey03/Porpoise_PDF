@@ -1,0 +1,15 @@
+[package]
+name = "porpoise-view"
+version = "0.1.0"
+description = "GUI-agnostic viewport logic: scroll layout, virtualization, and cache policy."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+porpoise-doc.workspace = true
+
+[lints]
+workspace = true

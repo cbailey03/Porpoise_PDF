@@ -1,0 +1,5 @@
+# `unwrap`/`expect` are denied in library code because panicking on untrusted
+# input is a DoS bug, but they are the clearest way to write a failing test.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true

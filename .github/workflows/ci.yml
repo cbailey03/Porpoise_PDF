@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT setting `RUSTFLAGS: -D warnings` here. Cargo applies
+  # RUSTFLAGS to dependencies as well as to our own crates, so a warning in any
+  # of the ~60 transitive crates would fail the build for something we cannot
+  # fix. Lints are configured per-crate via `[lints] workspace = true`, and the
+  # clippy job below passes `-D warnings` explicitly, which applies only to
+  # workspace members.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # NOTE: once eframe lands at M2, the Linux runner will need windowing
+      # system headers here (libxkbcommon-dev, libwayland-dev, libxi-dev, ...).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `-D warnings` after `--` applies to workspace members only, not to
+      # dependencies, which is why this is safe here but not as a global RUSTFLAGS.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  msrv:
+    name: msrv (1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins 1.97.1 and rustup honours it over whatever this
+      # job installs, which would silently make this a duplicate of the other
+      # jobs. Remove it so the MSRV toolchain is the one actually used.
+      - name: Remove the pinned build toolchain
+        run: rm rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources advisories
+
+  no-native-deps:
+    name: shipped binary is pure Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The security argument for this project rests on the shipped binary having
+      # no C PDF or codec library linked in. `deny.toml` bans the known offenders
+      # by name; this catches anything reaching the app through a new path,
+      # including the dev-only PDFium oracle leaking out of porpoise-testkit.
+      - name: Assert no PDFium or C codec in the app's runtime graph
+        run: |
+          tree=$(cargo tree --package porpoise-app --edges normal --prefix none)
+          echo "$tree"
+          for forbidden in pdfium mupdf openjpeg jpeg2k jbig2dec; do
+            if grep -qi "$forbidden" <<<"$tree"; then
+              echo "::error::'$forbidden' reached porpoise-app's runtime dependencies"
+              exit 1
+            fi
+          done

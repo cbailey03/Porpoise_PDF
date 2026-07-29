@@ -1,0 +1,67 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cbailey03/Porpoise_PDF"
+publish = false
+
+[workspace.dependencies]
+# --- Internal ---
+porpoise-doc = { path = "crates/porpoise-doc" }
+porpoise-render = { path = "crates/porpoise-render" }
+porpoise-view = { path = "crates/porpoise-view" }
+
+# --- PDF: parsing and rendering (see docs/goal-1-plan.md, section 1) ---
+hayro = "0.7.1"
+hayro-syntax = "0.7.2"
+# Document model for incremental save. Not used until the editor phase; declared
+# here so the version decision lives in one place.
+lopdf = "0.44"
+
+# --- Shell. Not wired until M2; see docs/goal-1-plan.md, section 4. ---
+egui = "0.35"
+eframe = "0.35"
+rfd = "0.17"
+
+# --- Support ---
+thiserror = "2.0"
+tracing = "0.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1.12"
+parking_lot = "0.12"
+
+# --- Dev / test only ---
+insta = "1.48"
+# Differential-testing oracle ONLY. Must never reach the shipped binary; it is an
+# optional dev-dependency of porpoise-testkit behind the `oracle` feature.
+pdfium-render = "0.9"
+
+# Applied to every member via `[lints] workspace = true`.
+[workspace.lints.rust]
+# The security case for this project rests on memory safety, so state it as a
+# machine-checked invariant rather than an intention.
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Panicking on untrusted input is a denial-of-service bug in this codebase, not a
+# style question. See docs/goal-1-plan.md, section 2.
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+
+[profile.release]
+# PDF rasterization is compute-bound; cross-crate inlining is worth the build time.
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+# Debug builds of a debug-built rasterizer are unusably slow. Optimize
+# dependencies while leaving our own crates debuggable.
+opt-level = 2

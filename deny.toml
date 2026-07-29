@@ -1,0 +1,109 @@
+# cargo-deny configuration.
+#
+# Two jobs here. The first is the obvious one: keep copyleft out of the dependency
+# graph. The second is to mechanically enforce the pure-Rust architecture decision
+# from docs/goal-1-plan.md, section 1 — several of the bans below are permissively
+# licensed and banned anyway, because pulling in a C PDF or codec library would
+# quietly undo the security rationale for this project.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# Several entries below are not in the graph yet but will be once eframe lands at
+# M2. Pre-allowing them is deliberate, so don't warn that they went unused.
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+
+[bans]
+multiple-versions = "warn"
+# Catches an unpinned external dependency. Our own crates are path dependencies
+# with no version requirement, which reads as a wildcard, so exempt those.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# --- Copyleft: would force us to open-source or buy a commercial license ---
+
+[[bans.deny]]
+name = "mupdf"
+reason = "AGPL-3.0. Upstream MuPDF is Artifex AGPL plus paid commercial licensing."
+
+[[bans.deny]]
+name = "mupdf-sys"
+reason = "AGPL-3.0, via mupdf."
+
+[[bans.deny]]
+name = "pdfium"
+reason = "The crate NAMED `pdfium` (newinnovations/pdfium-rs) is GPL-3.0 and has ~24k downloads. `pdfium-render` is the permissive binding. PDFium itself being BSD-3 does not save you from a GPL wrapper."
+
+[[bans.deny]]
+name = "jbig2dec"
+reason = "GPL-3.0, and unmaintained since 2020. Use hayro-jbig2."
+
+# --- Unclear or hostile provenance ---
+
+# Published under pdfluent.com, whose upstream LICENSE reads "proprietary and
+# confidential... NOT open-source software" and whose EULA forbids linking,
+# despite permissive crates.io metadata. Descriptions are byte-identical to
+# hayro's crates; provenance unverified in either direction.
+[[bans.deny]]
+name = "pdf_render"
+reason = "Proprietary upstream despite permissive crates.io metadata. NOTE: this is NOT pdf-rs's renderer, which is unpublished."
+
+[[bans.deny]]
+name = "pdf-syntax"
+reason = "Apparent unattributed rebrand of hayro-syntax; proprietary upstream."
+
+[[bans.deny]]
+name = "pdf-interpret"
+reason = "Apparent unattributed rebrand of hayro-interpret; proprietary upstream."
+
+[[bans.deny]]
+name = "pdfluent-jpeg2000"
+reason = "Apparent unattributed rebrand of hayro-jpeg2000."
+
+[[bans.deny]]
+name = "pdfluent-jbig2"
+reason = "Apparent unattributed rebrand of hayro-jbig2."
+
+[[bans.deny]]
+name = "pdfluent-ccitt"
+reason = "Apparent unattributed rebrand of hayro-ccitt."
+
+# --- Architectural guard: no C codecs. Not license problems; policy. ---
+
+[[bans.deny]]
+name = "openjpeg-sys"
+reason = "C JPEG2000. We use hayro-jpeg2000 (pure Rust, forbid(unsafe_code)). Reaching for this would reintroduce memory-unsafe parsing of untrusted input."
+
+[[bans.deny]]
+name = "jpeg2k"
+reason = "Wraps openjpeg-sys. See above."
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+# Verified 2026-07-29: published hayro 0.7.1 depends on vello_cpu ^0.0.8 from
+# crates.io. crates.io forbids git dependencies in published crates, so nothing in
+# our graph can carry one unless we add it ourselves.
+unknown-git = "deny"

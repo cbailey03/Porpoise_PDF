@@ -1,0 +1,22 @@
+[package]
+name = "porpoise-testkit"
+version = "0.1.0"
+description = "Test fixtures, pixel diffing, and the differential-testing harness."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+porpoise-doc.workspace = true
+porpoise-render.workspace = true
+thiserror.workspace = true
+
+# NOTE: the PDFium reference backend (`pdfium-render`) lands here at M6, behind an
+# off-by-default `oracle` feature. It exists only to pixel-diff hayro's output and
+# must never become a dependency of the shipped binary. CI enforces that; see
+# .github/workflows/ci.yml.
+
+[lints]
+workspace = true

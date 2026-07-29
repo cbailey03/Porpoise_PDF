@@ -1,0 +1,16 @@
+[package]
+name = "porpoise-doc"
+version = "0.1.0"
+description = "PDF document model: opening a document and describing its page geometry."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hayro-syntax.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -12,8 +12,13 @@ so the UI never waits: a 400-page drawing set sits at around 16 MB of cached pag
 than four hundred pages' worth, and a synthetic scroll of 40 pages per second holds a 60 fps median
 with our own code using under 15% of the frame budget.
 
-Still to come (M6): hardening against a malformed-PDF corpus, fuzzing the parse path, and the
-PDFium differential-rendering oracle. A file dialog is also still missing — a path is required.
+Hardened against damaged input: 4,000 deterministic mutations plus every possible truncation length
+of a valid PDF, all of which either open or return an error — none panic, none hang, and rejecting
+damaged input averages 7 µs.
+
+Still missing: a file dialog (a path is required), and **measured** evidence of rendering accuracy.
+The PDFium differential oracle is written and compiling but needs a PDFium library to run — see
+`docs/goal-1-plan.md` section 6a.
 
 ## Keys
 

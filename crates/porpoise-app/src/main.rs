@@ -69,6 +69,11 @@ struct Cli {
     #[arg(long, requires = "file", hide = true)]
     scroll_benchmark: Option<u32>,
 
+    /// Development aid: report how long until the first page is on screen,
+    /// then exit.
+    #[arg(long, requires = "file", hide = true)]
+    time_to_first_page: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -118,6 +123,9 @@ struct RenderArgs {
 }
 
 fn main() -> ExitCode {
+    // Taken before anything else so "time to first page" includes argument
+    // parsing, file reading and window creation — everything the user waits for.
+    let launched = Instant::now();
     let cli = Cli::parse();
 
     let outcome = match cli.command {
@@ -128,6 +136,7 @@ fn main() -> ExitCode {
             cli.start_page,
             cli.screenshot.as_deref(),
             cli.scroll_benchmark,
+            cli.time_to_first_page.then_some(launched),
         ),
     };
 
@@ -149,6 +158,7 @@ fn run_viewer(
     start_page: Option<usize>,
     screenshot: Option<&Path>,
     scroll_benchmark: Option<u32>,
+    report_first_page_from: Option<Instant>,
 ) -> Result<(), Box<dyn Error>> {
     // There is no file dialog yet, so with no path there is nothing to show.
     // Opening an empty window would be worse than saying so.
@@ -185,7 +195,14 @@ fn run_viewer(
         budget_frames: 240,
     });
 
-    viewer::run(title, document, start_index, request, scroll_benchmark)
+    viewer::run(
+        title,
+        document,
+        start_index,
+        request,
+        scroll_benchmark,
+        report_first_page_from,
+    )
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {

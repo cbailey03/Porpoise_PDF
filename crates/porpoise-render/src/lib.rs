@@ -1,11 +1,15 @@
 //! Rasterizing PDF pages to RGBA pixels.
 //!
-//! Rendering sits behind the [`Renderer`] trait for two reasons. The first is
-//! that the differential-testing oracle (see `porpoise-testkit`) is a second
-//! implementation of the same trait, so hayro's output can be pixel-diffed
-//! against PDFium's without the rest of the app knowing. The second is that a
-//! future GPU backend, built on hayro's `Device` trait, slots in at the same
-//! seam. See `docs/goal-1-plan.md`, sections 1 and 5.
+//! Rendering sits behind the [`Renderer`] trait so that a future GPU backend,
+//! built on hayro's `Device` trait, slots in at the same seam — and so that the
+//! render pool can be driven by a stub in tests. See `docs/goal-1-plan.md`,
+//! sections 1 and 5.
+//!
+//! The PDFium differential oracle in `porpoise-testkit` deliberately does *not*
+//! implement this trait, despite an earlier plan that it would. [`RenderError`]
+//! enumerates the ways *this* renderer fails, and adding a variant meaning
+//! "PDFium said no" would move a test-only concern into shipped code. The oracle
+//! carries its own error type instead.
 //!
 //! # Untrusted input
 //!

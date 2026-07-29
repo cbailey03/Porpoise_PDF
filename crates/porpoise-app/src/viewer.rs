@@ -210,6 +210,7 @@ pub(crate) fn run(
     start_page: Option<usize>,
     screenshot: Option<ScreenshotRequest>,
     benchmark_frames: Option<u32>,
+    report_first_page_from: Option<std::time::Instant>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wanted_screenshot = screenshot.is_some();
     let outcome: ScreenshotOutcome = Arc::new(Mutex::new(None));
@@ -233,6 +234,7 @@ pub(crate) fn run(
                 start_page,
                 screenshot,
                 benchmark_frames,
+                report_first_page_from,
                 app_outcome,
             )))
         }),
@@ -294,6 +296,9 @@ struct Viewer {
     screenshot: Option<ScreenshotRequest>,
     screenshot_sent: bool,
     outcome: ScreenshotOutcome,
+
+    /// Set when asked to report launch-to-first-page; cleared once reported.
+    first_page_from: Option<std::time::Instant>,
 }
 
 impl Viewer {
@@ -302,6 +307,7 @@ impl Viewer {
         start_page: Option<usize>,
         screenshot: Option<ScreenshotRequest>,
         benchmark_frames: Option<u32>,
+        report_first_page_from: Option<std::time::Instant>,
         outcome: ScreenshotOutcome,
     ) -> Self {
         let layout = ScrollLayout::vertical(document.geometry(), PAGE_GAP_PT);
@@ -349,6 +355,7 @@ impl Viewer {
             screenshot,
             screenshot_sent: false,
             outcome,
+            first_page_from: report_first_page_from,
         }
     }
 
@@ -529,6 +536,16 @@ impl Viewer {
                         );
                         self.cache.insert(key, handle, bytes);
                         self.failures.remove(&key);
+
+                        // Report on the first page to actually reach the cache,
+                        // which is the moment something is visible.
+                        if let Some(launched) = self.first_page_from.take() {
+                            println!(
+                                "time to first page: {:.0} ms",
+                                launched.elapsed().as_secs_f64() * 1000.0
+                            );
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     } else {
                         self.failures.insert(
                             key,

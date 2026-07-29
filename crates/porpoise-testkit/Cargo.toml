@@ -8,15 +8,19 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# The PDFium reference backend, used only to pixel-diff hayro's output. Off by
+# default because it needs a PDFium shared library present at runtime, which not
+# every checkout will have. It must never reach the shipped binary; CI enforces
+# that with the `no-native-deps` job.
+oracle = ["dep:pdfium-render"]
+
 [dependencies]
 porpoise-doc.workspace = true
 porpoise-render.workspace = true
 thiserror.workspace = true
-
-# NOTE: the PDFium reference backend (`pdfium-render`) lands here at M6, behind an
-# off-by-default `oracle` feature. It exists only to pixel-diff hayro's output and
-# must never become a dependency of the shipped binary. CI enforces that; see
-# .github/workflows/ci.yml.
+pdfium-render = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Used to decode what we encoded, so a PNG test proves the bytes are readable

@@ -2,7 +2,12 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M5 landed — Goal 1 is feature-complete.** You can open a PDF, scroll it freely or page by
+**Status: M6 mostly landed. Goal 1 is feature-complete and hardened; one item is blocked.**
+Three of the four exit criteria are now measured rather than asserted. The exception is hayro's
+rendering *accuracy*: the differential oracle is written and compiling, but running it needs a
+PDFium shared library, which is a human's call to obtain. See section 6a.
+
+Previously: **M5 landed — Goal 1 is feature-complete.** You can open a PDF, scroll it freely or page by
 page, navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Frame times under a
 synthetic 40-pages-per-second scroll are measured, not assumed: see the exit criteria. M6
 (hardening) is what remains.
@@ -254,7 +259,7 @@ free and prevents the monolith.
 | **M3** ✅ | Continuous scroll across all pages at one shared zoom, drawing only the visible set, with placeholders and texture eviction. Rasterization still synchronous, capped at 2 pages per frame. `--start-page` opens deep in a document. | Scroll geometry is right. Verified on a 400-page two-page-size document at pages 1, 200 and 400, holding **2 textures** throughout. |
 | **M4** ✅ | Async raster pipeline: `RenderPool` worker threads, byte-budgeted LRU `PageCache` keyed by page and zoom rung, prefetch margin, `ZoomBucket` quantization, queued-job cancellation, and stale-resolution fallback. | Smoothness. The UI thread never waits for a render. |
 | **M5** ✅ | Paged vs free scroll, keyboard navigation, ctrl+wheel and pinch zoom, fit-width/fit-page, a toolbar, and `--scroll-benchmark` for frame-time measurement. | **Goal 1 feature-complete.** |
-| **M6** | Hardening: malformed-PDF corpus run, `cargo-fuzz` targets on the parse path, PDFium differential pixel-diff. | It survives hostile input, and we have data on hayro's accuracy. |
+| **M6** ◐ | Parse-path panic isolation, a 4,000-case deterministic mutation harness, exhaustive truncation coverage, allocation-bomb rejection. PDFium oracle **built and compiling but not yet run** — it needs a PDFium binary. `cargo-fuzz` deliberately deferred; see section 6a. | It survives hostile input. Accuracy data still pending a PDFium library. |
 
 ### Exit criteria
 
@@ -268,8 +273,15 @@ Goal 1 is done when, on a mid-range laptop:
   See the caveat below.
 - ✅ **Resident memory bounded and roughly flat regardless of document length.** 15.7 MB of page
   textures at page 200 of 400, against a 192 MB budget and the 500 MB target.
-- Time from launch to first page painted on a 100 MB PDF under 1 second — not yet measured.
-- Zero hangs, zero process crashes across the malformed corpus — M6.
+- ✅ **Time from launch to first page painted on a 100 MB PDF under 1 second.** Measured with
+  `--time-to-first-page` on a **132 MB**, 400-page document: **552–630 ms** across three runs. The
+  clock starts before argument parsing, so it includes reading the file and creating the window.
+- ✅ **Zero hangs, zero process crashes across the malformed corpus.** 4,000 deterministic
+  mutations of a valid PDF — truncation, bit flips, zeroed runs, junk, damaged header, damaged
+  `startxref`, duplicated runs — plus every one of the 465 possible truncation lengths
+  exhaustively. Every input either opened or returned an error; **zero panics escaped**, and
+  notably zero were even contained by the new parser `catch_unwind`. Mean time to reject damaged
+  input is 6.7 µs, so a slow-parse denial of service is not available either.
 
 **Open performance item: an unattributed frame-time outlier.** Each 600-frame run shows a single
 frame around 150–160 ms. It is not our code: instrumenting `logic` and `ui` separately accounts for
@@ -346,6 +358,34 @@ Found while researching; all are easy mistakes to make:
   `png` crate. Permissive, but `NOTICE.md` must be propagated.
 - **AccessKit's repo reports BSD-3-Clause** because of a `LICENSE.chromium` file, though the
   crates are MIT OR Apache-2.0. Worth a lawyer's glance if we ever ship commercially.
+
+## 6a. Hardening: what M6 did and did not do
+
+**Parse-path panic isolation was a real gap.** Rasterization had been wrapped in `catch_unwind`
+since M1, but `Document::from_bytes` had not — so a panic in hayro's *parser* would have taken down
+the whole application rather than failing to open one file. Now contained, with a distinct
+`DocumentError::ParserPanicked` variant, because a panic is a bug to triage rather than an ordinary
+rejection.
+
+**hayro's parser proved more robust than expected.** Across 4,000 mutations, *zero* panics were
+contained — the isolation never fired. 3,555 of those mutations still opened successfully, which
+says the parser recovers from a great deal of damage. The `catch_unwind` stays regardless: hayro has
+open panic issues on record, and the cost of the guard is nil.
+
+**`cargo-fuzz` was deliberately not added.** It needs a nightly toolchain and libFuzzer via clang,
+is awkward on Windows MSVC, and cannot run in our stable CI — so committing a fuzz target would
+mean shipping scaffolding that is never exercised and quietly rots. The mutation harness covers the
+same surface, runs on every push on both platforms, and reproduces any failure from its seed. What
+coverage a real fuzzer would add over that is *structure-aware* mutation guided by coverage
+feedback, which is genuinely better; the honest position is that it is worth doing when there is a
+nightly job to run it in, not that it is done.
+
+**The PDFium oracle is built but unrun.** `porpoise-testkit`'s `oracle` feature compiles, and its
+tests skip with a clear message when no PDFium library is present, so CI keeps the harness alive
+without needing one. Running it requires obtaining a PDFium shared library, which is a deliberate
+decision for a human to make rather than something to fetch automatically. Until then, **hayro's
+rendering accuracy remains inferred rather than measured** — the single largest open assumption in
+the project, unchanged since M0.
 
 ## 7. Open decisions
 

@@ -9,6 +9,7 @@
 //! This is also the seam where `lopdf` joins for incremental save once the editor
 //! phase begins. See `docs/goal-1-plan.md`, section 1.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use hayro_syntax::Pdf;
@@ -31,6 +32,14 @@ pub enum DocumentError {
         /// Parser-supplied description of the failure.
         detail: String,
     },
+    /// The parser panicked.
+    ///
+    /// Distinct from [`Self::Parse`] because a panic is a *bug*, in hayro or in
+    /// our use of it, rather than an ordinary rejection of bad input. Callers
+    /// should treat both as "this file cannot be opened", but the distinction
+    /// matters when triaging.
+    #[error("the PDF parser panicked; the file is likely malformed in a way it mishandles")]
+    ParserPanicked,
 }
 
 /// The laid-out size of a single page, in PDF points (1/72 inch).
@@ -70,23 +79,36 @@ impl Document {
     /// cheap — it reads the page tree without touching any content stream — and
     /// it means the viewport can be laid out immediately on open.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, DocumentError> {
-        let pdf = Pdf::new(bytes).map_err(|err| DocumentError::Parse {
-            detail: format!("{err:?}"),
-        })?;
+        // A malformed PDF is ordinary input for a viewer, and hayro has open panic
+        // bugs, so parsing is contained the same way rasterization is. Without
+        // this a crafted file takes down the whole application rather than failing
+        // to open one document.
+        //
+        // `AssertUnwindSafe` is required because hayro's types hold
+        // interior-mutable caches. It is sound here in the strongest possible
+        // sense: on a panic every partially built value is dropped and nothing
+        // observable survives.
+        let parsed = catch_unwind(AssertUnwindSafe(|| {
+            let pdf = Pdf::new(bytes).map_err(|err| DocumentError::Parse {
+                detail: format!("{err:?}"),
+            })?;
 
-        let geometry = pdf
-            .pages()
-            .iter()
-            .map(|page| {
-                let (width_pt, height_pt) = page.render_dimensions();
-                PageGeometry {
-                    width_pt,
-                    height_pt,
-                }
-            })
-            .collect();
+            let geometry = pdf
+                .pages()
+                .iter()
+                .map(|page| {
+                    let (width_pt, height_pt) = page.render_dimensions();
+                    PageGeometry {
+                        width_pt,
+                        height_pt,
+                    }
+                })
+                .collect();
 
-        Ok(Self { pdf, geometry })
+            Ok(Self { pdf, geometry })
+        }));
+
+        parsed.unwrap_or(Err(DocumentError::ParserPanicked))
     }
 
     /// The number of pages in the document.

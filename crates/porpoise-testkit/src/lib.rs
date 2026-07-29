@@ -13,7 +13,177 @@
 //!   hayro-vs-PDFium accuracy comparison exists, so we build the oracle
 //!   ourselves at M6.
 
+#[cfg(feature = "oracle")]
+pub mod oracle;
+
 use porpoise_render::RenderedPage;
+
+/// Deterministic pseudo-random mutations of a valid PDF.
+///
+/// A PDF viewer's input is whatever someone hands it, so the interesting question
+/// is not whether valid files work but whether damaged ones fail *safely*. This
+/// generates damage of the kinds that occur both accidentally (truncated
+/// downloads, bad transfers) and deliberately (crafted files).
+///
+/// Deterministic on purpose: a failure reproduces from its seed, which is the
+/// difference between a useful bug report and a story about a flaky test.
+pub struct Mutator {
+    state: u64,
+}
+
+/// What a mutation did, for reporting which kind found a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    /// Cut the file short.
+    Truncated,
+    /// Flipped one bit.
+    BitFlipped,
+    /// Zeroed a run of bytes.
+    Zeroed,
+    /// Overwrote a run with junk.
+    Junked,
+    /// Damaged the `%PDF-` header.
+    HeaderDamaged,
+    /// Damaged the trailing `startxref` offset.
+    StartxrefDamaged,
+    /// Duplicated a run of bytes, shifting every later offset.
+    Duplicated,
+}
+
+impl Mutator {
+    /// A mutator seeded for reproducibility.
+    ///
+    /// The seed is run through splitmix64's finalizer rather than combined with a
+    /// constant directly. An earlier version used `seed | CONSTANT`, which *loses
+    /// information*: any seed bit already set in the constant becomes
+    /// indistinguishable, so seeds 42 and 43 produced byte-identical mutation
+    /// sequences. That would have quietly collapsed a multi-seed sweep into a
+    /// single one. Caught by `mutations_are_reproducible_from_their_seed`.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // xorshift is degenerate at zero and stays there forever.
+        Self {
+            state: if z == 0 { 1 } else { z },
+        }
+    }
+
+    /// xorshift64*, which is more than random enough for shuffling bytes and has
+    /// no dependencies.
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+        // `usize` is 64-bit on every target we build for, and the shift keeps the
+        // value positive regardless.
+        let value = usize::try_from(self.next_u64() >> 1).unwrap_or(0);
+        value % limit
+    }
+
+    /// Produces one damaged copy of `original`.
+    #[must_use]
+    pub fn mutate(&mut self, original: &[u8]) -> (Vec<u8>, Mutation) {
+        if original.is_empty() {
+            return (Vec::new(), Mutation::Truncated);
+        }
+
+        let kind = match self.below(7) {
+            0 => Mutation::Truncated,
+            1 => Mutation::BitFlipped,
+            2 => Mutation::Zeroed,
+            3 => Mutation::Junked,
+            4 => Mutation::HeaderDamaged,
+            5 => Mutation::StartxrefDamaged,
+            _ => Mutation::Duplicated,
+        };
+
+        let mut bytes = original.to_vec();
+        match kind {
+            Mutation::Truncated => {
+                let at = self.below(bytes.len());
+                bytes.truncate(at);
+            }
+            Mutation::BitFlipped => {
+                let at = self.below(bytes.len());
+                let bit = self.below(8);
+                if let Some(byte) = bytes.get_mut(at) {
+                    *byte ^= 1 << bit;
+                }
+            }
+            Mutation::Zeroed => {
+                let at = self.below(bytes.len());
+                let len = self.below(bytes.len() - at).max(1);
+                if let Some(range) = bytes.get_mut(at..at + len) {
+                    range.fill(0);
+                }
+            }
+            Mutation::Junked => {
+                let at = self.below(bytes.len());
+                let len = self.below(bytes.len() - at).clamp(1, 64);
+                for offset in 0..len {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "deliberately taking the low byte"
+                    )]
+                    let junk = self.next_u64() as u8;
+                    if let Some(byte) = bytes.get_mut(at + offset) {
+                        *byte = junk;
+                    }
+                }
+            }
+            Mutation::HeaderDamaged => {
+                // The first bytes decide whether this looks like a PDF at all.
+                let at = self.below(8);
+                if let Some(byte) = bytes.get_mut(at) {
+                    *byte = b'X';
+                }
+            }
+            Mutation::StartxrefDamaged => {
+                // Point the cross-reference table somewhere useless, which is the
+                // classic way a parser is sent hunting.
+                if let Some(found) = find_last(&bytes, b"startxref") {
+                    let digits = found + b"startxref\n".len();
+                    for offset in 0..6 {
+                        if let Some(byte) = bytes.get_mut(digits + offset)
+                            && byte.is_ascii_digit()
+                        {
+                            *byte = b'9';
+                        }
+                    }
+                }
+            }
+            Mutation::Duplicated => {
+                let at = self.below(bytes.len());
+                let len = self.below(bytes.len() - at).clamp(1, 128);
+                let slice: Vec<u8> = bytes.get(at..at + len).unwrap_or_default().to_vec();
+                bytes.splice(at..at, slice);
+            }
+        }
+
+        (bytes, kind)
+    }
+}
+
+fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|start| haystack.get(*start..start + needle.len()) == Some(needle))
+}
 
 /// A minimal but valid single-page PDF, 200x100 points, containing one filled
 /// blue rectangle.

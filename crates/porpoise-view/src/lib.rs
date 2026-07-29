@@ -24,6 +24,7 @@
 //! | `command` | What can be asked of the view? |
 //! | `state` | What is the view's state, and how does a command change it? |
 //! | `page` | What page is that, in the numbering a person uses? |
+//! | `viewport` | How big is the window, and in which units? |
 //!
 //! # Page numbers versus page indices
 //!
@@ -52,6 +53,7 @@ mod layout;
 mod page;
 mod request;
 mod state;
+mod viewport;
 mod zoom;
 
 pub use cache::{CacheKey, PageCache};
@@ -60,5 +62,6 @@ pub use fit::{FitMode, MAX_SCALE, MIN_SCALE, fit_scale};
 pub use layout::{PAGE_GAP_PT, ScrollLayout};
 pub use page::PageNumber;
 pub use request::request_order;
-pub use state::{ScrollMode, View, ViewSnapshot, ViewState, Viewport, apply};
+pub use state::{ScrollMode, View, ViewSnapshot, ViewState, apply};
+pub use viewport::Viewport;
 pub use zoom::ZoomBucket;

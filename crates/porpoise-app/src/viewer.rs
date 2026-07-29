@@ -1,39 +1,55 @@
 //! The eframe window.
 //!
-//! M2 shows page 1, fit to width. Rasterization is synchronous, on the UI thread,
-//! which means resizing a large page will visibly hitch. That is expected and
-//! deliberate: getting pixels on screen is this milestone's job, and moving
-//! rasterization to a worker pool is M4's. See `docs/goal-1-plan.md`, section 4.
+//! M3 scrolls continuously through every page, at one shared zoom, drawing only
+//! the pages that intersect the viewport. Rasterization is still synchronous on
+//! the UI thread — deliberately, because a geometry bug should show up as a
+//! visibly wrong layout rather than hiding behind async timing. Moving it to a
+//! worker pool is M4. See `docs/goal-1-plan.md`, section 4.
 //!
 //! The render pipeline is `hayro -> CPU pixmap -> GPU texture`, because hayro
-//! rasterizes on the CPU. So M2 needs no custom wgpu render pass; that only
+//! rasterizes on the CPU. So this needs no custom wgpu render pass; that only
 //! becomes relevant if we implement hayro's `Device` trait ourselves.
 
+use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use porpoise_doc::Document;
 use porpoise_render::{HayroRenderer, RenderRequest, RenderedPage, Renderer};
-use porpoise_view::{FitMode, fit_scale};
+use porpoise_view::ScrollLayout;
 
-/// Re-rasterize only when the wanted scale differs from the current one by more
-/// than this fraction, so dragging a window edge does not queue a render per
-/// pixel.
-const SCALE_CHANGE_THRESHOLD: f32 = 0.01;
+/// Vertical gap between pages, in PDF points.
+const PAGE_GAP_PT: f64 = 12.0;
+
+/// Re-rasterize only when the zoom moves by more than this fraction, so dragging
+/// a window edge does not throw away every texture on every pixel.
+const ZOOM_CHANGE_THRESHOLD: f32 = 0.01;
+
+/// Pages rasterized per frame.
+///
+/// Rasterization is synchronous here, so this is what keeps a frame bounded when
+/// many pages become visible at once. Anything not rendered this frame draws as a
+/// placeholder and is picked up next frame.
+const MAX_RENDERS_PER_FRAME: usize = 2;
+
+/// Pages either side of the visible range whose textures are kept.
+///
+/// Without eviction, scrolling a 400-page document would accumulate 400 textures
+/// and break Goal 1's bounded-memory criterion.
+const RETAIN_MARGIN_PAGES: usize = 2;
 
 /// A development request to capture the window and exit.
 ///
 /// This exists because a native window cannot be inspected from a headless
-/// context, so without it "the window works" would be an untested claim. It also
-/// lays the groundwork for visual regression tests.
+/// context, so without it "the window works" would be an untested claim.
 pub(crate) struct ScreenshotRequest {
     /// Where to write the PNG.
     pub(crate) path: PathBuf,
-    /// Frames to draw before asking, so a real frame is on screen first.
+    /// Frames to draw before asking, so real content is on screen first.
     pub(crate) warmup_frames: u32,
-    /// Hard frame budget. Without this a failed capture would leave a window
-    /// open on someone's desktop forever.
+    /// Hard frame budget, so a failed capture can never leave a window open.
     pub(crate) budget_frames: u32,
 }
 
@@ -45,6 +61,7 @@ type ScreenshotOutcome = Arc<Mutex<Option<Result<PathBuf, String>>>>;
 pub(crate) fn run(
     title: String,
     document: Document,
+    start_page: Option<usize>,
     screenshot: Option<ScreenshotRequest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wanted_screenshot = screenshot.is_some();
@@ -63,7 +80,14 @@ pub(crate) fn run(
     eframe::run_native(
         "porpoise",
         options,
-        Box::new(move |_cc| Ok(Box::new(Viewer::new(app_document, screenshot, app_outcome)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(Viewer::new(
+                app_document,
+                start_page,
+                screenshot,
+                app_outcome,
+            )))
+        }),
     )?;
 
     if wanted_screenshot {
@@ -81,10 +105,23 @@ pub(crate) fn run(
 struct Viewer {
     document: Arc<Document>,
     renderer: HayroRenderer,
-    texture: Option<egui::TextureHandle>,
-    /// Device-pixel scale the current texture was rasterized at.
-    texture_scale: f32,
-    error: Option<String>,
+    layout: ScrollLayout,
+
+    /// Rasterized pages, all at [`Self::cached_zoom`].
+    textures: HashMap<usize, egui::TextureHandle>,
+    /// Pages that failed, so they are not retried every frame.
+    failures: HashMap<usize, String>,
+    cached_zoom: f32,
+
+    /// Page whose middle is nearest the viewport centre, for the status bar.
+    current_page: usize,
+    /// Pages held after the last eviction pass, for the status bar.
+    cached_count: usize,
+
+    /// Scroll here on the first frame, then leave the user in control.
+    start_page: Option<usize>,
+    applied_start_page: bool,
+
     frame: u32,
     screenshot: Option<ScreenshotRequest>,
     screenshot_sent: bool,
@@ -94,15 +131,22 @@ struct Viewer {
 impl Viewer {
     fn new(
         document: Arc<Document>,
+        start_page: Option<usize>,
         screenshot: Option<ScreenshotRequest>,
         outcome: ScreenshotOutcome,
     ) -> Self {
+        let layout = ScrollLayout::vertical(document.geometry(), PAGE_GAP_PT);
         Self {
             document,
             renderer: HayroRenderer::new(),
-            texture: None,
-            texture_scale: 0.0,
-            error: None,
+            layout,
+            textures: HashMap::new(),
+            failures: HashMap::new(),
+            cached_zoom: 0.0,
+            current_page: 0,
+            cached_count: 0,
+            start_page,
+            applied_start_page: false,
             frame: 0,
             screenshot,
             screenshot_sent: false,
@@ -110,97 +154,209 @@ impl Viewer {
         }
     }
 
-    fn needs_rasterize(&self, wanted_scale: f32) -> bool {
-        if self.texture.is_none() && self.error.is_none() {
-            return true;
-        }
-        // Compare relatively, so the threshold means the same thing at every zoom.
-        let reference = self.texture_scale.max(f32::EPSILON);
-        (wanted_scale - self.texture_scale).abs() > reference * SCALE_CHANGE_THRESHOLD
-    }
-
-    fn rasterize(&mut self, ctx: &egui::Context, scale: f32) {
+    /// Rasterizes one page at the given device-pixel scale and uploads it.
+    fn rasterize(&mut self, ctx: &egui::Context, index: usize, device_scale: f32) {
         let request = RenderRequest {
-            page_index: 0,
-            scale,
+            page_index: index,
+            scale: device_scale,
         };
-        // Record the attempted scale either way, so a failure is not retried on
-        // every frame at the same scale.
-        self.texture_scale = scale;
 
         match self.renderer.render(&self.document, request) {
             Ok(page) => match to_color_image(&page) {
                 Some(image) => {
-                    self.texture =
-                        Some(ctx.load_texture("page", image, egui::TextureOptions::LINEAR));
-                    self.error = None;
+                    let handle = ctx.load_texture(
+                        format!("page-{index}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.textures.insert(index, handle);
                 }
                 None => {
-                    self.texture = None;
-                    self.error = Some(format!(
-                        "renderer returned {} bytes for a {}x{} page",
-                        page.rgba.len(),
-                        page.width,
-                        page.height
-                    ));
+                    self.failures.insert(
+                        index,
+                        format!(
+                            "renderer returned {} bytes for a {}x{} page",
+                            page.rgba.len(),
+                            page.width,
+                            page.height
+                        ),
+                    );
                 }
             },
             Err(error) => {
-                self.texture = None;
-                self.error = Some(error.to_string());
+                self.failures.insert(index, error.to_string());
             }
         }
     }
 
-    fn draw_page(&mut self, ui: &mut egui::Ui) {
-        let Some(geometry) = self.document.geometry().first().copied() else {
-            ui.label("This document has no pages.");
+    /// Drops textures far from the viewport so memory tracks the viewport rather
+    /// than the document length.
+    fn evict_outside(&mut self, visible: &Range<usize>) {
+        let low = visible.start.saturating_sub(RETAIN_MARGIN_PAGES);
+        let high = visible.end.saturating_add(RETAIN_MARGIN_PAGES);
+        self.textures.retain(|index, _| (low..high).contains(index));
+        // Failures are dropped too, so a page gets another chance if the user
+        // scrolls back to it — the cause may have been transient, like a timeout.
+        self.failures.retain(|index, _| (low..high).contains(index));
+        self.cached_count = self.textures.len();
+    }
+
+    fn paint_page(&self, painter: &egui::Painter, index: usize, rect: egui::Rect) {
+        if let Some(texture) = self.textures.get(&index) {
+            painter.image(texture.id(), rect, FULL_UV, egui::Color32::WHITE);
             return;
-        };
-
-        // Cloning the context is cheap (it is an `Arc` internally) and avoids
-        // holding an immutable borrow of `ui` across the mutable calls below.
-        let ctx = ui.ctx().clone();
-
-        let available = ui.available_size();
-        let fit = fit_scale(FitMode::Width, geometry, available.x, available.y);
-
-        // Rasterize at device pixels so the page is crisp on a HiDPI display,
-        // but lay it out in points.
-        let device_scale = fit * ctx.pixels_per_point();
-        if self.needs_rasterize(device_scale) {
-            self.rasterize(&ctx, device_scale);
         }
 
-        if let Some(error) = &self.error {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Cannot render: {error}"),
+        if self.failures.contains_key(&index) {
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(52, 30, 30));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("page {} could not be rendered", index + 1),
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(230, 140, 140),
             );
             return;
         }
 
-        if let Some(texture) = &self.texture {
-            let size = egui::vec2(geometry.width_pt * fit, geometry.height_pt * fit);
-            let sized = egui::load::SizedTexture::new(texture.id(), size);
-            ui.add(egui::Image::from_texture(sized));
+        // Not rasterized yet. A correct-aspect tile means scrolling never jumps
+        // when the real page arrives.
+        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(232));
+    }
+
+    fn draw_pages(&mut self, ui: &mut egui::Ui) {
+        if self.layout.page_count() == 0 {
+            ui.label("This document has no pages.");
+            return;
         }
+
+        // Cloning the context is cheap (an `Arc` inside) and avoids holding an
+        // immutable borrow of `ui` across the mutable calls below.
+        let ctx = ui.ctx().clone();
+        let pixels_per_point = ctx.pixels_per_point();
+
+        let zoom = self.layout.fit_width_scale(ui.available_width());
+        if (zoom - self.cached_zoom).abs()
+            > self.cached_zoom.max(f32::EPSILON) * ZOOM_CHANGE_THRESHOLD
+        {
+            // Every cached texture was rasterized for the old zoom.
+            self.textures.clear();
+            self.failures.clear();
+            self.cached_zoom = zoom;
+        }
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "content extents are page dimensions; f32 is what egui works in"
+        )]
+        let content_size = egui::vec2(
+            self.layout.content_width_pt() as f32 * zoom,
+            self.layout.content_height_pt() as f32 * zoom,
+        );
+
+        let mut scroll_area = egui::ScrollArea::vertical();
+
+        // Honour --start-page once, then hand control back to the user.
+        if let (Some(page), false) = (self.start_page, self.applied_start_page) {
+            if let Some(top_pt) = self.layout.page_top_pt(page) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "scroll offsets are bounded by content height"
+                )]
+                let offset = top_pt as f32 * zoom;
+                scroll_area = scroll_area.vertical_scroll_offset(offset);
+            }
+            self.applied_start_page = true;
+        }
+
+        scroll_area.show_viewport(ui, |ui, viewport| {
+            let (content_rect, _response) =
+                ui.allocate_exact_size(content_size, egui::Sense::hover());
+
+            // `viewport` is in content coordinates, so dividing by zoom converts
+            // the scroll window back into PDF points.
+            let top_pt = f64::from(viewport.min.y / zoom);
+            let height_pt = f64::from(viewport.height() / zoom);
+            let visible = self.layout.visible_pages(top_pt, height_pt);
+
+            self.current_page = self
+                .layout
+                .page_at_pt(top_pt + height_pt / 2.0)
+                .unwrap_or(0);
+
+            let mut rendered = 0_usize;
+            let mut deferred = false;
+
+            for index in visible.clone() {
+                let (Some(top_pt), Some(geometry)) = (
+                    self.layout.page_top_pt(index),
+                    self.document.geometry().get(index).copied(),
+                ) else {
+                    continue;
+                };
+
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "page offsets are bounded by content height"
+                )]
+                let page_rect = {
+                    let size = egui::vec2(geometry.width_pt * zoom, geometry.height_pt * zoom);
+                    // Centre each page in the column, so a narrow page among wide
+                    // ones does not sit flush left.
+                    let x = (content_size.x - size.x) * 0.5;
+                    egui::Rect::from_min_size(
+                        content_rect.min + egui::vec2(x, top_pt as f32 * zoom),
+                        size,
+                    )
+                };
+
+                let missing =
+                    !self.textures.contains_key(&index) && !self.failures.contains_key(&index);
+                if missing {
+                    if rendered < MAX_RENDERS_PER_FRAME {
+                        self.rasterize(&ctx, index, zoom * pixels_per_point);
+                        rendered += 1;
+                    } else {
+                        deferred = true;
+                    }
+                }
+
+                self.paint_page(ui.painter(), index, page_rect);
+            }
+
+            // Something is still a placeholder, so come back and finish it.
+            if deferred {
+                ctx.request_repaint();
+            }
+
+            self.evict_outside(&visible);
+        });
     }
 
     fn draw_status(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(format!("{} page(s)", self.document.page_count()));
+            ui.label(format!(
+                "page {} of {}",
+                self.current_page + 1,
+                self.layout.page_count()
+            ));
             ui.separator();
-            if let Some(geometry) = self.document.geometry().first() {
-                ui.label(format!(
-                    "{:.0}x{:.0} pt",
-                    geometry.width_pt, geometry.height_pt
-                ));
+            ui.label(format!("{:.0}% ", self.cached_zoom * 100.0));
+            ui.separator();
+            ui.label(format!(
+                "{:.0} pt of scroll",
+                self.layout.content_height_pt()
+            ));
+            ui.separator();
+            // Proof of virtualization: this stays small however long the document.
+            ui.label(format!("{} page(s) cached", self.cached_count));
+            if !self.failures.is_empty() {
                 ui.separator();
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("{} failed", self.failures.len()),
+                );
             }
-            ui.label(format!("raster scale {:.2}x", self.texture_scale));
-            ui.separator();
-            ui.label("page 1, fit to width");
         });
     }
 
@@ -237,7 +393,10 @@ impl Viewer {
             return;
         };
 
-        if !self.screenshot_sent && self.frame >= request.warmup_frames {
+        // Wait for the placeholders to fill in as well as the window to appear,
+        // otherwise the capture shows grey tiles rather than pages.
+        let settled = self.frame >= request.warmup_frames && !self.textures.is_empty();
+        if !self.screenshot_sent && settled {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.screenshot_sent = true;
         }
@@ -273,9 +432,15 @@ impl eframe::App for Viewer {
         // `TopBottomPanel` and `SidePanel` were unified into `Panel` in 0.34. The
         // root `ui` is the central area, so there is no CentralPanel here.
         egui::Panel::top("status").show(ui, |ui| self.draw_status(ui));
-        self.draw_page(ui);
+        self.draw_pages(ui);
     }
 }
+
+/// The whole texture, for `Painter::image`.
+const FULL_UV: egui::Rect = egui::Rect {
+    min: egui::Pos2 { x: 0.0, y: 0.0 },
+    max: egui::Pos2 { x: 1.0, y: 1.0 },
+};
 
 /// Converts a rasterized page into an egui image, or `None` if the buffer does
 /// not match its stated dimensions.

@@ -56,6 +56,10 @@ struct Cli {
     /// A PDF to open in the viewer.
     file: Option<PathBuf>,
 
+    /// Open scrolled to this page, counting from 1.
+    #[arg(long, requires = "file")]
+    start_page: Option<usize>,
+
     /// Development aid: capture the window to this PNG and exit immediately.
     #[arg(long, requires = "file", hide = true)]
     screenshot: Option<PathBuf>,
@@ -114,7 +118,11 @@ fn main() -> ExitCode {
     let outcome = match cli.command {
         Some(Command::Info(args)) => run_info(&args),
         Some(Command::Render(args)) => run_render(&args),
-        None => run_viewer(cli.file.as_deref(), cli.screenshot.as_deref()),
+        None => run_viewer(
+            cli.file.as_deref(),
+            cli.start_page,
+            cli.screenshot.as_deref(),
+        ),
     };
 
     if let Err(error) = outcome {
@@ -130,7 +138,11 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_viewer(file: Option<&Path>, screenshot: Option<&Path>) -> Result<(), Box<dyn Error>> {
+fn run_viewer(
+    file: Option<&Path>,
+    start_page: Option<usize>,
+    screenshot: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     // There is no file dialog yet, so with no path there is nothing to show.
     // Opening an empty window would be worse than saying so.
     let Some(file) = file else {
@@ -138,6 +150,22 @@ fn run_viewer(file: Option<&Path>, screenshot: Option<&Path>) -> Result<(), Box<
     };
 
     let document = Document::open(file)?;
+
+    // 1-based on the way in, 0-based inside, converted once.
+    let start_index = match start_page {
+        Some(0) => return Err("page numbers start at 1".into()),
+        Some(page) if page > document.page_count() => {
+            return Err(format!(
+                "{} has {} page(s), so page {} does not exist",
+                file.display(),
+                document.page_count(),
+                page
+            )
+            .into());
+        }
+        Some(page) => Some(page - 1),
+        None => None,
+    };
     let title = file.file_name().map_or_else(
         || file.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
@@ -150,7 +178,7 @@ fn run_viewer(file: Option<&Path>, screenshot: Option<&Path>) -> Result<(), Box<
         budget_frames: 240,
     });
 
-    viewer::run(title, document, request)
+    viewer::run(title, document, start_index, request)
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {

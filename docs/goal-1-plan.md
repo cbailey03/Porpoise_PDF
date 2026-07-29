@@ -2,11 +2,23 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M2 landed.** There is a window, and it shows a real PDF. The stack decision below is
-validated rather than assumed — hayro parses and rasterizes correctly on Windows MSVC and Linux,
-58 of 58 real-world PDFs on the dev machine parsed without error, and renders have been inspected
-by eye rather than only pixel-counted against a synthetic fixture. M3 (scroll geometry and
-virtualization) is next.
+**Status: M3 landed.** The viewer scrolls a whole document, and virtualization is real rather than
+aspirational: a 400-page drawing set with two distinct page sizes holds two textures whether you
+are at page 1, page 200, or page 400. The stack decision below is validated rather than assumed —
+hayro parses and rasterizes correctly on Windows MSVC and Linux, 58 of 58 real-world PDFs on the
+dev machine parsed without error, and renders have been inspected by eye rather than only
+pixel-counted against a synthetic fixture. M4 (async raster pipeline) is next.
+
+Two pieces of M4 arrived early at M3, because leaving them out would have shipped an obvious
+defect rather than a known limitation:
+
+- **Texture eviction.** Without it, scrolling 400 pages accumulates 400 textures, which breaks the
+  bounded-memory exit criterion outright. Pages outside the visible range plus a two-page margin
+  are dropped.
+- **A per-frame render cap.** Rasterization is synchronous, so a viewport that suddenly shows many
+  pages would otherwise block for as long as it takes to draw all of them. Two pages per frame
+  keeps a frame bounded, and the remainder draw as placeholders and fill in next frame — which is
+  also what makes the placeholder path real rather than theoretical.
 
 Two things worth knowing before M3, both found by looking at output rather than by testing:
 
@@ -220,7 +232,7 @@ free and prevents the monolith.
 | **M0** ✅ | Workspace skeleton. CI: fmt + clippy + test on Windows and Linux, MSRV floor job, `cargo-deny`, and a job asserting no C PDF/codec library reaches the shipped binary. Page geometry, the `Renderer` trait seam, and `ScrollLayout` are real and tested. | The AGPL/GPL traps (§6) are mechanically excluded, not remembered — and the pure-Rust stack demonstrably rasterizes on Windows. |
 | **M1** ✅ | Headless CLI: `porpoise info` and `porpoise render --page N --dpi D -o out.png`. `RenderLimits` (per-axis **and** total-pixel caps), `render_with_timeout`, `catch_unwind`, PNG encoding. | hayro works on real files. Fully testable with no GUI. |
 | **M2** ✅ | eframe window (wgpu backend), page 1 fit-to-width, opened from a CLI path. Plus a hidden `--screenshot` flag so the window can be verified headlessly. No file dialog yet. | End-to-end pixels on screen. |
-| **M3** | Continuous scroll across all pages with correct heterogeneous geometry, placeholders, visible-set computation. Rasterization still synchronous — expect stutter. | Scroll geometry is right. Isolating this from async is what makes it debuggable. |
+| **M3** ✅ | Continuous scroll across all pages at one shared zoom, drawing only the visible set, with placeholders and texture eviction. Rasterization still synchronous, capped at 2 pages per frame. `--start-page` opens deep in a document. | Scroll geometry is right. Verified on a 400-page two-page-size document at pages 1, 200 and 400, holding **2 textures** throughout. |
 | **M4** | Async raster pipeline: worker pool, LRU byte budget, prefetch margin, zoom buckets, job cancellation. | Smoothness. This is the milestone that makes it feel good. |
 | **M5** | Mode switch — paged (snap) vs free scroll. Keyboard nav (PgUp/PgDn, Home/End, arrows), ctrl+wheel zoom, fit-width/fit-page. | **Goal 1 feature-complete.** |
 | **M6** | Hardening: malformed-PDF corpus run, `cargo-fuzz` targets on the parse path, PDFium differential pixel-diff. | It survives hostile input, and we have data on hayro's accuracy. |

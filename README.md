@@ -6,10 +6,13 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: M2.** There is a window: it opens a PDF and shows page 1 fit to width. The CLI
-can also describe a document or rasterize a page to a PNG. Scrolling arrives at M3, and smooth
-scrolling at M4 — rasterization is still synchronous and on the UI thread, so resizing a large
-page visibly hitches.
+**Current state: M3.** The viewer scrolls continuously through a whole document, rendering only
+the pages you can see — a 400-page file holds two page textures, not four hundred. The CLI can
+also describe a document or rasterize a page to a PNG.
+
+Rasterization is still synchronous on the UI thread, capped at two pages per frame, so fast
+scrolling shows grey placeholders that fill in and resizing a large page visibly hitches. Moving
+that to a worker pool is M4.
 
 ## Crates
 
@@ -35,6 +38,12 @@ Open a PDF in the viewer:
 
 ```bash
 cargo run -p porpoise-app -- path/to/file.pdf
+```
+
+Open it scrolled to a particular page:
+
+```bash
+cargo run -p porpoise-app -- path/to/file.pdf --start-page 200
 ```
 
 Report page count, page sizes, and the scroll layout a viewer would build:

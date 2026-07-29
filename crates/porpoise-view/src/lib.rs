@@ -130,6 +130,27 @@ impl ScrollLayout {
         start..end.max(start)
     }
 
+    /// Zoom needed to fit the *widest* page to `viewport_width_pt`.
+    ///
+    /// Deliberately based on the widest page rather than the current one. A
+    /// document view uses a single zoom throughout, so that scrolling past a
+    /// landscape page does not resize every other page — which is what happens if
+    /// you fit each page independently.
+    #[must_use]
+    pub fn fit_width_scale(&self, viewport_width_pt: f32) -> f32 {
+        // `content_width_pt` is already sanitized in `vertical`, so this only has
+        // to survive a degenerate viewport.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "page widths are small; f32 is the precision the renderer works in"
+        )]
+        let widest = PageGeometry {
+            width_pt: self.content_width_pt as f32,
+            height_pt: 1.0,
+        };
+        fit_scale(FitMode::Width, widest, viewport_width_pt, f32::INFINITY)
+    }
+
     /// The page containing `y_pt`, saturating to the first or last page when
     /// `y_pt` falls outside the content or into an inter-page gap.
     ///
@@ -326,6 +347,33 @@ mod tests {
             assert!(
                 layout.page_top_pt(index).is_some_and(f64::is_finite),
                 "page {index} has a non-finite top"
+            );
+        }
+    }
+
+    #[test]
+    fn content_fit_width_uses_the_widest_page_not_the_first() {
+        // Portrait first, landscape second. Fitting to the first page would zoom
+        // in far enough to clip the second one.
+        let layout = ScrollLayout::vertical(&[letter(), page(1224.0, 792.0)], 10.0);
+        assert_eq!(layout.content_width_pt(), 1224.0);
+        // 1224 pt of content in a 1224 pt viewport is 1:1, not 2x.
+        assert_eq!(layout.fit_width_scale(1224.0), 1.0);
+        assert_eq!(layout.fit_width_scale(612.0), 0.5);
+    }
+
+    #[test]
+    fn content_fit_width_survives_an_empty_or_degenerate_layout() {
+        let empty = ScrollLayout::vertical(&[], 10.0);
+        let scale = empty.fit_width_scale(1000.0);
+        assert!(scale.is_finite() && scale > 0.0, "got {scale}");
+
+        let degenerate = ScrollLayout::vertical(&[page(f32::NAN, f32::NAN)], 10.0);
+        for width in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let scale = degenerate.fit_width_scale(width);
+            assert!(
+                scale.is_finite() && scale > 0.0,
+                "width {width} gave {scale}"
             );
         }
     }

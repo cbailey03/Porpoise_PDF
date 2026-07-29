@@ -37,8 +37,8 @@ use eframe::egui;
 use porpoise_doc::Document;
 use porpoise_render::{HayroRenderer, RenderError, RenderPool, RenderedPage};
 use porpoise_view::{
-    CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PageCache, PageNumber, ScrollLayout, ScrollMode, View,
-    ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
+    CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PAGE_GAP_PT, PageCache, PageNumber, ScrollLayout,
+    ScrollMode, View, ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
 };
 
 use crate::command::Command;
@@ -48,9 +48,6 @@ use crate::devtools::{
 };
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
-
-/// Vertical gap between pages, in PDF points.
-const PAGE_GAP_PT: f64 = 12.0;
 
 /// Byte budget for cached page textures.
 ///

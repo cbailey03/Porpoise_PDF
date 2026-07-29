@@ -22,7 +22,7 @@ use porpoise_doc::Document;
 use porpoise_render::{
     HayroRenderer, RenderError, RenderLimits, RenderRequest, render_with_timeout,
 };
-use porpoise_view::{PageNumber, ScrollLayout};
+use porpoise_view::{PAGE_GAP_PT, PageNumber, ScrollLayout};
 use tracing::level_filters::LevelFilter;
 
 /// Wraps a [`RenderError`] so the message leads with the page number the user
@@ -39,9 +39,6 @@ struct RenderFailed {
     #[source]
     source: RenderError,
 }
-
-/// Gap between pages in the scrolling column, in PDF points.
-const PAGE_GAP_PT: f64 = 12.0;
 
 /// Height of the notional viewport used to illustrate the visible set.
 const SAMPLE_VIEWPORT_PT: f64 = 800.0;

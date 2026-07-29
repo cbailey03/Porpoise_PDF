@@ -57,7 +57,7 @@ mod zoom;
 pub use cache::{CacheKey, PageCache};
 pub use command::{Outcome, Rejection, ViewCommand, ZoomTarget};
 pub use fit::{FitMode, MAX_SCALE, MIN_SCALE, fit_scale};
-pub use layout::ScrollLayout;
+pub use layout::{PAGE_GAP_PT, ScrollLayout};
 pub use page::PageNumber;
 pub use request::request_order;
 pub use state::{ScrollMode, View, ViewSnapshot, ViewState, Viewport, apply};

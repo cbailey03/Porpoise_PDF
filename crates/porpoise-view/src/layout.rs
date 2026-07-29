@@ -11,6 +11,16 @@ use porpoise_doc::PageGeometry;
 
 use crate::fit::{FitMode, fit_scale};
 
+/// The gap between pages in a scrolling column, in PDF points.
+///
+/// Lives here rather than in the shell because it is a property of the layout, and
+/// because more than one caller has to agree on it: the viewer builds a layout to
+/// paint, and `porpoise info` builds one to describe. It was previously declared
+/// separately in each — plus a third time in an integration test — so `info` could
+/// have reported a scroll height for a layout the viewer does not build, and nothing
+/// would have compared the two.
+pub const PAGE_GAP_PT: f64 = 12.0;
+
 /// Where every page sits in a single vertically scrolling column.
 ///
 /// Built once per document. Because real PDFs mix page sizes and rotations, this

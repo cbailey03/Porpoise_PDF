@@ -23,6 +23,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use porpoise_testkit::multi_page_pdf;
+use porpoise_view::PAGE_GAP_PT;
 use serde_json::Value;
 
 /// How long to wait for any single expected message.
@@ -34,13 +35,6 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The fixture: enough pages that navigating to page 4 means something.
 const PAGES: usize = 6;
-
-/// The viewer's gap between pages, in points.
-///
-/// Duplicated from `viewer.rs` because this is an integration test and that
-/// constant is crate-private. Only used to predict a scroll offset; if the two ever
-/// disagree, the assertion that uses it fails loudly rather than drifting.
-const PAGE_GAP_PT: f64 = 12.0;
 
 /// Serializes these tests against one another.
 ///
@@ -279,7 +273,9 @@ fn an_agent_can_open_navigate_and_capture() {
     );
     // Page numbers are one-based, so page 3 is the *third* page: two pages and two
     // gaps above it. The round trip above holds under either convention, which is
-    // why the offset is asserted too.
+    // why the offset is asserted too. `PAGE_GAP_PT` is imported from `porpoise-view`
+    // rather than copied, so this cannot quietly disagree with the layout the viewer
+    // actually builds.
     assert_eq!(
         view.get("scroll_top_pt").and_then(Value::as_f64),
         Some(2.0 * (300.0 + PAGE_GAP_PT)),

@@ -1,10 +1,13 @@
 //! `porpoise` — command line entry point.
 //!
-//! At M1 this can describe a document and rasterize a page to a PNG. The window
-//! arrives at M2; see `docs/goal-1-plan.md`, section 4.
+//! Three ways in: a bare file path opens the viewer, `info` describes a document,
+//! and `render` rasterizes one page to a PNG. See `docs/goal-1-plan.md`,
+//! section 4.
+
+mod viewer;
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,11 +47,21 @@ const POINTS_PER_INCH: f32 = 72.0;
 #[command(
     name = "porpoise",
     version,
-    about = "A PDF viewer and editor with no C PDF library in the binary"
+    about = "A PDF viewer and editor with no C PDF library in the binary",
+    // So `porpoise file.pdf` opens the viewer while `porpoise info file.pdf`
+    // still reaches the subcommand. Makes the binary usable as a file handler.
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    /// A PDF to open in the viewer.
+    file: Option<PathBuf>,
+
+    /// Development aid: capture the window to this PNG and exit immediately.
+    #[arg(long, requires = "file", hide = true)]
+    screenshot: Option<PathBuf>,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -99,8 +112,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let outcome = match cli.command {
-        Command::Info(args) => run_info(&args),
-        Command::Render(args) => run_render(&args),
+        Some(Command::Info(args)) => run_info(&args),
+        Some(Command::Render(args)) => run_render(&args),
+        None => run_viewer(cli.file.as_deref(), cli.screenshot.as_deref()),
     };
 
     if let Err(error) = outcome {
@@ -114,6 +128,29 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn run_viewer(file: Option<&Path>, screenshot: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    // There is no file dialog yet, so with no path there is nothing to show.
+    // Opening an empty window would be worse than saying so.
+    let Some(file) = file else {
+        return Err("no file given — try `porpoise <file.pdf>`, or `porpoise --help`".into());
+    };
+
+    let document = Document::open(file)?;
+    let title = file.file_name().map_or_else(
+        || file.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+
+    let request = screenshot.map(|path| viewer::ScreenshotRequest {
+        path: path.to_path_buf(),
+        // A few frames so the first real render is on screen before capturing.
+        warmup_frames: 3,
+        budget_frames: 240,
+    });
+
+    viewer::run(title, document, request)
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {
@@ -196,7 +233,7 @@ fn run_render(args: &RenderArgs) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let page = render_with_timeout(
-        HayroRenderer::with_limits(limits),
+        HayroRenderer::new().with_limits(limits),
         Arc::clone(&document),
         RenderRequest { page_index, scale },
         Duration::from_millis(args.timeout_ms),

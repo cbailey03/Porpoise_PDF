@@ -30,6 +30,14 @@ allow = [
     "MPL-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # Font licences, not code licences. They arrive via `epaint_default_fonts`,
+    # which is egui's bundled default typeface set, declared as
+    # "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0". Both permit
+    # redistribution but attach conditions — reserved font names, and shipping the
+    # licence text — so they are part of the THIRD-PARTY-NOTICES obligation
+    # recorded in README.md, not a free pass.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 
 [bans]
@@ -100,6 +108,23 @@ reason = "Wraps openjpeg-sys. See above."
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0192 — `ttf-parser` is unmaintained. Not a vulnerability: the
+    # author has stated it will receive no further fixes.
+    #
+    # It reaches us four levels down a path we did not choose:
+    #   ttf-parser <- owned_ttf_parser <- ab_glyph <- sctk-adwaita <- winit <- eframe
+    #
+    # `sctk-adwaita` draws Wayland client-side window decorations, so this is
+    # Linux-and-Wayland only and absent from the Windows build entirely. It never
+    # touches document text — that goes through skrifa and harfrust.
+    #
+    # Removing it would mean dropping eframe's `wayland` feature and with it real
+    # Wayland support, which is a bad trade for an unmaintained notice on a
+    # title-bar font parser. Upstream's to fix. Revisit when winit moves off
+    # ab_glyph.
+    "RUSTSEC-2026-0192",
+]
 
 [sources]
 unknown-registry = "deny"

@@ -2,10 +2,21 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M1 landed.** The stack decision below is validated rather than assumed — hayro parses
-and rasterizes correctly on Windows MSVC and Linux, 58 of 58 real-world PDFs on the dev machine
-parsed without error, and page renders have been eyeballed against real documents rather than
-only pixel-counted against a synthetic fixture. M2 (the window) is next.
+**Status: M2 landed.** There is a window, and it shows a real PDF. The stack decision below is
+validated rather than assumed — hayro parses and rasterizes correctly on Windows MSVC and Linux,
+58 of 58 real-world PDFs on the dev machine parsed without error, and renders have been inspected
+by eye rather than only pixel-counted against a synthetic fixture. M3 (scroll geometry and
+virtualization) is next.
+
+Two things worth knowing before M3, both found by looking at output rather than by testing:
+
+- **hayro renders on a transparent background by default.** A map filled its whole page so this
+  was invisible; a text invoice exposed it immediately as black text on dark grey. Paper is white,
+  so `porpoise-render` now has an explicit [`Background`] defaulting to opaque white. This
+  affected the PNG output too, not just the window.
+- **egui 0.34 renamed `App::update` to `App::ui`** and unified `TopBottomPanel`/`SidePanel` into
+  `Panel`. Expect this class of churn at every egui bump; the changelog does not always mark it as
+  breaking, and there are no migration guides.
 
 ## 1. The stack decision
 
@@ -208,7 +219,7 @@ free and prevents the monolith.
 |---|---|---|
 | **M0** ✅ | Workspace skeleton. CI: fmt + clippy + test on Windows and Linux, MSRV floor job, `cargo-deny`, and a job asserting no C PDF/codec library reaches the shipped binary. Page geometry, the `Renderer` trait seam, and `ScrollLayout` are real and tested. | The AGPL/GPL traps (§6) are mechanically excluded, not remembered — and the pure-Rust stack demonstrably rasterizes on Windows. |
 | **M1** ✅ | Headless CLI: `porpoise info` and `porpoise render --page N --dpi D -o out.png`. `RenderLimits` (per-axis **and** total-pixel caps), `render_with_timeout`, `catch_unwind`, PNG encoding. | hayro works on real files. Fully testable with no GUI. |
-| **M2** | eframe window; open via CLI arg or file dialog; page 1, fit-to-width. | End-to-end pixels on screen. |
+| **M2** ✅ | eframe window (wgpu backend), page 1 fit-to-width, opened from a CLI path. Plus a hidden `--screenshot` flag so the window can be verified headlessly. No file dialog yet. | End-to-end pixels on screen. |
 | **M3** | Continuous scroll across all pages with correct heterogeneous geometry, placeholders, visible-set computation. Rasterization still synchronous — expect stutter. | Scroll geometry is right. Isolating this from async is what makes it debuggable. |
 | **M4** | Async raster pipeline: worker pool, LRU byte budget, prefetch margin, zoom buckets, job cancellation. | Smoothness. This is the milestone that makes it feel good. |
 | **M5** | Mode switch — paged (snap) vs free scroll. Keyboard nav (PgUp/PgDn, Home/End, arrows), ctrl+wheel zoom, fit-width/fit-page. | **Goal 1 feature-complete.** |

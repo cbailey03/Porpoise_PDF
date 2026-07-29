@@ -38,8 +38,15 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
-      # NOTE: once eframe lands at M2, the Linux runner will need windowing
-      # system headers here (libxkbcommon-dev, libwayland-dev, libxi-dev, ...).
+      - name: Install windowing headers (Linux only)
+        if: runner.os == 'Linux'
+        # eframe/winit need these to build on Linux. The jobs only compile, they
+        # never open a window, so no display server is required.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -57,8 +64,17 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
+      - name: Install windowing headers (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The GUI is never launched here — no display server is available — so this
+      # covers the library crates and compiles the shell without running it.
       - run: cargo test --workspace --all-features
 
   msrv:
@@ -71,6 +87,12 @@ jobs:
       # jobs. Remove it so the MSRV toolchain is the one actually used.
       - name: Remove the pinned build toolchain
         run: rm rust-toolchain.toml
+      - name: Install windowing headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.92"

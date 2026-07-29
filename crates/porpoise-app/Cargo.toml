@@ -18,9 +18,9 @@ porpoise-render.workspace = true
 porpoise-view.workspace = true
 clap.workspace = true
 thiserror.workspace = true
-
-# NOTE: eframe/egui arrive at M2, when the window does. Declared in the workspace
-# manifest already so the version decision is made once.
+# Default features already select the wgpu backend in 0.35 (glow is now opt-in),
+# plus AccessKit, so there is nothing to override.
+eframe.workspace = true
 
 [lints]
 workspace = true

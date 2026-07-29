@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use porpoise_doc::Document;
 use porpoise_render::{
-    BACKEND_MAX_DIMENSION, EncodePngError, HayroRenderer, RenderError, RenderLimits, RenderRequest,
-    RenderedPage, Renderer, render_with_timeout,
+    BACKEND_MAX_DIMENSION, Background, EncodePngError, HayroRenderer, RenderError, RenderLimits,
+    RenderRequest, RenderedPage, Renderer, render_with_timeout,
 };
 use porpoise_testkit::{minimal_pdf, pixel_diff, single_page_pdf};
 
@@ -180,7 +180,7 @@ fn area_cap_is_what_rejects_and_not_the_size_itself() {
         .render(&document, request)
         .expect("4 Mpx is fine under the 64 Mpx default");
 
-    let tight = HayroRenderer::with_limits(RenderLimits {
+    let tight = HayroRenderer::new().with_limits(RenderLimits {
         max_total_pixels: 1 << 20, // 1 Mpx
         ..RenderLimits::default()
     });
@@ -202,7 +202,7 @@ fn area_cap_is_what_rejects_and_not_the_size_itself() {
 
 #[test]
 fn per_axis_cap_still_applies() {
-    let renderer = HayroRenderer::with_limits(RenderLimits {
+    let renderer = HayroRenderer::new().with_limits(RenderLimits {
         max_pixel_dimension: 100,
         max_total_pixels: u64::MAX,
     });
@@ -243,6 +243,55 @@ fn effective_max_dimension_never_exceeds_the_backend_limit() {
         max_total_pixels: u64::MAX,
     };
     assert_eq!(limits.effective_max_dimension(), BACKEND_MAX_DIMENSION);
+}
+
+// --- Page background ---------------------------------------------------------
+
+/// The top-left pixel of the fixture, which is outside the inset rectangle and so
+/// shows the page background.
+fn corner_pixel(page: &RenderedPage) -> [u8; 4] {
+    let mut pixel = [0_u8; 4];
+    pixel.copy_from_slice(page.rgba.get(..4).unwrap_or(&[0, 0, 0, 0]));
+    pixel
+}
+
+#[test]
+fn pages_render_on_opaque_white_by_default() {
+    // hayro's own default is transparent, which makes a text document unreadable
+    // against a dark UI and makes a PNG of one look blank. Paper is white.
+    let page = HayroRenderer::new()
+        .render(&open_minimal(), request(0, 1.0))
+        .expect("should rasterize");
+
+    assert_eq!(corner_pixel(&page), [255, 255, 255, 255]);
+}
+
+#[test]
+fn transparent_background_is_available_when_asked_for() {
+    let page = HayroRenderer::new()
+        .with_background(Background::Transparent)
+        .render(&open_minimal(), request(0, 1.0))
+        .expect("should rasterize");
+
+    let corner = corner_pixel(&page);
+    assert_eq!(
+        corner[3], 0,
+        "expected a transparent corner, got {corner:?}"
+    );
+}
+
+#[test]
+fn the_background_does_not_paint_over_content() {
+    // A white background must sit behind the drawing, not on top of it.
+    let page = HayroRenderer::new()
+        .render(&open_minimal(), request(0, 1.0))
+        .expect("should rasterize");
+
+    let blue = count_blue(&page.rgba);
+    assert!(
+        blue > 8000,
+        "white background hid the rectangle; only {blue} blue pixels left"
+    );
 }
 
 // --- Timeout -----------------------------------------------------------------

@@ -6,8 +6,10 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: M1.** The CLI can describe a document and rasterize any page to a PNG, with
-resource limits and a per-page timeout. There is no window yet — that arrives at M2.
+**Current state: M2.** There is a window: it opens a PDF and shows page 1 fit to width. The CLI
+can also describe a document or rasterize a page to a PNG. Scrolling arrives at M3, and smooth
+scrolling at M4 — rasterization is still synchronous and on the UI thread, so resizing a large
+page visibly hitches.
 
 ## Crates
 
@@ -28,6 +30,12 @@ cargo build --workspace
 ```
 
 ## Using it
+
+Open a PDF in the viewer:
+
+```bash
+cargo run -p porpoise-app -- path/to/file.pdf
+```
 
 Report page count, page sizes, and the scroll layout a viewer would build:
 

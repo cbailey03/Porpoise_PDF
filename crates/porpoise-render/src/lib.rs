@@ -246,29 +246,63 @@ pub trait Renderer {
     ) -> Result<RenderedPage, RenderError>;
 }
 
+/// What to paint underneath a page's content.
+///
+/// This matters more than it sounds. hayro's own default is *transparent*, which
+/// is a reasonable primitive but the wrong default for a viewer: a PDF page is
+/// conceptually a sheet of white paper, and most pages leave most of their area
+/// untouched. Rendering transparent means those areas take on whatever is behind
+/// them — so a text document composited onto a dark UI comes out as black text on
+/// dark grey, and a PNG of an invoice looks empty in any viewer with a dark
+/// background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Background {
+    /// Opaque white, like paper. The default, because it is what a reader expects.
+    #[default]
+    White,
+    /// Leave untouched pixels transparent, for compositing a page over something
+    /// else.
+    Transparent,
+}
+
 /// The default backend: pure-Rust rasterization via [`hayro`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HayroRenderer {
     limits: RenderLimits,
+    background: Background,
 }
 
 impl HayroRenderer {
-    /// A renderer with [`RenderLimits::default`].
+    /// A renderer with default limits and a white page background.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A renderer with explicit limits.
+    /// Replaces the resource limits.
     #[must_use]
-    pub fn with_limits(limits: RenderLimits) -> Self {
-        Self { limits }
+    pub fn with_limits(mut self, limits: RenderLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Replaces the page background.
+    #[must_use]
+    pub fn with_background(mut self, background: Background) -> Self {
+        self.background = background;
+        self
     }
 
     /// The limits in force.
     #[must_use]
     pub fn limits(&self) -> RenderLimits {
         self.limits
+    }
+
+    /// The page background in force.
+    #[must_use]
+    pub fn background(&self) -> Background {
+        self.background
     }
 
     /// Validates the target raster size without allocating anything.
@@ -359,9 +393,16 @@ impl Renderer for HayroRenderer {
             count: document.page_count(),
         })?;
 
+        // hayro defaults this to transparent; see [`Background`] for why we do not.
+        let bg_color = match self.background {
+            Background::White => hayro::vello_cpu::color::palette::css::WHITE,
+            Background::Transparent => hayro::vello_cpu::color::palette::css::TRANSPARENT,
+        };
+
         let render_settings = hayro::RenderSettings {
             x_scale: request.scale,
             y_scale: request.scale,
+            bg_color,
             ..Default::default()
         };
         let cache = hayro::RenderCache::new();

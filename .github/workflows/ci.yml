@@ -23,7 +23,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -37,7 +37,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # NOTE: once eframe lands at M2, the Linux runner will need windowing
       # system headers here (libxkbcommon-dev, libwayland-dev, libxi-dev, ...).
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +56,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
@@ -65,7 +65,7 @@ jobs:
     name: msrv (1.92)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rust-toolchain.toml pins 1.97.1 and rustup honours it over whatever this
       # job installs, which would silently make this a duplicate of the other
       # jobs. Remove it so the MSRV toolchain is the one actually used.
@@ -81,7 +81,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources advisories
@@ -90,7 +90,7 @@ jobs:
     name: shipped binary is pure Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The security argument for this project rests on the shipped binary having

@@ -23,7 +23,7 @@
 //! translation, not to the command, or an agent could never be sure what
 //! `NextPage` would do.
 
-use crate::ScrollMode;
+use crate::{PageNumber, ScrollMode};
 
 /// What the viewer should scale pages to.
 ///
@@ -59,10 +59,10 @@ impl ZoomTarget {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "command", rename_all = "snake_case"))]
 pub enum ViewCommand {
-    /// Scroll so page `page` is at the top of the viewport. Zero-based.
+    /// Scroll so `page` is at the top of the viewport.
     GoToPage {
-        /// Zero-based page index.
-        page: usize,
+        /// The page to show, counting from 1.
+        page: PageNumber,
     },
     /// Scroll to the next page. Always page-granular; see the module docs.
     NextPage,
@@ -120,7 +120,9 @@ impl ViewCommand {
     ///    `the_all_list_is_exhaustive` fails to *compile* if a variant is added
     ///    without being added here.
     pub const ALL: &'static [Self] = &[
-        Self::GoToPage { page: 0 },
+        Self::GoToPage {
+            page: PageNumber::FIRST,
+        },
         Self::NextPage,
         Self::PreviousPage,
         Self::FirstPage,
@@ -167,8 +169,8 @@ pub enum Rejection {
     /// The requested page is past the end.
     #[error("page {page} does not exist (the document has {page_count})")]
     NoSuchPage {
-        /// The requested zero-based index.
-        page: usize,
+        /// The page that was asked for, counting from 1.
+        page: PageNumber,
         /// How many pages the document has.
         page_count: usize,
     },

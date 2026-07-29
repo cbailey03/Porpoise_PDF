@@ -28,7 +28,7 @@
 use std::ops::Range;
 
 use crate::command::{Outcome, Rejection, ViewCommand, ZoomTarget};
-use crate::{MAX_SCALE, MIN_SCALE, ScrollLayout, ZoomBucket};
+use crate::{MAX_SCALE, MIN_SCALE, PageNumber, ScrollLayout, ZoomBucket};
 
 /// Scroll positions closer than this are the same place.
 ///
@@ -222,7 +222,11 @@ impl View<'_> {
             .visible_pages(self.state.scroll_top_pt, self.viewport.height())
     }
 
-    /// The topmost page on screen.
+    /// The topmost page on screen, as a zero-based index.
+    ///
+    /// An index rather than a [`PageNumber`] because callers here use it to reach
+    /// into the layout and the cache. [`ViewSnapshot::current_page`] is the same
+    /// page in the numbering a person reads.
     ///
     /// Derived from where the view *actually is*, not from a pending request, so
     /// this always describes what a person can see.
@@ -255,10 +259,30 @@ impl View<'_> {
     /// Everything about the view, in one readable value.
     #[must_use]
     pub fn snapshot(&self) -> ViewSnapshot {
+        // Indices become page numbers here, at the boundary between what the view
+        // computes and what someone reads.
+        let visible = self.visible_pages();
+        let (first_visible_page, last_visible_page) = if visible.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(PageNumber::from_index(visible.start)),
+                // A half-open index range, so the last page on screen is the one
+                // before its end.
+                Some(PageNumber::from_index(visible.end - 1)),
+            )
+        };
+        let current_page = if self.layout.page_count() == 0 {
+            None
+        } else {
+            Some(PageNumber::from_index(self.current_page()))
+        };
+
         ViewSnapshot {
             page_count: self.layout.page_count(),
-            current_page: self.current_page(),
-            visible_pages: self.visible_pages(),
+            current_page,
+            first_visible_page,
+            last_visible_page,
             scroll_top_pt: self.state.scroll_top_pt,
             pending_scroll_pt: self.state.requested_scroll_pt,
             content_height_pt: self.layout.content_height_pt(),
@@ -286,10 +310,16 @@ impl View<'_> {
 pub struct ViewSnapshot {
     /// Pages in the open document. Zero when nothing is open.
     pub page_count: usize,
-    /// The page the viewport is centred on, zero-based.
-    pub current_page: usize,
-    /// The pages currently on screen.
-    pub visible_pages: Range<usize>,
+    /// The topmost page on screen, or `None` when no document is open.
+    pub current_page: Option<PageNumber>,
+    /// The first page with any part on screen, or `None` when none is.
+    pub first_visible_page: Option<PageNumber>,
+    /// The last page with any part on screen, *inclusive*.
+    ///
+    /// A first/last pair rather than a range, because a half-open range whose start
+    /// counts from 1 is an invitation to an off-by-one: `{"start":51,"end":53}`
+    /// takes a moment to read, where `first 51, last 52` does not.
+    pub last_visible_page: Option<PageNumber>,
     /// Where the viewport top is, in points.
     pub scroll_top_pt: f64,
     /// Where a command has asked it to go but the shell has not yet moved it.
@@ -327,10 +357,13 @@ pub fn apply(
             if page_count == 0 {
                 return Outcome::Rejected(Rejection::NoPages);
             }
-            if page >= page_count {
+            // The one place a page number becomes an index. `PageNumber` cannot be
+            // zero, so this is the only bound left to check.
+            let index = page.index();
+            if index >= page_count {
                 return Outcome::Rejected(Rejection::NoSuchPage { page, page_count });
             }
-            scroll_to_page(state, layout, viewport, page)
+            scroll_to_page(state, layout, viewport, index)
         }
         ViewCommand::NextPage => step_page(state, layout, viewport, 1),
         ViewCommand::PreviousPage => step_page(state, layout, viewport, -1),
@@ -419,12 +452,12 @@ fn scroll_to_page(
     state: &mut ViewState,
     layout: &ScrollLayout,
     viewport: Viewport,
-    page: usize,
+    index: usize,
 ) -> Outcome {
-    match layout.page_top_pt(page) {
+    match layout.page_top_pt(index) {
         Some(top_pt) => request_scroll(state, layout, viewport, top_pt),
         None => Outcome::Rejected(Rejection::NoSuchPage {
-            page,
+            page: PageNumber::from_index(index),
             page_count: layout.page_count(),
         }),
     }
@@ -521,6 +554,18 @@ mod tests {
         Viewport::new(612.0, 396.0)
     }
 
+    /// `GoToPage` for a zero-based index.
+    ///
+    /// Most assertions here are about layout offsets, which are indexed, so these
+    /// tests stay in index terms and name the conversion here rather than adding
+    /// one to every expected value. The one-based meaning is pinned down by
+    /// `page_one_is_the_top_of_the_document` and by the `PageNumber` tests.
+    fn go_to_index(index: usize) -> ViewCommand {
+        ViewCommand::GoToPage {
+            page: PageNumber::from_index(index),
+        }
+    }
+
     fn run(state: &mut ViewState, command: ViewCommand) -> Outcome {
         apply(state, &ten_pages(), viewport(), command)
     }
@@ -568,7 +613,7 @@ mod tests {
     fn go_to_page_scrolls_to_that_pages_top() {
         let mut state = ViewState::new();
         assert_eq!(
-            run(&mut state, ViewCommand::GoToPage { page: 3 }),
+            run(&mut state, go_to_index(3)),
             Outcome::Changed
         );
         assert_eq!(state.requested_scroll_pt(), Some(3.0 * 792.0));
@@ -578,9 +623,11 @@ mod tests {
     fn go_to_page_past_the_end_is_rejected_with_the_real_page_count() {
         let mut state = ViewState::new();
         assert_eq!(
-            run(&mut state, ViewCommand::GoToPage { page: 10 }),
+            // Page 11 of a ten-page document. Index 10 is past the end, and the
+            // rejection reports the number that was asked for, not the index.
+            run(&mut state, go_to_index(10)),
             Outcome::Rejected(Rejection::NoSuchPage {
-                page: 10,
+                page: PageNumber::from_index(10),
                 page_count: 10
             })
         );
@@ -595,7 +642,7 @@ mod tests {
     fn navigating_an_empty_document_is_rejected_rather_than_silently_doing_nothing() {
         let empty = ScrollLayout::vertical(&[], 0.0);
         for command in [
-            ViewCommand::GoToPage { page: 0 },
+            go_to_index(0),
             ViewCommand::FirstPage,
             ViewCommand::LastPage,
             ViewCommand::NextPage,
@@ -621,7 +668,7 @@ mod tests {
     #[test]
     fn previous_page_goes_back_one_page() {
         let mut state = ViewState::new();
-        run_and_settle(&mut state, ViewCommand::GoToPage { page: 4 });
+        run_and_settle(&mut state, go_to_index(4));
         run_and_settle(&mut state, ViewCommand::PreviousPage);
         assert_eq!(state.scroll_top_pt(), 3.0 * 792.0);
     }
@@ -660,7 +707,7 @@ mod tests {
     #[test]
     fn first_page_returns_to_the_top() {
         let mut state = ViewState::new();
-        run_and_settle(&mut state, ViewCommand::GoToPage { page: 7 });
+        run_and_settle(&mut state, go_to_index(7));
         run_and_settle(&mut state, ViewCommand::FirstPage);
         assert_eq!(state.scroll_top_pt(), 0.0);
     }
@@ -760,7 +807,7 @@ mod tests {
     #[test]
     fn set_zoom_changes_the_target_and_anchors() {
         let mut state = ViewState::new();
-        run_and_settle(&mut state, ViewCommand::GoToPage { page: 5 });
+        run_and_settle(&mut state, go_to_index(5));
 
         let outcome = run(
             &mut state,
@@ -825,7 +872,7 @@ mod tests {
         // in one batch anchored on where the view still *was* and discarded the
         // navigation. Same class of bug as `repeated_next_page_in_one_frame`.
         let mut state = ViewState::new();
-        run(&mut state, ViewCommand::GoToPage { page: 4 });
+        run(&mut state, go_to_index(4));
         run(
             &mut state,
             ViewCommand::SetZoom {
@@ -852,7 +899,7 @@ mod tests {
             &mut state,
             &layout,
             unmeasured,
-            ViewCommand::GoToPage { page: 3 },
+            go_to_index(3),
         );
         apply(
             &mut state,
@@ -968,7 +1015,7 @@ mod tests {
         let layout = ten_pages();
         assert_eq!(state.with(&layout, viewport()).current_page(), 0);
 
-        run_and_settle(&mut state, ViewCommand::GoToPage { page: 6 });
+        run_and_settle(&mut state, go_to_index(6));
         assert_eq!(state.with(&layout, viewport()).current_page(), 6);
     }
 
@@ -984,7 +1031,7 @@ mod tests {
             let port = Viewport::new(612.0, height);
             for page in 0..10 {
                 let mut state = ViewState::new();
-                let outcome = apply(&mut state, &layout, port, ViewCommand::GoToPage { page });
+                let outcome = apply(&mut state, &layout, port, go_to_index(page));
                 assert!(outcome.rejected().is_none(), "page {page} was refused");
                 if let Some(top) = state.take_requested_scroll_pt() {
                     state.report_scroll_top_pt(top);
@@ -1020,7 +1067,7 @@ mod tests {
         // will screenshot the old position and believe it is the new one.
         let mut state = ViewState::new();
         let layout = ten_pages();
-        run(&mut state, ViewCommand::GoToPage { page: 6 });
+        run(&mut state, go_to_index(6));
 
         assert_eq!(
             state.with(&layout, viewport()).current_page(),
@@ -1077,18 +1124,65 @@ mod tests {
     fn a_snapshot_describes_the_whole_view() {
         let mut state = ViewState::new();
         let layout = ten_pages();
-        run_and_settle(&mut state, ViewCommand::GoToPage { page: 4 });
+        run_and_settle(&mut state, go_to_index(4));
 
         let snapshot = state.with(&layout, viewport()).snapshot();
         assert_eq!(snapshot.page_count, 10);
-        assert_eq!(snapshot.current_page, 4);
+        // Index 4 is the fifth page, and the snapshot says so.
+        assert_eq!(snapshot.current_page, PageNumber::new(5));
         assert_eq!(snapshot.scroll_top_pt, 4.0 * 792.0);
         assert_eq!(snapshot.pending_scroll_pt, None);
         assert_eq!(snapshot.content_height_pt, 10.0 * 792.0);
         assert_eq!(snapshot.max_scroll_pt, 10.0 * 792.0 - 396.0);
         assert_eq!(snapshot.zoom_target, ZoomTarget::FitWidth);
         assert_eq!(snapshot.scroll_mode, ScrollMode::Free);
-        assert_eq!(snapshot.visible_pages, 4..5);
+        assert_eq!(snapshot.first_visible_page, PageNumber::new(5));
+        assert_eq!(
+            snapshot.last_visible_page,
+            PageNumber::new(5),
+            "one page fills a half-page viewport, so first and last are the same"
+        );
+    }
+
+    #[test]
+    fn page_one_is_the_top_of_the_document() {
+        // The whole point of the one-based convention, pinned down in one place:
+        // page 1 means the very start, not the second page.
+        let mut state = ViewState::new();
+        let layout = ten_pages();
+        run_and_settle(
+            &mut state,
+            ViewCommand::GoToPage {
+                page: PageNumber::FIRST,
+            },
+        );
+        assert_eq!(state.with(&layout, viewport()).snapshot().scroll_top_pt, 0.0);
+        assert_eq!(
+            state.with(&layout, viewport()).snapshot().current_page,
+            PageNumber::new(1)
+        );
+    }
+
+    #[test]
+    fn a_snapshot_reports_every_page_on_screen() {
+        // A viewport two and a half pages tall, to prove `last_visible_page` is
+        // inclusive rather than the exclusive end of the old range.
+        let mut state = ViewState::new();
+        let layout = ten_pages();
+        let tall = Viewport::new(612.0, 792.0 * 2.5);
+        let outcome = apply(&mut state, &layout, tall, go_to_index(2));
+        assert!(outcome.rejected().is_none());
+        if let Some(top) = state.take_requested_scroll_pt() {
+            state.report_scroll_top_pt(top);
+        }
+
+        let snapshot = state.with(&layout, tall).snapshot();
+        assert_eq!(snapshot.first_visible_page, PageNumber::new(3));
+        assert_eq!(
+            snapshot.last_visible_page,
+            PageNumber::new(5),
+            "pages 3, 4 and part of 5 are on screen"
+        );
     }
 
     #[test]
@@ -1098,7 +1192,7 @@ mod tests {
         // is pending, and the agent captures the wrong frame believing it is right.
         let mut state = ViewState::new();
         let layout = ten_pages();
-        run(&mut state, ViewCommand::GoToPage { page: 4 });
+        run(&mut state, go_to_index(4));
 
         let snapshot = state.with(&layout, viewport()).snapshot();
         assert_eq!(
@@ -1114,8 +1208,11 @@ mod tests {
         let state = ViewState::new();
         let snapshot = state.with(&empty, viewport()).snapshot();
         assert_eq!(snapshot.page_count, 0);
-        assert_eq!(snapshot.current_page, 0);
-        assert!(snapshot.visible_pages.is_empty());
+        // Not "page 0", which does not exist, and not "page 1", which would claim a
+        // page is on screen when none is.
+        assert_eq!(snapshot.current_page, None);
+        assert_eq!(snapshot.first_visible_page, None);
+        assert_eq!(snapshot.last_visible_page, None);
         assert!(snapshot.zoom.is_finite() && snapshot.zoom > 0.0);
     }
 
@@ -1124,7 +1221,7 @@ mod tests {
     fn a_snapshot_survives_a_json_round_trip() {
         let mut state = ViewState::new();
         let layout = ten_pages();
-        run_and_settle(&mut state, ViewCommand::GoToPage { page: 2 });
+        run_and_settle(&mut state, go_to_index(2));
         run(
             &mut state,
             ViewCommand::SetZoom {

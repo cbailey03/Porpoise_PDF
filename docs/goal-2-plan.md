@@ -338,6 +338,95 @@ handler chooses between `NextPage` and `ScrollByViewports` instead. `NextPage` i
 every mode. This is a small thing that makes the command set much easier to reason about, and it only
 became visible once commands had to be nameable from outside.
 
+## 7b. Two bugs found driving a real document by hand
+
+Found in the first genuinely interactive session — a 400-page, 132 MB drawing set, a window left open
+for minutes, and commands arriving whenever they were typed. Both were in `Screenshotter`, and both
+have one root cause: it was written for the one-shot CLI `--screenshot` flag, where *capture and exit*
+is the entire purpose, and was later reused for the `capture` command without revisiting either
+assumption baked into that purpose.
+
+**The frame budget was absolute, not relative.** `warmup_frames` and `budget_frames` were compared
+against the app's lifetime frame counter. For the CLI flag that is the same thing, because the request
+exists from frame zero. For a `capture` command it is not: any capture arriving after about four
+seconds of window uptime found `frame > budget_frames` already true, so it asked egui for an image and
+declared failure in the same frame, without ever giving egui a frame to answer. The fix records the
+frame the attempt started on and measures from there. The frame arithmetic moved into a pure `step`
+function so it is testable without a live window, and expiry is now checked *before* sending, so a
+request is never issued on the frame the attempt is abandoned.
+
+**Resolving a capture closed the window.** Correct for the CLI flag, where a stranded window would
+hang the command; wrong for a command, where the controlling process expects to keep driving.
+`ScreenshotRequest` now carries `exit_when_done`, so the two callers state which they mean.
+
+The interesting part is why M10 could not see either one. Every capture assertion in `control.rs`
+captured *last* in its test, and within the first seconds of process life. That satisfies the absolute
+budget by accident, and makes the process exiting afterwards indistinguishable from normal teardown —
+the test then read a PNG that did exist and passed. The lesson is not "write more tests" but that a
+test which exercises a step only in final position cannot see whether that step is destructive. The
+new test captures, navigates, asserts the reply, and captures again, comparing the two PNGs for
+inequality so a stale image cannot pass either.
+
+This is the second time interactive use found something the suite could not — the BOM rejection was
+the first. Both were at the seam between the program and the thing driving it, which is exactly where
+a suite that supplies its own inputs is weakest.
+
+## 7c. One-based page numbers everywhere visible
+
+The same session turned up an inconsistency this plan never noticed: `go_to_page` counted from 0
+while the CLI's `--start-page` and `render --page` counted from 1, and `info` printed a half-open
+index range — "pages 0..1 would rasterize" — to a person. The status bar was already adding one by
+hand. Three conventions in one program.
+
+Page numbers are now one-based everywhere a person or an agent can see one, and the conversion is
+carried by a type rather than by discipline. `PageNumber` wraps a `NonZeroUsize`; indices stay plain
+`usize`; `PageNumber::index` and `PageNumber::from_index` are the only way across.
+
+Three things fell out of using a type rather than a convention:
+
+- **`{"page":0}` is refused by deserialization itself.** No hand-written guard exists to forget,
+  because zero is unrepresentable. The decoder needed no change at all.
+- **`visible_pages: Range<usize>` became `first_visible_page` and `last_visible_page`, inclusive.**
+  A half-open range whose start counts from 1 is an invitation to an off-by-one:
+  `{"start":51,"end":53}` takes a moment to read where *first 51, last 52* does not. They are also
+  `Option`, so an empty document reports `null` rather than claiming page 1 is on screen.
+- **The round-trip test was convention-agnostic and so proved nothing here.** `go_to_page(N)` then
+  reading `current_page == N` holds under *either* numbering. The tests now also assert the scroll
+  offset, which does not.
+
+`View::current_page()` and `View::visible_pages()` deliberately still return indices: their callers
+reach into the layout and the cache with them. The distinction is that a snapshot is *read* and an
+index is *used*.
+
+## 7d. A decode failure has to keep its request id
+
+Adding the `page: 0` case to the end-to-end tests exposed something worse than the case itself. The
+test hung with the window open until it was closed by hand, and the reason was two lines of
+`serve_control`:
+
+```rust
+// A line we could not decode has no id to reply against, so the
+// best we can do is say what was wrong.
+let reply = Reply::failed(None, error);
+```
+
+That comment is true for a line that is not JSON, is not an object, or whose `id` is itself
+malformed. It is false for `{"id":7,"command":"go_to_page","page":0}`, where the id parsed perfectly
+and only an argument was bad. Every argument error, unknown command and missing field was answered
+with `id: null`, so a client waiting for a reply to id 7 waited forever. Section 4 chose to echo `id`
+back precisely so a client could correlate replies, and the error path quietly opted out of it.
+
+`decode` now returns a `DecodeFailure { id, reason }`. The id is read before anything that can fail
+with one, travels with the failure, and is `None` only when it genuinely could not be read. Two tests
+pin both halves: the id survives every post-id failure, and is absent for the three cases where
+claiming one would be inventing it.
+
+Two things worth drawing out. First, this was found by *adding a test*, not by running one — the
+hang was in the test's own `reply_to`, which is what a real client's wait loop looks like. Second,
+§4's reasoning was sound and the implementation silently contradicted it in a branch nobody
+re-read; the fix is a type that makes the id impossible to drop rather than a comment asking
+future readers to remember.
+
 ## 8. Open decisions
 
 1. **Does an agent get a window at all?** Still open, and now with a concrete cost attached: because

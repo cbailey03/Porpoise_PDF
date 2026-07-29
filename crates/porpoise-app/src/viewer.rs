@@ -37,7 +37,7 @@ use eframe::egui;
 use porpoise_doc::Document;
 use porpoise_render::{HayroRenderer, RenderError, RenderPool, RenderedPage};
 use porpoise_view::{
-    CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PageCache, ScrollLayout, ScrollMode, View,
+    CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PageCache, PageNumber, ScrollLayout, ScrollMode, View,
     ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
 };
 
@@ -223,8 +223,8 @@ pub(crate) struct ViewerOptions {
     /// The document to show, if any. `None` opens an empty window, which is what
     /// `porpoise serve` does when it expects an agent to send `open`.
     pub(crate) document: Option<(PathBuf, Document)>,
-    /// Scroll here on the first frame.
-    pub(crate) start_page: Option<usize>,
+    /// Scroll here on the first frame, counting from 1.
+    pub(crate) start_page: Option<PageNumber>,
     /// An external process driving the program, if one asked to.
     pub(crate) control: Option<Control>,
     /// See [`DevOptions`].
@@ -282,7 +282,7 @@ struct Viewer {
     timing: FrameTiming,
 
     /// Scroll here once a document is open, then leave the operator in control.
-    start_page: Option<usize>,
+    start_page: Option<PageNumber>,
     applied_start_page: bool,
 
     frame: u32,
@@ -322,6 +322,9 @@ impl Viewer {
                     path,
                     warmup_frames: CAPTURE_WARMUP_FRAMES,
                     budget_frames: CAPTURE_BUDGET_FRAMES,
+                    // The CLI flag means "capture and exit", so a stranded window
+                    // would hang the command.
+                    exit_when_done: true,
                 },
                 Arc::clone(&screenshot_outcome),
             )
@@ -384,14 +387,14 @@ impl Viewer {
 
     /// Everything readable about the program right now.
     fn snapshot(&self) -> Snapshot {
-        let mut failed_pages: Vec<usize> = self
+        let mut failed_pages: Vec<PageNumber> = self
             .open
             .as_ref()
             .map(|open| {
                 open.failures
                     .iter()
                     .filter(|(_, failure)| failure.gave_up())
-                    .map(|(key, _)| key.page)
+                    .map(|(key, _)| PageNumber::from_index(key.page))
                     .collect()
             })
             .unwrap_or_default();
@@ -434,10 +437,12 @@ impl Viewer {
         for incoming in control.poll() {
             let request = match incoming {
                 Ok(request) => request,
-                Err(error) => {
-                    // A line we could not decode has no id to reply against, so the
-                    // best we can do is say what was wrong.
-                    let reply = Reply::failed(None, error);
+                Err(failure) => {
+                    // Reply against the id when the line got far enough to have one.
+                    // A bad argument on an otherwise well-formed line has a perfectly
+                    // good id, and dropping it leaves a client waiting for a reply it
+                    // will never be able to match.
+                    let reply = Reply::failed(failure.id, failure.reason);
                     if let Some(control) = &mut self.control {
                         control.send(&reply);
                     }
@@ -531,11 +536,20 @@ impl Viewer {
                 DispatchResult::Closed
             }
             Command::Capture { path } => {
+                // Clear any previous result, so "the slot holds the outcome of the
+                // most recent capture" is true by construction rather than by an
+                // argument about when `drive_screenshot` happens to read it.
+                if let Ok(mut slot) = self.screenshot_outcome.lock() {
+                    *slot = None;
+                }
                 self.screenshot = Some(Screenshotter::new(
                     ScreenshotRequest {
                         path,
                         warmup_frames: CAPTURE_WARMUP_FRAMES,
                         budget_frames: CAPTURE_BUDGET_FRAMES,
+                        // A capture is one step in a longer session. Closing the
+                        // window here would end the conversation mid-sentence.
+                        exit_when_done: false,
                     },
                     Arc::clone(&self.screenshot_outcome),
                 ));
@@ -619,7 +633,7 @@ impl Viewer {
                 Ok(page) => {
                     self.accept_page(ctx, key, rung, &page);
                     self.emit(|| Event::PageRendered {
-                        page: outcome.page_index,
+                        page: PageNumber::from_index(outcome.page_index),
                     });
                 }
                 Err(error) => {
@@ -636,7 +650,7 @@ impl Viewer {
                     let reason = failure.message.clone();
                     open.failures.insert(key, failure);
                     self.emit(|| Event::PageFailed {
-                        page: outcome.page_index,
+                        page: PageNumber::from_index(outcome.page_index),
                         reason,
                         will_retry,
                     });
@@ -987,7 +1001,7 @@ impl Viewer {
                 Some(open) => {
                     ui.label(format!(
                         "page {} of {}",
-                        view.current_page() + 1,
+                        PageNumber::from_index(view.current_page()),
                         open.layout.page_count()
                     ));
                     ui.separator();

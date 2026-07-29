@@ -79,8 +79,19 @@ Rasterize a page to a PNG:
 cargo run -p porpoise-app -- render path/to/file.pdf --page 1 --dpi 150 -o page1.png
 ```
 
-Page numbers start at 1. `--dpi` is a friendlier spelling of `--scale`, where `--scale 1.0` is
-72 DPI; the two conflict and cannot be combined.
+`--dpi` is a friendlier spelling of `--scale`, where `--scale 1.0` is 72 DPI; the two conflict and
+cannot be combined.
+
+## Page numbers
+
+Page numbers start at 1 everywhere they are visible: the CLI, the status bar, the control protocol,
+and every event. There is no zero-based page number anywhere a person or an agent can see one, and
+`{"page":0}` is refused rather than quietly meaning page 1.
+
+Internally, page *indices* start at 0, because they index arrays. The two are separate types —
+`PageNumber` and `usize` — so converting between them has to be written down. That is not
+pedantry: the protocol shipped with `go_to_page` counting from 0 while `--start-page` counted from
+1, in the same program.
 
 ## Driving it from another program
 
@@ -106,10 +117,11 @@ Send `{"command":"commands"}` for the full list and `{"command":"snapshot"}` for
 current state. The file argument is optional — send `{"command":"open","path":"…"}`
 instead.
 
-Two things worth knowing:
+Three things worth knowing:
 
 - **Wait for `idle` before capturing or asserting.** It means nothing is queued and
   everything visible is drawn. Acting before it gets you placeholder tiles.
+- **Page numbers start at 1**, here and everywhere else. `{"page":0}` is refused.
 - **Closing stdin exits the program**, the way every other stdio protocol behaves.
 
 This is off unless you ask for it, and it is stdio only — no port is opened. Be

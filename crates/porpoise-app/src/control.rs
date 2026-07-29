@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use serde::Serialize;
 
-use crate::protocol::{DecodeError, MAX_LINE_BYTES, Request, decode};
+use crate::protocol::{DecodeError, DecodeFailure, MAX_LINE_BYTES, Request, decode};
 
 /// Requests handled per frame.
 ///
@@ -31,7 +31,7 @@ use crate::protocol::{DecodeError, MAX_LINE_BYTES, Request, decode};
 const MAX_REQUESTS_PER_FRAME: usize = 64;
 
 /// One line's worth of input: a request, or why it could not be read.
-type Incoming = Result<Request, DecodeError>;
+type Incoming = Result<Request, DecodeFailure>;
 
 /// The reader half plus the writer, owned by the viewer.
 pub(crate) struct Control {
@@ -198,16 +198,24 @@ fn read_lines(mut input: Box<dyn BufRead + Send>, sender: &mpsc::Sender<Incoming
         let incoming = match outcome {
             // EOF: the controller has gone. Dropping the sender tells the viewer.
             Line::Eof => return,
-            Line::TooLong => Err(DecodeError::TooLong),
+            // No id is recoverable from either of these: an over-long line was never
+            // read to its end, and a line that is not UTF-8 cannot be parsed at all.
+            Line::TooLong => Err(DecodeFailure {
+                id: None,
+                reason: DecodeError::TooLong,
+            }),
             Line::Read => match std::str::from_utf8(&buffer) {
                 Ok(line) => match decode(line) {
                     // A blank line is not a request and needs no reply.
                     Ok(None) => continue,
                     Ok(Some(request)) => Ok(request),
-                    Err(error) => Err(error),
+                    Err(failure) => Err(failure),
                 },
-                Err(error) => Err(DecodeError::NotUtf8 {
-                    detail: error.to_string(),
+                Err(error) => Err(DecodeFailure {
+                    id: None,
+                    reason: DecodeError::NotUtf8 {
+                        detail: error.to_string(),
+                    },
                 }),
             },
         };
@@ -362,7 +370,9 @@ mod tests {
     fn messages_are_written_one_per_line_and_flushed() {
         let (mut control, out) = control("");
         control.send(&crate::protocol::Event::Idle);
-        control.send(&crate::protocol::Event::PageRendered { page: 3 });
+        control.send(&crate::protocol::Event::PageRendered {
+            page: porpoise_view::PageNumber::from_index(2),
+        });
 
         let text = out.text();
         let lines: Vec<&str> = text.lines().collect();

@@ -21,7 +21,7 @@ use porpoise_doc::Document;
 use porpoise_render::{
     HayroRenderer, RenderError, RenderLimits, RenderRequest, render_with_timeout,
 };
-use porpoise_view::ScrollLayout;
+use porpoise_view::{PageNumber, ScrollLayout};
 use tracing::level_filters::LevelFilter;
 
 /// Wraps a [`RenderError`] so the message leads with the page number the user
@@ -215,21 +215,22 @@ fn log_level(setting: Option<&str>) -> LevelFilter {
     }
 }
 
-/// Converts a 1-based page number into an index, checked against the document.
+/// Validates a page number typed on the command line against the document.
 ///
-/// Page numbers are 1-based for humans and 0-based internally. This is the only
-/// place that boundary is crossed, so an off-by-one has one place to hide.
-fn page_index(page: usize, page_count: usize, file: &Path) -> Result<usize, String> {
-    if page == 0 {
+/// Returns a [`PageNumber`] rather than an index: callers that need to index a
+/// collection say so with [`PageNumber::index`], which keeps the two conventions
+/// distinguishable all the way down. See `porpoise-view`'s crate docs.
+fn checked_page(page: usize, page_count: usize, file: &Path) -> Result<PageNumber, String> {
+    let Some(page) = PageNumber::new(page) else {
         return Err("page numbers start at 1".to_owned());
-    }
-    if page > page_count {
+    };
+    if page.get() > page_count {
         return Err(format!(
             "{} has {page_count} page(s), so page {page} does not exist",
             file.display()
         ));
     }
-    Ok(page - 1)
+    Ok(page)
 }
 
 /// The scale to rasterize at, from the mutually exclusive `--dpi` and `--scale`.
@@ -261,14 +262,14 @@ fn run_viewer(
 
     let document = Document::open(file)?;
 
-    let start_index = match start_page {
-        Some(page) => Some(page_index(page, document.page_count(), file)?),
+    let start_page = match start_page {
+        Some(page) => Some(checked_page(page, document.page_count(), file)?),
         None => None,
     };
 
     viewer::run(viewer::ViewerOptions {
         document: Some((file.to_path_buf(), document)),
-        start_page: start_index,
+        start_page,
         control: None,
         devtools: viewer::DevOptions {
             screenshot: screenshot.map(Path::to_path_buf),
@@ -291,9 +292,9 @@ fn run_serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    let start_index = match (args.start_page, &document) {
+    let start_page = match (args.start_page, &document) {
         (Some(page), Some((file, document))) => {
-            Some(page_index(page, document.page_count(), file)?)
+            Some(checked_page(page, document.page_count(), file)?)
         }
         // clap's `requires = "file"` makes this unreachable, but returning rather
         // than panicking keeps the invariant local.
@@ -303,7 +304,7 @@ fn run_serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
 
     viewer::run(viewer::ViewerOptions {
         document,
-        start_page: start_index,
+        start_page,
         control: Some(control::Control::stdio()),
         devtools: viewer::DevOptions::default(),
     })
@@ -340,11 +341,18 @@ fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Printed as page numbers, not indices. This used to read "pages 0..1", which
+    // is an index range shown to a person -- exactly the mixed convention that made
+    // us settle on one-based everywhere visible.
     let first_screen = layout.visible_pages(0.0, SAMPLE_VIEWPORT_PT);
-    println!(
-        "  first {SAMPLE_VIEWPORT_PT:.0} pt: pages {}..{} would rasterize",
-        first_screen.start, first_screen.end
-    );
+    match (first_screen.start, first_screen.end) {
+        (_, 0) => println!("  first {SAMPLE_VIEWPORT_PT:.0} pt: nothing to rasterize"),
+        (start, end) => println!(
+            "  first {SAMPLE_VIEWPORT_PT:.0} pt: pages {} to {} would rasterize",
+            PageNumber::from_index(start),
+            PageNumber::from_index(end - 1)
+        ),
+    }
 
     Ok(())
 }
@@ -354,7 +362,7 @@ fn run_render(args: &RenderArgs) -> Result<(), Box<dyn Error>> {
     let document = Arc::new(Document::open(&args.file)?);
     // Checked here rather than in the renderer so the message can name the real
     // page count, which is more useful than an index-out-of-range error.
-    let page_index = page_index(args.page, document.page_count(), &args.file)?;
+    let page_index = checked_page(args.page, document.page_count(), &args.file)?.index();
 
     let limits = RenderLimits {
         max_total_pixels: args
@@ -406,13 +414,13 @@ mod tests {
 
     #[test]
     fn page_one_is_index_zero() {
-        assert_eq!(page_index(1, 10, doc()), Ok(0));
-        assert_eq!(page_index(10, 10, doc()), Ok(9));
+        assert_eq!(checked_page(1, 10, doc()).map(PageNumber::index), Ok(0));
+        assert_eq!(checked_page(10, 10, doc()).map(PageNumber::index), Ok(9));
     }
 
     #[test]
     fn page_zero_is_rejected_because_humans_count_from_one() {
-        let error = page_index(0, 10, doc()).expect_err("page 0 does not exist");
+        let error = checked_page(0, 10, doc()).expect_err("page 0 does not exist");
         assert!(error.contains("start at 1"), "unhelpful: {error}");
     }
 
@@ -420,7 +428,7 @@ mod tests {
     fn a_page_past_the_end_names_the_real_page_count() {
         // The renderer's own out-of-range error talks about indices, which reads as
         // an off-by-one to someone who typed a 1-based number.
-        let error = page_index(11, 10, doc()).expect_err("page 11 of 10");
+        let error = checked_page(11, 10, doc()).expect_err("page 11 of 10");
         assert!(error.contains("10 page(s)"), "unhelpful: {error}");
         assert!(error.contains("page 11"), "unhelpful: {error}");
         assert!(error.contains("report.pdf"), "unhelpful: {error}");
@@ -428,7 +436,7 @@ mod tests {
 
     #[test]
     fn an_empty_document_rejects_every_page_number() {
-        assert!(page_index(1, 0, doc()).is_err());
+        assert!(checked_page(1, 0, doc()).is_err());
     }
 
     // --- Scale resolution ----------------------------------------------------

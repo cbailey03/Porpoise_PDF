@@ -168,7 +168,7 @@ fn print_percentiles(label: &str, samples: &[f32]) {
     }
 }
 
-/// A request to capture the window and exit.
+/// A request to capture the window.
 ///
 /// This exists because a native window cannot be inspected from a headless
 /// context, so without it "the window works" would be an untested claim.
@@ -177,17 +177,60 @@ pub(crate) struct ScreenshotRequest {
     pub(crate) path: PathBuf,
     /// Frames to draw before asking, so real content is on screen first.
     pub(crate) warmup_frames: u32,
-    /// Hard frame budget, so a failed capture can never leave a window open.
+    /// Frames after which the attempt is abandoned.
     pub(crate) budget_frames: u32,
+    /// Whether resolving the capture should also close the window.
+    ///
+    /// True for the one-shot CLI `--screenshot` flag, where capture-then-exit is
+    /// the entire point and a stranded window would hang the command. False for a
+    /// `capture` command, where the controlling process expects to carry on
+    /// driving afterwards.
+    pub(crate) exit_when_done: bool,
 }
 
 /// What the screenshot attempt produced, shared with the caller because
 /// `run_native` gives us no other way to report it.
 pub(crate) type ScreenshotOutcome = Arc<Mutex<Option<Result<PathBuf, String>>>>;
 
-/// Drives the capture-and-exit sequence.
+/// What to do on a given frame of a capture attempt.
+///
+/// Split out from [`Screenshotter::drive`] so the frame arithmetic is testable
+/// without a live window. The bug this prevents is not hypothetical: warmup and
+/// budget used to be compared against the app's lifetime frame counter, so a
+/// capture requested after the budget had already elapsed expired on arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Warming up, waiting for the pipeline, or waiting for the image.
+    Wait,
+    /// Ask egui for the image.
+    Request,
+    /// Give up.
+    Expire,
+}
+
+/// Decides a frame's action from elapsed frames alone.
+///
+/// `elapsed` counts from the frame the attempt started, never from process start.
+/// Expiry is checked first so the request is never sent on the same frame the
+/// attempt is abandoned.
+fn step(elapsed: u32, sent: bool, pipeline_settled: bool, request: &ScreenshotRequest) -> Step {
+    if elapsed > request.budget_frames {
+        Step::Expire
+    } else if !sent && elapsed >= request.warmup_frames && pipeline_settled {
+        Step::Request
+    } else {
+        Step::Wait
+    }
+}
+
+/// Drives a capture to a PNG on disk.
 pub(crate) struct Screenshotter {
     request: ScreenshotRequest,
+    /// The frame this was first driven on, or `None` before the first frame.
+    ///
+    /// Warmup and budget are measured from here. A `capture` command can arrive on
+    /// frame 50,000 of a long-lived window and must still get its full budget.
+    started_at: Option<u32>,
     sent: bool,
     outcome: ScreenshotOutcome,
 }
@@ -196,6 +239,7 @@ impl Screenshotter {
     pub(crate) fn new(request: ScreenshotRequest, outcome: ScreenshotOutcome) -> Self {
         Self {
             request,
+            started_at: None,
             sent: false,
             outcome,
         }
@@ -230,28 +274,34 @@ impl Screenshotter {
             return true;
         }
 
-        if !self.sent && frame >= self.request.warmup_frames && pipeline_settled {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
-            self.sent = true;
-        }
+        let started_at = *self.started_at.get_or_insert(frame);
+        let elapsed = frame.saturating_sub(started_at);
 
-        if frame > self.request.budget_frames {
-            let budget = self.request.budget_frames;
-            self.finish(
-                ctx,
-                Err(format!("no screenshot arrived within {budget} frames")),
-            );
-            return true;
+        match step(elapsed, self.sent, pipeline_settled, &self.request) {
+            Step::Wait => false,
+            Step::Request => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                self.sent = true;
+                false
+            }
+            Step::Expire => {
+                let budget = self.request.budget_frames;
+                self.finish(
+                    ctx,
+                    Err(format!("no screenshot arrived within {budget} frames")),
+                );
+                true
+            }
         }
-
-        false
     }
 
     fn finish(&mut self, ctx: &egui::Context, result: Result<PathBuf, String>) {
         if let Ok(mut slot) = self.outcome.lock() {
             *slot = Some(result);
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.request.exit_when_done {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 
@@ -282,6 +332,84 @@ fn save_screenshot(image: &egui::ColorImage, path: &Path) -> Result<PathBuf, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request with no interest in where the PNG would land.
+    fn capture_request(warmup: u32, budget: u32) -> ScreenshotRequest {
+        ScreenshotRequest {
+            path: PathBuf::from("unused-by-these-tests.png"),
+            warmup_frames: warmup,
+            budget_frames: budget,
+            exit_when_done: false,
+        }
+    }
+
+    #[test]
+    fn a_capture_waits_for_warmup_and_for_a_settled_pipeline() {
+        let request = capture_request(3, 240);
+        assert_eq!(step(0, false, true, &request), Step::Wait, "before warmup");
+        assert_eq!(
+            step(3, false, false, &request),
+            Step::Wait,
+            "pages still rendering: capturing here shows placeholders"
+        );
+        assert_eq!(step(3, false, true, &request), Step::Request);
+    }
+
+    #[test]
+    fn a_capture_is_requested_only_once() {
+        let request = capture_request(3, 240);
+        assert_eq!(step(10, true, true, &request), Step::Wait);
+    }
+
+    #[test]
+    fn a_capture_expires_only_after_its_budget() {
+        let request = capture_request(3, 240);
+        assert_eq!(step(240, true, true, &request), Step::Wait, "on the line");
+        assert_eq!(step(241, true, true, &request), Step::Expire);
+    }
+
+    #[test]
+    fn expiring_wins_over_requesting_on_the_same_frame() {
+        // Asking for an image on the frame the attempt is abandoned would leave a
+        // reply arriving after nobody is waiting for it.
+        let request = capture_request(3, 240);
+        assert_eq!(step(241, false, true, &request), Step::Expire);
+    }
+
+    #[test]
+    fn a_capture_requested_late_in_a_long_session_still_gets_its_budget() {
+        // The regression. Warmup and budget used to be compared against the app's
+        // lifetime frame counter, so a `capture` command arriving after about four
+        // seconds of window uptime expired on the frame it arrived -- egui was
+        // asked for an image and then given no frame to answer in. Found by
+        // driving a real window by hand, which is also the only way it could be
+        // found: the end-to-end capture test happens to run inside the first 240
+        // frames of process life.
+        let outcome: ScreenshotOutcome = Arc::new(Mutex::new(None));
+        let mut shot = Screenshotter::new(capture_request(3, 240), Arc::clone(&outcome));
+        let ctx = egui::Context::default();
+
+        assert!(
+            !shot.drive(&ctx, 50_000, true),
+            "expired on the frame it arrived"
+        );
+        assert!(
+            outcome.lock().unwrap().is_none(),
+            "reported an outcome before waiting a single frame"
+        );
+
+        assert!(
+            !shot.drive(&ctx, 50_100, true),
+            "gave up 100 frames into a 240 frame budget"
+        );
+
+        assert!(
+            shot.drive(&ctx, 50_241, true),
+            "never expired, so a lost capture would wait forever"
+        );
+        let reported = outcome.lock().unwrap().clone();
+        assert!(matches!(reported, Some(Err(_))), "{reported:?}");
+    }
 
     fn timing(frame_ms: f32) -> FrameTiming {
         FrameTiming {

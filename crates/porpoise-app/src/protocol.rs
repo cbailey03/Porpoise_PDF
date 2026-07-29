@@ -12,6 +12,10 @@
 //! `id` is optional and echoed back, so a client can correlate replies without a
 //! full JSON-RPC envelope. Events arrive unsolicited and carry no `id`.
 //!
+//! Every page number on this wire counts from 1, matching the CLI and what a person
+//! reads in the status bar. They are [`PageNumber`], not `usize`, so `{"page":0}` is
+//! refused by deserialization rather than by a check somebody has to remember.
+//!
 //! # Why this is decoded by hand
 //!
 //! A derived `Deserialize` on [`Command`] would nest the view commands one level
@@ -30,7 +34,7 @@
 
 use std::path::PathBuf;
 
-use porpoise_view::{Rejection, ViewCommand, ViewSnapshot};
+use porpoise_view::{PageNumber, Rejection, ViewCommand, ViewSnapshot};
 use serde::Serialize;
 
 use crate::command::Command;
@@ -101,13 +105,41 @@ pub(crate) enum DecodeError {
     },
 }
 
+impl DecodeError {
+    /// Attaches the request id this failure belongs to, if one was readable.
+    fn at(self, id: Option<u64>) -> DecodeFailure {
+        DecodeFailure { id, reason: self }
+    }
+}
+
+/// A line that could not be decoded, and the id it was sent under.
+///
+/// The id matters more than it looks. A bad *argument* on a well-formed line —
+/// `{"id":7,"command":"go_to_page","page":0}` — has a perfectly good id, and
+/// discarding it hands the client an error it cannot match to any request. A client
+/// waiting for a reply to id 7 then waits forever.
+///
+/// That is not hypothetical: the first end-to-end test to send a bad argument under
+/// an id hung with the window open until it was closed by hand. So the id travels
+/// with the failure whenever the line got far enough to have one, and is `None` only
+/// when it genuinely could not be read — a line that is not JSON, not an object, or
+/// whose `id` was itself malformed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub(crate) struct DecodeFailure {
+    /// The request this failure answers, when the line got far enough to say.
+    pub(crate) id: Option<u64>,
+    /// What was wrong.
+    pub(crate) reason: DecodeError,
+}
+
 /// Decodes one line.
 ///
 /// Blank lines are not an error; they decode to `None` so a client can send them
 /// harmlessly.
-pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeError> {
+pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
     if line.len() > MAX_LINE_BYTES {
-        return Err(DecodeError::TooLong);
+        return Err(DecodeError::TooLong.at(None));
     }
     // A leading UTF-8 BOM is stripped rather than refused. JSON permits ignoring
     // it, and plenty of tooling — PowerShell's pipe among them — emits one without
@@ -119,31 +151,38 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeError> {
         return Ok(None);
     }
 
-    let value: serde_json::Value =
-        serde_json::from_str(trimmed).map_err(|error| DecodeError::NotJson {
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+        DecodeError::NotJson {
             detail: error.to_string(),
-        })?;
-    let object = value.as_object().ok_or(DecodeError::NotAnObject)?;
+        }
+        .at(None)
+    })?;
+    let object = value.as_object().ok_or(DecodeError::NotAnObject.at(None))?;
 
+    // Read the id before anything that can fail with one, so every later failure can
+    // be correlated by the client. See [`DecodeFailure`].
     let id = match object.get("id") {
         None | Some(serde_json::Value::Null) => None,
-        Some(raw) => Some(raw.as_u64().ok_or(DecodeError::BadId)?),
+        Some(raw) => Some(raw.as_u64().ok_or(DecodeError::BadId.at(None))?),
     };
 
     let name = object
         .get("command")
-        .ok_or(DecodeError::MissingCommand)?
+        .ok_or(DecodeError::MissingCommand.at(id))?
         .as_str()
-        .ok_or(DecodeError::CommandNotAString)?;
+        .ok_or(DecodeError::CommandNotAString.at(id))?;
 
-    let path_argument = |field: &str| -> Result<PathBuf, DecodeError> {
+    let path_argument = |field: &str| -> Result<PathBuf, DecodeFailure> {
         object
             .get(field)
             .and_then(serde_json::Value::as_str)
             .map(PathBuf::from)
-            .ok_or_else(|| DecodeError::BadArguments {
-                command: name.to_owned(),
-                detail: format!("expected a string \"{field}\""),
+            .ok_or_else(|| {
+                DecodeError::BadArguments {
+                    command: name.to_owned(),
+                    detail: format!("expected a string \"{field}\""),
+                }
+                .at(id)
             })
     };
 
@@ -166,13 +205,15 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeError> {
                 return Err(DecodeError::UnknownCommand {
                     name: other.to_owned(),
                     valid: Command::all_names().join(", "),
-                });
+                }
+                .at(id));
             }
             let view: ViewCommand = serde_json::from_value(value.clone()).map_err(|error| {
                 DecodeError::BadArguments {
                     command: other.to_owned(),
                     detail: error.to_string(),
                 }
+                .at(id)
             })?;
             RequestBody::Command(Command::View(view))
         }
@@ -194,8 +235,8 @@ pub(crate) struct Snapshot {
     pub(crate) cache_bytes: usize,
     /// Renders submitted and not yet returned.
     pub(crate) renders_in_flight: usize,
-    /// Pages we have stopped trying to render.
-    pub(crate) failed_pages: Vec<usize>,
+    /// Pages we have stopped trying to render, counting from 1.
+    pub(crate) failed_pages: Vec<PageNumber>,
     /// Nothing queued, nothing in flight, everything visible is drawn.
     ///
     /// The most useful field here. An agent that scrolls and then captures without
@@ -224,13 +265,13 @@ pub(crate) enum Event {
     },
     /// A page finished rasterizing and is on screen.
     PageRendered {
-        /// Zero-based page index.
-        page: usize,
+        /// The page, counting from 1.
+        page: PageNumber,
     },
     /// A page could not be rasterized.
     PageFailed {
-        /// Zero-based page index.
-        page: usize,
+        /// The page, counting from 1.
+        page: PageNumber,
         /// The renderer's message.
         reason: String,
         /// Whether another attempt is coming.
@@ -360,7 +401,67 @@ mod tests {
         );
         assert_eq!(
             command(r#"{"command":"go_to_page","page":4}"#),
-            Command::View(ViewCommand::GoToPage { page: 4 })
+            Command::View(ViewCommand::GoToPage {
+                page: PageNumber::new(4).expect("page 4 exists")
+            })
+        );
+    }
+
+    #[test]
+    fn page_zero_is_refused_without_a_hand_written_check() {
+        // `PageNumber` cannot hold zero, so deserialization refuses it. Worth a test
+        // because the guarantee lives in a type rather than in code anybody reading
+        // `decode` would see.
+        let failure = decode(r#"{"id":7,"command":"go_to_page","page":0}"#)
+            .expect_err("should be refused");
+        match failure.reason {
+            DecodeError::BadArguments { command, .. } => assert_eq!(command, "go_to_page"),
+            other => panic!("expected BadArguments, got {other:?}"),
+        }
+        assert_eq!(
+            failure.id,
+            Some(7),
+            "a bad argument must still be answerable, or the client waits forever"
+        );
+    }
+
+    #[test]
+    fn a_failure_keeps_the_id_whenever_the_line_had_one() {
+        // The bug this pins down: every failure below used to reply with no id, so a
+        // client waiting on its request never saw an answer. Found when an end-to-end
+        // test sent `page: 0` under an id and hung with the window open.
+        for line in [
+            r#"{"id":3,"command":"go_to_page","page":0}"#,
+            r#"{"id":3,"command":"teleport"}"#,
+            r#"{"id":3,"command":"open"}"#,
+            r#"{"id":3}"#,
+            r#"{"id":3,"command":5}"#,
+        ] {
+            let failure = decode(line).expect_err("should be refused");
+            assert_eq!(failure.id, Some(3), "{line} lost its id");
+        }
+    }
+
+    #[test]
+    fn a_failure_has_no_id_when_none_could_be_read() {
+        // The honest half: claiming an id here would be inventing one.
+        for line in [
+            "not json at all",
+            "[1,2,3]",
+            r#"{"id":-1,"command":"next_page"}"#,
+        ] {
+            let failure = decode(line).expect_err("should be refused");
+            assert_eq!(failure.id, None, "{line} reported an id it never had");
+        }
+    }
+
+    #[test]
+    fn a_negative_page_is_refused() {
+        let failure =
+            decode(r#"{"command":"go_to_page","page":-1}"#).expect_err("should be refused");
+        assert!(
+            matches!(failure.reason, DecodeError::BadArguments { .. }),
+            "{failure:?}"
         );
     }
 
@@ -471,7 +572,9 @@ mod tests {
     fn an_unknown_command_lists_the_valid_ones() {
         // An agent that guesses wrong should be able to correct itself from the
         // error rather than by reading our source.
-        let error = decode(r#"{"command":"teleport"}"#).expect_err("should be refused");
+        let error = decode(r#"{"command":"teleport"}"#)
+            .expect_err("should be refused")
+            .reason;
         match error {
             DecodeError::UnknownCommand { name, valid } => {
                 assert_eq!(name, "teleport");
@@ -484,8 +587,9 @@ mod tests {
 
     #[test]
     fn a_recognised_command_with_bad_arguments_says_which_command() {
-        let error =
-            decode(r#"{"command":"go_to_page","page":"four"}"#).expect_err("should be refused");
+        let error = decode(r#"{"command":"go_to_page","page":"four"}"#)
+            .expect_err("should be refused")
+            .reason;
         match error {
             DecodeError::BadArguments { command, .. } => assert_eq!(command, "go_to_page"),
             other => panic!("expected BadArguments, got {other:?}"),
@@ -526,7 +630,7 @@ mod tests {
             r#"{{"command":"next_page","pad":"{}"}}"#,
             "x".repeat(MAX_LINE_BYTES)
         );
-        assert_eq!(decode(&line), Err(DecodeError::TooLong));
+        assert_eq!(decode(&line), Err(DecodeError::TooLong.at(None)));
     }
 
     #[test]
@@ -567,7 +671,13 @@ mod tests {
         // silently disagreeing with whatever the client used to build the message,
         // which is a worse outcome for it than a clear rejection.
         let line = format!("{{\"command\":\"open\",\"path\":\"a{}b.pdf\"}}", '\u{1}');
-        assert!(matches!(decode(&line), Err(DecodeError::NotJson { .. })));
+        assert!(matches!(
+            decode(&line),
+            Err(DecodeFailure {
+                reason: DecodeError::NotJson { .. },
+                ..
+            })
+        ));
     }
 
     // --- Replies -------------------------------------------------------------
@@ -589,7 +699,7 @@ mod tests {
         let reply = Reply::rejected(
             Some(1),
             Rejection::NoSuchPage {
-                page: 10,
+                page: PageNumber::new(10).expect("nonzero"),
                 page_count: 3,
             },
         );
@@ -613,11 +723,15 @@ mod tests {
         let json = serde_json::to_string(&Event::Idle).expect("serialize");
         assert_eq!(json, r#"{"event":"idle"}"#);
 
-        let json = serde_json::to_string(&Event::PageRendered { page: 4 }).expect("serialize");
+        // The wire carries the page number, so index 3 reports as page 4.
+        let json = serde_json::to_string(&Event::PageRendered {
+            page: PageNumber::from_index(3),
+        })
+        .expect("serialize");
         assert_eq!(json, r#"{"event":"page_rendered","page":4}"#);
 
         let json = serde_json::to_string(&Event::PageFailed {
-            page: 2,
+            page: PageNumber::from_index(1),
             reason: "timed out".to_owned(),
             will_retry: true,
         })

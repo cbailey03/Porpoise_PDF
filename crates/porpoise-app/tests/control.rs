@@ -34,6 +34,13 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The fixture: enough pages that navigating to page 4 means something.
 const PAGES: usize = 6;
 
+/// The viewer's gap between pages, in points.
+///
+/// Duplicated from `viewer.rs` because this is an integration test and that
+/// constant is crate-private. Only used to predict a scroll offset; if the two ever
+/// disagree, the assertion that uses it fails loudly rather than drifting.
+const PAGE_GAP_PT: f64 = 12.0;
+
 /// Whether the environment can open a window.
 fn e2e_enabled() -> bool {
     std::env::var_os("PORPOISE_E2E").is_some()
@@ -246,6 +253,18 @@ fn an_agent_can_open_navigate_and_capture() {
         Some(&Value::Null),
         "a scroll was still pending after idle: {view}"
     );
+    // Page numbers are one-based, so page 3 is the *third* page: two pages and two
+    // gaps above it. The round trip above holds under either convention, which is
+    // why the offset is asserted too.
+    assert_eq!(
+        view.get("scroll_top_pt").and_then(Value::as_f64),
+        Some(2.0 * (300.0 + PAGE_GAP_PT)),
+        "page 3 is not where one-based numbering puts it: {view}"
+    );
+    assert_eq!(
+        view.get("first_visible_page").and_then(Value::as_u64),
+        Some(3)
+    );
 
     // 5. Capture, and wait for the file to actually exist.
     let id = serve.send(
@@ -278,6 +297,71 @@ fn an_agent_can_open_navigate_and_capture() {
         "captured a {}x{} image",
         info.width,
         info.height
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn a_capture_leaves_the_window_open_for_more_commands() {
+    if !e2e_enabled() {
+        skip("a_capture_leaves_the_window_open_for_more_commands");
+        return;
+    }
+
+    // The regression this exists for: `capture` closed the window, because the
+    // capture machinery was written for the one-shot CLI `--screenshot` flag, where
+    // capture-then-exit is the whole point, and was then reused for the `capture`
+    // command without revisiting that. Every other capture assertion in this file
+    // captures *last*, so the program exiting afterwards looked like teardown.
+    let document = fixture("e2e-capture-twice.pdf");
+    let first = scratch("e2e-capture-first.png");
+    let second = scratch("e2e-capture-second.png");
+    let mut serve = Serve::start(&document);
+
+    serve.wait_for_event("idle");
+
+    let id = serve.send(
+        "capture",
+        &[("path", Value::from(first.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    serve.wait_for_event("captured");
+
+    // The actual point: the program is still listening.
+    let id = serve.send("go_to_page", &[("page", Value::from(4))]);
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "the window did not survive a capture: {reply}"
+    );
+    serve.wait_for_event("idle");
+    assert_eq!(
+        serve.view().get("current_page").and_then(Value::as_u64),
+        Some(4)
+    );
+
+    // And a second capture still works, which a one-shot state machine would fail.
+    let id = serve.send(
+        "capture",
+        &[("path", Value::from(second.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    serve.wait_for_event("captured");
+
+    let before = std::fs::read(&first).expect("the first capture should exist");
+    let after = std::fs::read(&second).expect("the second capture should exist");
+    assert_ne!(
+        before, after,
+        "both captures are byte-identical, so the second is a stale image \
+         rather than a fresh one of page 4"
     );
 
     serve.quit();
@@ -417,7 +501,27 @@ fn a_refused_command_explains_itself_and_changes_nothing() {
     let view = serve.view();
     assert_eq!(
         view.get("current_page").and_then(Value::as_u64),
-        Some(0),
+        Some(1),
+        "a refused command moved the view"
+    );
+
+    // Page zero does not exist under one-based numbering. Unlike page 999 above it
+    // is refused by the wire *type* rather than by a bounds check, so it fails during
+    // decoding rather than in `apply` — a different path, and one that used to throw
+    // the request id away. `reply_to` only returns on a matching id, so this call
+    // hanging is exactly the failure a real client would see.
+    let id = serve.send("go_to_page", &[("page", Value::from(0))]);
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "page 0 was accepted: {reply}"
+    );
+
+    let view = serve.view();
+    assert_eq!(
+        view.get("current_page").and_then(Value::as_u64),
+        Some(1),
         "a refused command moved the view"
     );
 

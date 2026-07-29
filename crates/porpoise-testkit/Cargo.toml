@@ -1,7 +1,7 @@
 [package]
 name = "porpoise-testkit"
 version = "0.1.0"
-description = "Test fixtures, pixel diffing, and the differential-testing harness."
+description = "Test fixtures, pixel diffing, and the malformed-input mutation harness."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

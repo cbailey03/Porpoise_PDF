@@ -236,7 +236,7 @@ Porpoise_PDF/
    ├─ porpoise-render/       # Renderer trait + hayro backend; page + scale -> RGBA pixmap
    ├─ porpoise-view/         # GUI-agnostic: layout, scroll, zoom, virtualization, cache policy
    ├─ porpoise-app/          # eframe shell: the binary, input handling, texture upload, chrome
-   └─ porpoise-testkit/      # dev-only: corpus runner, pixel-diff, PDFium oracle, fuzz targets
+   └─ porpoise-testkit/      # dev-only: PDF fixtures, pixel-diff, malformed-input mutator
 ```
 
 Why these seams specifically:
@@ -244,13 +244,15 @@ Why these seams specifically:
 - **`porpoise-doc` / `porpoise-render` split** — the editor needs the document model without the
   renderer. `porpoise-doc` is a thin facade over hayro for Goal 1; it is the seam where `lopdf`
   joins for incremental save later, without the shell knowing.
-- **`porpoise-render` as a trait, not a direct call** — lets the PDFium oracle be a second
-  implementation of the same trait in tests, and lets a future GPU backend (§5) slot in.
+- **`porpoise-render` as a trait, not a direct call** — lets tests drive the pipeline with a stub
+  backend, and lets a future GPU backend (§5) slot in. Originally justified by wanting a second
+  *engine* behind the same trait; that reason is gone with the oracle, but the stub renderer the
+  pool tests depend on earns the seam on its own.
 - **`porpoise-view` is the important one.** Scroll geometry, visible-set computation, zoom
   bucketing, and cache eviction are pure logic over numbers. Keeping them out of the GUI crate
   means they are unit-testable with zero windowing, and it caps the cost of a shell migration.
-- **`porpoise-testkit` separate** so corpus PDFs and the PDFium dev-dependency cannot leak into
-  the shipped binary.
+- **`porpoise-testkit` separate** so fixtures and test-only dependencies cannot leak into the
+  shipped binary. A CI job asserts this rather than trusting it.
 
 `porpoise-view` and `porpoise-testkit` will be nearly empty at M1. Creating them up front is
 free and prevents the monolith.
@@ -322,7 +324,8 @@ writing our own renderer now would be the single fastest way to never ship. What
 
 - **The `porpoise-*` crates** — the document facade, the scroll/virtualization engine, and the
   cache policy. This is the actual product surface, and none of it exists off the shelf.
-- **The differential test harness** — genuinely novel, per §1.
+- **The malformed-input mutation harness** — deterministic, seeded, and reproducible from its
+  seed, which off-the-shelf fuzzing does not give us without a corpus and a separate build.
 - **A GPU render backend, Phase 3+, via hayro's `Device` trait.** hayro rasterizes on CPU
   (`vello_cpu`), so our Goal 1 pipeline is `hayro → CPU pixmap → GPU texture upload`. That is
   fine, and it means we do not need egui's custom wgpu pass for Goal 1 at all. Later, we can
@@ -402,6 +405,66 @@ The `deny.toml` bans on C PDF and codec libraries, and the `no-native-deps` CI j
 framing they matter *more*, not less: they are the mechanical enforcement of the premise. `pixel_diff`
 also stays — it is what makes hayro's own output testable for determinism and regression.
 
+## 6b. Post-Goal-1 code audit (2026-07-29)
+
+Goal 1 was reviewed for code quality, module boundaries, test coverage, and documentation accuracy
+once it was complete. All four automated gates were already green — 93 tests, clippy with
+`-D warnings`, rustdoc with `-D warnings`, and `cargo-deny` — so the findings were the things a gate
+does not catch.
+
+**Documentation had drifted from the code in ten places.** Every one described the PDFium
+differential oracle as existing or forthcoming: the README's state line and crate table, a whole
+paragraph of `porpoise-render`'s crate docs, `porpoise-testkit`'s crate docs and package
+description, the `no-native-deps` CI comment, and four spots in this document's own §3 and §5. All
+corrected. This is worth naming as a category rather than a list: when a decision reverses, the
+prose that justified the old decision is scattered much wider than the code that implemented it,
+and only the code gets deleted.
+
+**Test coverage was inverted against risk.** `porpoise-view` — 465 lines of pure arithmetic — had
+649 lines of tests. `porpoise-app` — 1,168 lines holding every piece of mutable state in the
+program — had none. That is backwards: the arithmetic is the part least likely to be silently wrong,
+because it is the part with no hidden state. Fixed by splitting the dev instrumentation into
+`devtools.rs`, extracting the CLI's pure decisions (`page_index`, `resolve_scale`, `log_level`) from
+the I/O around them, and testing all of it — 34 tests where there were zero.
+
+That immediately paid for itself: `to_color_image`, the guard whose entire job is to stop a bad
+buffer from panicking on the UI thread, **accepted a zero-dimension page**. A zero width satisfies
+the length check trivially — zero bytes is exactly what `0 * h * 4` asks for — and the image then
+reaches `load_texture`, where wgpu validates dimensions. Not reachable through `HayroRenderer`,
+which refuses a sub-pixel page first, so this was a latent hole rather than a live bug. It was found
+by writing the obvious test for a function that had never had one.
+
+**Three defects in shipped behaviour:**
+
+1. **A timed-out page was blacklisted forever.** `failures` was keyed by rasterization and only
+   cleared on a zoom change, so one timeout meant a permanent error tile at that zoom — and the
+   field's own comment claimed the opposite. Timeouts now carry a bounded retry budget
+   (`MAX_RENDER_RETRIES`) while deterministic failures — panic, refused size, bad index — still get
+   none, because retrying those only burns a worker to reach the same answer.
+2. **Every `tracing` call went nowhere.** `porpoise-render` has three `warn!` sites and no
+   subscriber was ever installed, so "the renderer panicked on this page" — the single diagnostic
+   this project's premise most depends on — was discarded. `porpoise-app` now installs one on
+   stderr, honouring a bare `RUST_LOG` level.
+3. **Dead declarations and dead code.** `rayon`, `parking_lot`, `insta` and `rfd` were declared in
+   `[workspace.dependencies]` and used by nothing; we wrote our own pool, used std locks, and never
+   wrote a snapshot test. They cost no build time — an unused workspace declaration pulls nothing —
+   but they read as "we use these." Removed. `lopdf` stays, as the one forward reference with a
+   stated reason. `PixelDiff::fraction_differing` was never called and is gone; `pixel_diff`'s
+   `tolerance` parameter was only ever passed zero and now has a test that exercises it.
+
+**Module boundaries: crate layering was right, file sizes were not.** `doc ← render ← app` and
+`doc ← view ← app` with no cycles, and `porpoise-view` depending on exactly one crate, is the part
+that would have been expensive to get wrong. But `viewer.rs` was 901 lines with ~200 of them
+measurement apparatus interleaved with the thing being measured, and `porpoise-view/src/lib.rs` held
+three unrelated concerns in 570 lines while the *smaller* concerns had each been given their own
+module. `porpoise-view` is now five focused modules behind the same public API; `porpoise-app` is
+three.
+
+**Still open after the audit:** the ~150 ms frame outlier (§6a) reproduces unchanged and remains
+unexplained, though `ui` time at its worst is 0.24 ms, so it is still not our code. There are no
+doctests anywhere in the workspace — the prose is thorough but nothing compiles it, so it can drift
+the same way §3 and §5 just did.
+
 ## 7. Open decisions
 
 1. ~~**Our license.**~~ **Decided 2026-07-29: `MIT OR Apache-2.0`**, copyright Christian Bailey,
@@ -413,15 +476,20 @@ also stays — it is what makes hayro's own output testable for determinism and 
    first release, not for M1.
 2. **Confirm the egui bet.** It is the right call for Goal 1 and defensible for years, but if a
    distinctly non-egui-looking UI is a hard product requirement, that is worth knowing before M2.
-3. **Corpus sourcing for M6.** pdf.js and PDFBox regression suites are the obvious starting
-   points; check their licenses before vendoring.
+3. **Corpus sourcing.** Still open, but no longer an M6 blocker — M6 shipped on a synthesized
+   fixture plus mutation, which needs no corpus at all. What a corpus would buy now is breadth of
+   *real* documents: pdf.js and PDFBox regression suites are the obvious starting points; check
+   their licenses before vendoring.
 
 ## 8. Known unknowns
 
 Flagged rather than glossed, because each is a real risk:
 
-- **No independent hayro-vs-PDFium correctness comparison exists.** Its breadth is inferred from
-  corpus size and Typst adoption. M6 is how we replace inference with data.
+- **No independent hayro correctness comparison exists.** Its breadth is inferred from corpus size
+  and Typst adoption. An earlier draft said M6 would replace that inference with data; it did not,
+  because the comparison M6 planned was against PDFium and that was dropped by decision (§1). So
+  the inference stands, deliberately. What would actually narrow it is spot-checking real documents
+  against a reader a human trusts — not a second engine wired into CI.
 - **hayro's documented gaps:** knockout groups, non-embedded CID fonts. Type 3 fonts render but
   [lack character-code access](https://github.com/LaurenzV/hayro/issues/1331) — that is a Goal 2
   text-extraction problem, not a Goal 1 one.

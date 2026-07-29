@@ -6,7 +6,7 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: M5 — Goal 1 is feature-complete.** Open a PDF, scroll it freely or page by page,
+**Current state: Goal 1 is complete.** Open a PDF, scroll it freely or page by page,
 navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Pages rasterize on worker threads
 so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
 than four hundred pages' worth, and a synthetic scroll of 40 pages per second holds a 60 fps median
@@ -43,7 +43,7 @@ sections 1 and 6a.
 | `porpoise-render` | Rasterizes pages to RGBA, behind a swappable `Renderer` trait. |
 | `porpoise-view` | GUI-agnostic viewport logic: scroll layout, virtualization, cache policy. |
 | `porpoise-app` | The `porpoise` binary. |
-| `porpoise-testkit` | Fixtures, pixel diffing, and (from M6) the PDFium differential oracle. |
+| `porpoise-testkit` | Fixtures, pixel diffing, and the malformed-input mutation harness. |
 
 ## Building
 
@@ -81,6 +81,21 @@ cargo run -p porpoise-app -- render path/to/file.pdf --page 1 --dpi 150 -o page1
 
 Page numbers start at 1. `--dpi` is a friendlier spelling of `--scale`, where `--scale 1.0` is
 72 DPI; the two conflict and cannot be combined.
+
+## Diagnostics
+
+Warnings go to stderr, so they never mix with `info` and `render` output. Set `RUST_LOG` to a level
+to see more:
+
+```bash
+RUST_LOG=debug porpoise file.pdf
+```
+
+`trace`, `debug`, `info`, `warn` (the default), `error`, and `off` are understood. A per-target
+directive like `RUST_LOG=porpoise_render=debug` is *not* parsed — it falls back to the default rather
+than going silent — because supporting it means pulling regex machinery in to parse a filter string.
+
+## Untrusted input
 
 Two flags exist because a PDF is untrusted input, and both have sane defaults:
 
@@ -121,6 +136,9 @@ cargo deny check bans licenses sources advisories
   bug in a PDF viewer, not a style question.
 - Untrusted input is parsed and rasterized inside `catch_unwind`; a malformed page must degrade
   to one broken page, never take down the process.
+- A page that times out is retried a bounded number of times, because a timeout usually means the
+  machine was busy. A page that panics or is refused for its size is not retried — that failure is
+  deterministic, so a retry only spends a worker to reach the same answer.
 
 ## License
 

@@ -22,23 +22,26 @@ hayro-syntax = "0.7.2"
 # here so the version decision lives in one place.
 lopdf = "0.44"
 
-# --- Shell. Not wired until M2; see docs/goal-1-plan.md, section 4. ---
+# --- Shell ---
 egui = "0.35"
 eframe = "0.35"
-rfd = "0.17"
 
 # --- Support ---
 thiserror = "2.0"
 tracing = "0.1"
+# Without a subscriber installed, every `tracing` call compiles to a no-op and the
+# diagnostics vanish — including "the renderer just panicked", which is the last
+# one we can afford to lose. `env-filter` is deliberately *not* enabled: it pulls
+# in regex machinery to parse a filter string, which is a poor trade for a project
+# whose argument rests on a small, auditable dependency graph.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "std",
+] }
 clap = { version = "4.6", features = ["derive"] }
 # Used directly rather than through `image`, which would require cloning the
 # whole page buffer to hand it an owned Vec. Already in the tree via hayro.
 png = "0.18"
-rayon = "1.12"
-parking_lot = "0.12"
-
-# --- Dev / test only ---
-insta = "1.48"
 
 # Applied to every member via `[lints] workspace = true`.
 [workspace.lints.rust]

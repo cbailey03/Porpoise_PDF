@@ -5,12 +5,6 @@
 //! render pool can be driven by a stub in tests. See `docs/goal-1-plan.md`,
 //! sections 1 and 5.
 //!
-//! The PDFium differential oracle in `porpoise-testkit` deliberately does *not*
-//! implement this trait, despite an earlier plan that it would. [`RenderError`]
-//! enumerates the ways *this* renderer fails, and adding a variant meaning
-//! "PDFium said no" would move a test-only concern into shipped code. The oracle
-//! carries its own error type instead.
-//!
 //! # Untrusted input
 //!
 //! Every function here treats its input as hostile, and there are three distinct
@@ -18,7 +12,7 @@
 //! memory-safe language.
 //!
 //! - **Memory corruption.** Not possible: hayro is pure Rust. This is the whole
-//!   reason we are not using PDFium.
+//!   reason for building on a pure-Rust interpreter rather than a C++ one.
 //! - **Panics.** hayro has open panic bugs today. [`HayroRenderer`] wraps
 //!   rasterization in [`catch_unwind`], so a malformed page degrades to
 //!   [`RenderError::Panicked`] rather than ending the process.

@@ -1,17 +1,20 @@
 //! Test fixtures and comparison helpers.
 //!
-//! This crate exists so that corpus files, comparison logic, and eventually the
-//! PDFium reference backend cannot leak into the shipped binary. Nothing here is
-//! reachable from `porpoise-app`.
+//! This crate exists so that fixtures and comparison logic cannot leak into the
+//! shipped binary. Nothing here is reachable from `porpoise-app`, and a CI job
+//! asserts as much.
 //!
-//! Two things live here today:
+//! Three things live here:
 //!
 //! - [`single_page_pdf`], which synthesizes a valid PDF in memory, so the core
 //!   pipeline can be tested in CI without vendoring any fixture files.
-//! - [`pixel_diff`], the comparison primitive the differential-testing harness
-//!   will be built on. See `docs/goal-1-plan.md`, section 1: no published
-//!   hayro-vs-PDFium accuracy comparison exists, so we build the oracle
-//!   ourselves at M6.
+//! - [`Mutator`], which damages that PDF in thousands of deterministic ways, so
+//!   the hardening claims in `docs/goal-1-plan.md` section 6a are measured rather
+//!   than asserted.
+//! - [`pixel_diff`], which compares two rasterizations channel by channel. Used
+//!   to prove rendering is deterministic and that the threaded path produces the
+//!   same pixels as the direct one. Comparing against a second *engine* is
+//!   explicitly a non-goal; see `docs/goal-1-plan.md`, section 1.
 
 use porpoise_render::RenderedPage;
 
@@ -279,20 +282,6 @@ pub struct PixelDiff {
 }
 
 impl PixelDiff {
-    /// Fraction of pixels that differ, in `0.0..=1.0`. Zero for an empty image.
-    #[must_use]
-    pub fn fraction_differing(&self) -> f64 {
-        if self.total_pixels == 0 {
-            return 0.0;
-        }
-        // Both counts are pixel counts, so the precision loss is irrelevant at
-        // any image size we can actually rasterize.
-        #[allow(clippy::cast_precision_loss)]
-        {
-            self.differing_pixels as f64 / self.total_pixels as f64
-        }
-    }
-
     /// Whether the two images are identical within the tolerance used.
     #[must_use]
     pub fn is_clean(&self) -> bool {

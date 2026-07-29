@@ -4,6 +4,7 @@
 //! and `render` rasterizes one page to a PNG. See `docs/goal-1-plan.md`,
 //! section 4.
 
+mod devtools;
 mod viewer;
 
 use std::error::Error;
@@ -18,6 +19,7 @@ use porpoise_render::{
     HayroRenderer, RenderError, RenderLimits, RenderRequest, render_with_timeout,
 };
 use porpoise_view::ScrollLayout;
+use tracing::level_filters::LevelFilter;
 
 /// Wraps a [`RenderError`] so the message leads with the page number the user
 /// actually typed.
@@ -126,6 +128,7 @@ fn main() -> ExitCode {
     // Taken before anything else so "time to first page" includes argument
     // parsing, file reading and window creation — everything the user waits for.
     let launched = Instant::now();
+    init_tracing();
     let cli = Cli::parse();
 
     let outcome = match cli.command {
@@ -153,6 +156,80 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Sends `tracing` output to stderr.
+///
+/// Without a subscriber, every `warn!` in the render pipeline is discarded —
+/// including the one reporting that the interpreter panicked on a page, which for
+/// this project is the single most important diagnostic there is. stderr rather
+/// than stdout so diagnostics never mix with `info` and `render` output.
+fn init_tracing() {
+    let level = log_level(std::env::var("RUST_LOG").ok().as_deref());
+    // A second call would fail, and there is only one call site, so the result is
+    // deliberately ignored rather than unwrapped.
+    drop(
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::stderr)
+            .try_init(),
+    );
+}
+
+/// Maps a `RUST_LOG` value onto a level, defaulting to warnings only.
+///
+/// Deliberately not `tracing-subscriber`'s `EnvFilter`, which supports per-target
+/// directives but pulls in regex machinery to parse them. A bare level covers what
+/// this binary can actually emit; per-target filtering can join when there are
+/// enough targets to filter between.
+fn log_level(setting: Option<&str>) -> LevelFilter {
+    match setting
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "trace" => LevelFilter::TRACE,
+        "debug" => LevelFilter::DEBUG,
+        "info" => LevelFilter::INFO,
+        "error" => LevelFilter::ERROR,
+        "off" | "none" => LevelFilter::OFF,
+        // Anything else — unset, or a per-target directive we do not parse —
+        // leaves the default. Staying at `warn` on an unrecognized value is safer
+        // than going silent on a typo.
+        _ => LevelFilter::WARN,
+    }
+}
+
+/// Converts a 1-based page number into an index, checked against the document.
+///
+/// Page numbers are 1-based for humans and 0-based internally. This is the only
+/// place that boundary is crossed, so an off-by-one has one place to hide.
+fn page_index(page: usize, page_count: usize, file: &Path) -> Result<usize, String> {
+    if page == 0 {
+        return Err("page numbers start at 1".to_owned());
+    }
+    if page > page_count {
+        return Err(format!(
+            "{} has {page_count} page(s), so page {page} does not exist",
+            file.display()
+        ));
+    }
+    Ok(page - 1)
+}
+
+/// The scale to rasterize at, from the mutually exclusive `--dpi` and `--scale`.
+///
+/// clap enforces that they are not combined; this validates the one that was
+/// given. Non-finite and non-positive values are rejected here rather than
+/// reaching the renderer, so the message names the flag the user typed.
+fn resolve_scale(dpi: Option<f32>, scale: f32) -> Result<f32, String> {
+    match dpi {
+        Some(dpi) if dpi.is_finite() && dpi > 0.0 => Ok(dpi / POINTS_PER_INCH),
+        Some(dpi) => Err(format!("--dpi must be a positive number, got {dpi}")),
+        None if scale.is_finite() && scale > 0.0 => Ok(scale),
+        None => Err(format!("--scale must be a positive number, got {scale}")),
+    }
+}
+
 fn run_viewer(
     file: Option<&Path>,
     start_page: Option<usize>,
@@ -168,19 +245,8 @@ fn run_viewer(
 
     let document = Document::open(file)?;
 
-    // 1-based on the way in, 0-based inside, converted once.
     let start_index = match start_page {
-        Some(0) => return Err("page numbers start at 1".into()),
-        Some(page) if page > document.page_count() => {
-            return Err(format!(
-                "{} has {} page(s), so page {} does not exist",
-                file.display(),
-                document.page_count(),
-                page
-            )
-            .into());
-        }
-        Some(page) => Some(page - 1),
+        Some(page) => Some(page_index(page, document.page_count(), file)?),
         None => None,
     };
     let title = file.file_name().map_or_else(
@@ -188,20 +254,23 @@ fn run_viewer(
         |name| name.to_string_lossy().into_owned(),
     );
 
-    let request = screenshot.map(|path| viewer::ScreenshotRequest {
-        path: path.to_path_buf(),
-        // A few frames so the first real render is on screen before capturing.
-        warmup_frames: 3,
-        budget_frames: 240,
-    });
-
     viewer::run(
-        title,
         document,
-        start_index,
-        request,
-        scroll_benchmark,
-        report_first_page_from,
+        viewer::ViewerOptions {
+            title,
+            start_page: start_index,
+            devtools: viewer::DevOptions {
+                screenshot: screenshot.map(|path| devtools::ScreenshotRequest {
+                    path: path.to_path_buf(),
+                    // A few frames so the first real render is on screen before
+                    // capturing.
+                    warmup_frames: 3,
+                    budget_frames: 240,
+                }),
+                benchmark_frames: scroll_benchmark,
+                report_first_page_from,
+            },
+        },
     )
 }
 
@@ -246,35 +315,11 @@ fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_render(args: &RenderArgs) -> Result<(), Box<dyn Error>> {
-    // Page numbers are 1-based for humans and 0-based internally. Convert once,
-    // here, so the boundary is in one obvious place.
-    if args.page == 0 {
-        return Err("page numbers start at 1".into());
-    }
-    let page_index = args.page - 1;
-
-    let scale = match args.dpi {
-        Some(dpi) if dpi.is_finite() && dpi > 0.0 => dpi / POINTS_PER_INCH,
-        Some(dpi) => return Err(format!("--dpi must be a positive number, got {dpi}").into()),
-        None if args.scale.is_finite() && args.scale > 0.0 => args.scale,
-        None => {
-            return Err(format!("--scale must be a positive number, got {}", args.scale).into());
-        }
-    };
-
+    let scale = resolve_scale(args.dpi, args.scale)?;
     let document = Arc::new(Document::open(&args.file)?);
-
-    // Check this before rendering so the message can name the real page count,
-    // which is more useful than the renderer's index-out-of-range error.
-    if page_index >= document.page_count() {
-        return Err(format!(
-            "{} has {} page(s), so page {} does not exist",
-            args.file.display(),
-            document.page_count(),
-            args.page
-        )
-        .into());
-    }
+    // Checked here rather than in the renderer so the message can name the real
+    // page count, which is more useful than an index-out-of-range error.
+    let page_index = page_index(args.page, document.page_count(), &args.file)?;
 
     let limits = RenderLimits {
         max_total_pixels: args
@@ -310,4 +355,140 @@ fn run_render(args: &RenderArgs) -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::CommandFactory;
+
+    fn doc() -> &'static Path {
+        Path::new("report.pdf")
+    }
+
+    // --- Page numbering ------------------------------------------------------
+
+    #[test]
+    fn page_one_is_index_zero() {
+        assert_eq!(page_index(1, 10, doc()), Ok(0));
+        assert_eq!(page_index(10, 10, doc()), Ok(9));
+    }
+
+    #[test]
+    fn page_zero_is_rejected_because_humans_count_from_one() {
+        let error = page_index(0, 10, doc()).expect_err("page 0 does not exist");
+        assert!(error.contains("start at 1"), "unhelpful: {error}");
+    }
+
+    #[test]
+    fn a_page_past_the_end_names_the_real_page_count() {
+        // The renderer's own out-of-range error talks about indices, which reads as
+        // an off-by-one to someone who typed a 1-based number.
+        let error = page_index(11, 10, doc()).expect_err("page 11 of 10");
+        assert!(error.contains("10 page(s)"), "unhelpful: {error}");
+        assert!(error.contains("page 11"), "unhelpful: {error}");
+        assert!(error.contains("report.pdf"), "unhelpful: {error}");
+    }
+
+    #[test]
+    fn an_empty_document_rejects_every_page_number() {
+        assert!(page_index(1, 0, doc()).is_err());
+    }
+
+    // --- Scale resolution ----------------------------------------------------
+
+    #[test]
+    fn scale_one_is_seventy_two_dpi() {
+        assert_eq!(resolve_scale(None, 1.0), Ok(1.0));
+        assert_eq!(resolve_scale(Some(72.0), 1.0), Ok(1.0));
+    }
+
+    #[test]
+    fn dpi_converts_through_points_per_inch() {
+        assert_eq!(resolve_scale(Some(144.0), 1.0), Ok(2.0));
+        assert_eq!(resolve_scale(Some(36.0), 1.0), Ok(0.5));
+    }
+
+    #[test]
+    fn dpi_overrides_the_scale_default() {
+        // clap forbids passing both, but `scale` still carries its default value,
+        // so `dpi` has to win rather than being silently ignored.
+        assert_eq!(resolve_scale(Some(150.0), 1.0), Ok(150.0 / 72.0));
+    }
+
+    #[test]
+    fn a_degenerate_dpi_names_the_dpi_flag() {
+        for bad in [0.0, -10.0, f32::NAN, f32::INFINITY] {
+            let error =
+                resolve_scale(Some(bad), 1.0).expect_err("a degenerate dpi must be refused");
+            assert!(error.contains("--dpi"), "{bad} gave: {error}");
+        }
+    }
+
+    #[test]
+    fn a_degenerate_scale_names_the_scale_flag() {
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let error = resolve_scale(None, bad).expect_err("a degenerate scale must be refused");
+            assert!(error.contains("--scale"), "{bad} gave: {error}");
+        }
+    }
+
+    // --- Log level -----------------------------------------------------------
+
+    #[test]
+    fn logging_defaults_to_warnings_only() {
+        // The default has to include WARN: every diagnostic this binary emits is a
+        // warning, so a stricter default would make the subscriber pointless.
+        assert_eq!(log_level(None), LevelFilter::WARN);
+        assert_eq!(log_level(Some("")), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn rust_log_selects_a_level_case_insensitively() {
+        assert_eq!(log_level(Some("debug")), LevelFilter::DEBUG);
+        assert_eq!(log_level(Some("DEBUG")), LevelFilter::DEBUG);
+        assert_eq!(log_level(Some("  Info  ")), LevelFilter::INFO);
+        assert_eq!(log_level(Some("trace")), LevelFilter::TRACE);
+        assert_eq!(log_level(Some("off")), LevelFilter::OFF);
+    }
+
+    #[test]
+    fn an_unparsed_directive_stays_at_the_default_rather_than_going_silent() {
+        // A per-target directive is valid `RUST_LOG` that we do not parse. Falling
+        // back to `warn` keeps diagnostics; falling back to `off` would lose them.
+        assert_eq!(log_level(Some("porpoise_render=debug")), LevelFilter::WARN);
+        assert_eq!(log_level(Some("nonsense")), LevelFilter::WARN);
+    }
+
+    // --- CLI wiring ----------------------------------------------------------
+
+    #[test]
+    fn the_cli_definition_is_internally_consistent() {
+        // Catches contradictory `requires`/`conflicts_with` wiring, which otherwise
+        // only surfaces as a panic the first time a user passes that flag.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_bare_path_opens_the_viewer_rather_than_needing_a_subcommand() {
+        let cli = Cli::try_parse_from(["porpoise", "file.pdf"]).expect("should parse");
+        assert_eq!(cli.file.as_deref(), Some(Path::new("file.pdf")));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn dpi_and_scale_cannot_be_combined() {
+        let result = Cli::try_parse_from([
+            "porpoise", "render", "f.pdf", "-o", "out.png", "--dpi", "150", "--scale", "2",
+        ]);
+        assert!(result.is_err(), "--dpi and --scale must conflict");
+    }
+
+    #[test]
+    fn viewer_flags_require_a_file() {
+        // `--start-page 3` with no path would otherwise parse and then fail late
+        // with a less specific message.
+        assert!(Cli::try_parse_from(["porpoise", "--start-page", "3"]).is_err());
+    }
 }

@@ -18,6 +18,8 @@ porpoise-render.workspace = true
 porpoise-view.workspace = true
 clap.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 # Default features already select the wgpu backend in 0.35 (glow is now opt-in),
 # plus AccessKit, so there is nothing to override.
 eframe.workspace = true

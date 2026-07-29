@@ -618,3 +618,38 @@ fn differently_sized_rasterizations_cannot_be_diffed() {
 
     assert!(pixel_diff(&small, &large, 0).is_err());
 }
+
+#[test]
+fn tolerance_masks_differences_at_or_below_it_and_no_further() {
+    // The tolerance parameter exists so two rasterizations can be compared
+    // without antialiased edges counting as disagreement. Exercised here because
+    // every other caller passes zero, which would leave the branch untested.
+    let flat = |value: u8| RenderedPage {
+        width: 2,
+        height: 1,
+        rgba: vec![value, value, value, 255, value, value, value, 255],
+    };
+    let left = flat(100);
+    let right = flat(103); // three levels apart on every colour channel
+
+    let exact = pixel_diff(&left, &right, 0).expect("same dimensions");
+    assert_eq!(exact.differing_pixels, 2);
+    assert_eq!(exact.max_channel_delta, 3);
+
+    // A tolerance below the delta still reports it.
+    let strict = pixel_diff(&left, &right, 2).expect("same dimensions");
+    assert_eq!(
+        strict.differing_pixels, 2,
+        "a delta of 3 survives a tolerance of 2"
+    );
+
+    // At the delta, the difference is absorbed — but `max_channel_delta` keeps
+    // reporting the real distance, which is what makes a clean diff meaningful.
+    let forgiving = pixel_diff(&left, &right, 3).expect("same dimensions");
+    assert!(
+        forgiving.is_clean(),
+        "a delta of 3 should pass a tolerance of 3"
+    );
+    assert_eq!(forgiving.max_channel_delta, 3);
+    assert_eq!(forgiving.total_pixels, 2);
+}

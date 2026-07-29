@@ -18,5 +18,10 @@ thiserror.workspace = true
 # must never become a dependency of the shipped binary. CI enforces that; see
 # .github/workflows/ci.yml.
 
+[dev-dependencies]
+# Used to decode what we encoded, so a PNG test proves the bytes are readable
+# rather than merely non-empty.
+png.workspace = true
+
 [lints]
 workspace = true

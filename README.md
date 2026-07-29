@@ -6,8 +6,8 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: M0.** The workspace, CI, and license gating are in place. Page geometry and
-scroll layout work; there is no window yet — that arrives at M2.
+**Current state: M1.** The CLI can describe a document and rasterize any page to a PNG, with
+resource limits and a per-page timeout. There is no window yet — that arrives at M2.
 
 ## Crates
 
@@ -27,11 +27,30 @@ Requires Rust 1.97.1, which `rust-toolchain.toml` selects automatically. The MSR
 cargo build --workspace
 ```
 
-Report what the viewer would lay out for a document:
+## Using it
+
+Report page count, page sizes, and the scroll layout a viewer would build:
 
 ```bash
-cargo run -p porpoise-app -- path/to/file.pdf
+cargo run -p porpoise-app -- info path/to/file.pdf
 ```
+
+Rasterize a page to a PNG:
+
+```bash
+cargo run -p porpoise-app -- render path/to/file.pdf --page 1 --dpi 150 -o page1.png
+```
+
+Page numbers start at 1. `--dpi` is a friendlier spelling of `--scale`, where `--scale 1.0` is
+72 DPI; the two conflict and cannot be combined.
+
+Two flags exist because a PDF is untrusted input, and both have sane defaults:
+
+- `--max-pixels` refuses a render above a pixel budget, defaulting to 64 megapixels. A page can
+  be within the per-axis limit on both axes and still be an absurd allocation — a 200x100 pt page
+  at 5000 DPI is 2.5 *billion* pixels — so the total is capped, not just the dimensions.
+- `--timeout-ms` gives up on a page after a time budget, defaulting to 10 seconds. Some malformed
+  documents make the interpreter loop rather than crash, and memory safety does not help there.
 
 ## Checks
 

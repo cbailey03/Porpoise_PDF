@@ -2,9 +2,10 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M0 landed.** The workspace, CI, and license gating are in place, and the stack decision
-below is validated rather than assumed — hayro parses and rasterizes correctly on Windows MSVC,
-and 58 of 58 real-world PDFs on the dev machine parsed without error. M1 is next.
+**Status: M1 landed.** The stack decision below is validated rather than assumed — hayro parses
+and rasterizes correctly on Windows MSVC and Linux, 58 of 58 real-world PDFs on the dev machine
+parsed without error, and page renders have been eyeballed against real documents rather than
+only pixel-counted against a synthetic fixture. M2 (the window) is next.
 
 ## 1. The stack decision
 
@@ -141,15 +142,30 @@ is all in the scroll pipeline:
 
 Pure Rust converts *remote code execution* into *denial of service*. It does not eliminate DoS,
 and hayro has open panic issues today (#717, #646, #373 inside `vello_cpu`; #404 on large
-xStep/yStep). So the untrusted-input boundary needs real handling from M1, not bolted on later:
+xStep/yStep). So the untrusted-input boundary needed real handling from M1, not bolted on later.
 
-- Parse and rasterize only inside worker threads, wrapped in `catch_unwind`.
-- Hard limits: max decompressed image bytes, max page dimensions, recursion depth caps.
-- Per-job wall-clock timeout; a hung page degrades to an error placeholder, never a hung app.
-- A panic renders one broken page, never takes down the process.
+**Landed at M1:**
 
-Process-level isolation is the eventual answer, but thread isolation plus limits is the right
-scope for Goal 1.
+- Rasterization wrapped in `catch_unwind`, so a panic ruins one page rather than the process.
+  Note hayro is `!UnwindSafe` — it holds interior-mutable caches — so `AssertUnwindSafe` is
+  load-bearing, not decorative.
+- `RenderLimits` bounds the allocation *before* the backend is invoked, with both a per-axis cap
+  and a **total-pixel cap**. The second one matters more than it looks: 65535x65535 is within
+  hayro's per-axis `u16` viewport limit and still asks for roughly 17 GB. Per-axis checks alone
+  are not a limit.
+- `render_with_timeout` bounds wall-clock time, because a malformed document can make the
+  interpreter loop rather than panic, and no amount of memory safety helps with that.
+
+**Deliberately not done, and why:**
+
+- *Max decompressed image bytes* and *recursion depth caps* were in the original plan. They are
+  not implementable through hayro's public API — it exposes no hooks for either. The timeout and
+  the area cap are what we actually have, and they cover the realistic cases. Revisit if we
+  implement `Device` ourselves, which would put us inside the interpretation loop.
+- *Real cancellation.* Rust cannot cancel a thread, so a timeout abandons the worker rather than
+  killing it. An infinite loop occupies a core until the process exits. Acceptable for a one-shot
+  CLI render; **not** acceptable for the viewer, which needs a bounded worker pool at M4 so
+  timeouts cannot accumulate, and process isolation after that.
 
 ## 3. Project structure
 
@@ -191,7 +207,7 @@ free and prevents the monolith.
 | | Deliverable | Proves |
 |---|---|---|
 | **M0** ✅ | Workspace skeleton. CI: fmt + clippy + test on Windows and Linux, MSRV floor job, `cargo-deny`, and a job asserting no C PDF/codec library reaches the shipped binary. Page geometry, the `Renderer` trait seam, and `ScrollLayout` are real and tested. | The AGPL/GPL traps (§6) are mechanically excluded, not remembered — and the pure-Rust stack demonstrably rasterizes on Windows. |
-| **M1** | Headless CLI: open a PDF, report page count and sizes, rasterize page N at scale S to PNG. Worker thread + `catch_unwind` + limits from day one. | hayro works on real files. Fully testable with no GUI. |
+| **M1** ✅ | Headless CLI: `porpoise info` and `porpoise render --page N --dpi D -o out.png`. `RenderLimits` (per-axis **and** total-pixel caps), `render_with_timeout`, `catch_unwind`, PNG encoding. | hayro works on real files. Fully testable with no GUI. |
 | **M2** | eframe window; open via CLI arg or file dialog; page 1, fit-to-width. | End-to-end pixels on screen. |
 | **M3** | Continuous scroll across all pages with correct heterogeneous geometry, placeholders, visible-set computation. Rasterization still synchronous — expect stutter. | Scroll geometry is right. Isolating this from async is what makes it debuggable. |
 | **M4** | Async raster pipeline: worker pool, LRU byte budget, prefetch margin, zoom buckets, job cancellation. | Smoothness. This is the milestone that makes it feel good. |

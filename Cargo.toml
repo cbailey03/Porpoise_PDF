@@ -30,7 +30,10 @@ rfd = "0.17"
 # --- Support ---
 thiserror = "2.0"
 tracing = "0.1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4.6", features = ["derive"] }
+# Used directly rather than through `image`, which would require cloning the
+# whole page buffer to hand it an owned Vec. Already in the tree via hayro.
+png = "0.18"
 rayon = "1.12"
 parking_lot = "0.12"
 

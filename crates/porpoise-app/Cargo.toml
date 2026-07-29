@@ -14,7 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 porpoise-doc.workspace = true
+porpoise-render.workspace = true
 porpoise-view.workspace = true
+clap.workspace = true
+thiserror.workspace = true
 
 # NOTE: eframe/egui arrive at M2, when the window does. Declared in the workspace
 # manifest already so the version decision is made once.

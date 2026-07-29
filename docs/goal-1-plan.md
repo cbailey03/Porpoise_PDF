@@ -276,8 +276,13 @@ Found while researching; all are easy mistakes to make:
 
 ## 7. Open decisions
 
-1. **Our license.** Defaulting to `MIT OR Apache-2.0` (Rust norm). Either way `deny.toml` must
-   exclude AGPL/GPL, so this does not block M0.
+1. ~~**Our license.**~~ **Decided 2026-07-29: `MIT OR Apache-2.0`**, copyright Christian Bailey,
+   open source. Apache-2.0 supplies the explicit patent grant that MIT lacks — worth having when
+   the format's image codecs carry a long patent history — while MIT keeps the code usable by
+   GPLv2 projects that Apache-2.0 alone excludes. Matches `hayro`. One consequence to track:
+   Apache-2.0 section 4(d) obliges us to propagate hayro's `NOTICE.md` (PDFBox, pdf.js, `png`)
+   once we distribute binaries, so a generated `THIRD-PARTY-NOTICES` is a prerequisite for the
+   first release, not for M1.
 2. **Confirm the egui bet.** It is the right call for Goal 1 and defensible for years, but if a
    distinctly non-egui-looking UI is a hard product requirement, that is worth knowing before M2.
 3. **Corpus sourcing for M6.** pdf.js and PDFBox regression suites are the obvious starting

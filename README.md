@@ -67,6 +67,28 @@ cargo deny check bans licenses sources advisories
 
 ## License
 
-`Cargo.toml` declares `MIT OR Apache-2.0`, but the `LICENSE-MIT` and `LICENSE-APACHE` files are
-not written yet — that needs a decision on the copyright holder. See
-`docs/goal-1-plan.md` section 7.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+The dual license is the Rust ecosystem norm, and both halves earn their place here. Apache-2.0
+carries an explicit patent grant, which MIT lacks — that matters more than usual for a PDF
+implementation, since the format's image codecs have a long patent history. Offering MIT
+alongside it keeps the code usable by GPLv2 projects, which Apache-2.0 alone is incompatible
+with. It also matches `hayro`, our primary dependency.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you shall be dual licensed as above, without any additional terms or conditions.
+
+### Third-party notices
+
+`hayro` is Apache-2.0 and carries its own `NOTICE.md`, covering code adapted from PDFBox, pdf.js,
+and the `png` crate. Apache-2.0 section 4(d) requires propagating those notices in any
+distribution that includes the work, so a generated `THIRD-PARTY-NOTICES` file needs to land
+before we ship binaries. `cargo about` is the usual tool. Not required while the only artifact is
+source.

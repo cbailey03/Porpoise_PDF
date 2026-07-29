@@ -6,13 +6,13 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: M3.** The viewer scrolls continuously through a whole document, rendering only
-the pages you can see — a 400-page file holds two page textures, not four hundred. The CLI can
-also describe a document or rasterize a page to a PNG.
+**Current state: M4.** The viewer scrolls continuously through a whole document, rendering pages on
+worker threads so the UI never waits. A 400-page drawing set sits at around 16 MB of cached page
+textures rather than four hundred pages' worth. The CLI can also describe a document or rasterize a
+page to a PNG.
 
-Rasterization is still synchronous on the UI thread, capped at two pages per frame, so fast
-scrolling shows grey placeholders that fill in and resizing a large page visibly hitches. Moving
-that to a worker pool is M4.
+Still to come: paged scrolling and keyboard navigation, explicit zoom controls, and a file dialog
+(M5), then hardening against a malformed-PDF corpus (M6).
 
 ## Crates
 

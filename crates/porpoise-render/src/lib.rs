@@ -30,6 +30,10 @@
 //! partially-unwound cache is exactly the kind of thing worth staying nervous
 //! about, so prefer discarding a document that has panicked repeatedly.
 
+mod pool;
+
+pub use pool::{RenderOutcome, RenderPool};
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};

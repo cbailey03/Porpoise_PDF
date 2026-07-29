@@ -1,10 +1,18 @@
 //! The eframe window.
 //!
-//! M3 scrolls continuously through every page, at one shared zoom, drawing only
-//! the pages that intersect the viewport. Rasterization is still synchronous on
-//! the UI thread — deliberately, because a geometry bug should show up as a
-//! visibly wrong layout rather than hiding behind async timing. Moving it to a
-//! worker pool is M4. See `docs/goal-1-plan.md`, section 4.
+//! M4 rasterizes off the UI thread. The frame loop only ever polls for finished
+//! pages, submits requests for missing ones, and paints whatever the cache
+//! currently holds — it never waits for a render. That is the whole reason
+//! scrolling can stay smooth while pages are still being drawn.
+//!
+//! Three things make it feel continuous rather than merely asynchronous:
+//!
+//! - **Zoom bucketing.** Renders are keyed to a quantized zoom rung, so resizing
+//!   the window reuses textures instead of invalidating them on every pixel.
+//! - **Stale-resolution fallback.** While the right rung renders, the nearest
+//!   cached rung is drawn scaled. Slightly soft beats a grey flash.
+//! - **Prefetch.** Pages just outside the viewport are requested after the
+//!   visible ones, so scrolling usually finds them already there.
 //!
 //! The render pipeline is `hayro -> CPU pixmap -> GPU texture`, because hayro
 //! rasterizes on the CPU. So this needs no custom wgpu render pass; that only
@@ -14,31 +22,34 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eframe::egui;
 use porpoise_doc::Document;
-use porpoise_render::{HayroRenderer, RenderRequest, RenderedPage, Renderer};
-use porpoise_view::ScrollLayout;
+use porpoise_render::{HayroRenderer, RenderPool, RenderedPage};
+use porpoise_view::{CacheKey, PageCache, ScrollLayout, ZoomBucket, request_order};
 
 /// Vertical gap between pages, in PDF points.
 const PAGE_GAP_PT: f64 = 12.0;
 
-/// Re-rasterize only when the zoom moves by more than this fraction, so dragging
-/// a window edge does not throw away every texture on every pixel.
-const ZOOM_CHANGE_THRESHOLD: f32 = 0.01;
-
-/// Pages rasterized per frame.
+/// Byte budget for cached page textures.
 ///
-/// Rasterization is synchronous here, so this is what keeps a frame bounded when
-/// many pages become visible at once. Anything not rendered this frame draws as a
-/// placeholder and is picked up next frame.
-const MAX_RENDERS_PER_FRAME: usize = 2;
+/// Goal 1 targets under 500 MB resident for a whole document, so this leaves
+/// headroom for everything else. In practice `retain_pages` keeps usage far below
+/// it — the budget is the backstop, not the mechanism.
+const TEXTURE_BUDGET_BYTES: usize = 192 << 20;
 
-/// Pages either side of the visible range whose textures are kept.
+/// Pages either side of the viewport to render speculatively.
+const PREFETCH_PAGES: usize = 2;
+
+/// Results absorbed per frame, so a burst of completions cannot stall a frame.
+const MAX_RESULTS_PER_FRAME: usize = 8;
+
+/// How long one page may take before the render is abandoned.
 ///
-/// Without eviction, scrolling a 400-page document would accumulate 400 textures
-/// and break Goal 1's bounded-memory criterion.
-const RETAIN_MARGIN_PAGES: usize = 2;
+/// Shorter than the CLI's budget because an interactive viewer should give up and
+/// show an error tile rather than leave a page blank for ten seconds.
+const JOB_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A development request to capture the window and exit.
 ///
@@ -104,19 +115,22 @@ pub(crate) fn run(
 
 struct Viewer {
     document: Arc<Document>,
-    renderer: HayroRenderer,
     layout: ScrollLayout,
+    pool: RenderPool,
 
-    /// Rasterized pages, all at [`Self::cached_zoom`].
-    textures: HashMap<usize, egui::TextureHandle>,
-    /// Pages that failed, so they are not retried every frame.
-    failures: HashMap<usize, String>,
-    cached_zoom: f32,
+    cache: PageCache<egui::TextureHandle>,
+    /// Requests submitted but not yet returned, so a page is not queued twice.
+    in_flight: Vec<CacheKey>,
+    /// Failures keyed by rasterization, not by page, so a different zoom is still
+    /// attempted — and a transient timeout does not blacklist a page forever.
+    failures: HashMap<CacheKey, String>,
 
-    /// Page whose middle is nearest the viewport centre, for the status bar.
+    /// The zoom rung currently being rendered for.
+    bucket: ZoomBucket,
+    /// The unquantized display zoom, which is what pages are laid out at.
+    zoom: f32,
+
     current_page: usize,
-    /// Pages held after the last eviction pass, for the status bar.
-    cached_count: usize,
 
     /// Scroll here on the first frame, then leave the user in control.
     start_page: Option<usize>,
@@ -136,15 +150,23 @@ impl Viewer {
         outcome: ScreenshotOutcome,
     ) -> Self {
         let layout = ScrollLayout::vertical(document.geometry(), PAGE_GAP_PT);
+        let pool = RenderPool::new(
+            Arc::clone(&document),
+            HayroRenderer::new(),
+            RenderPool::recommended_workers(),
+            JOB_TIMEOUT,
+        );
+
         Self {
             document,
-            renderer: HayroRenderer::new(),
             layout,
-            textures: HashMap::new(),
+            pool,
+            cache: PageCache::new(TEXTURE_BUDGET_BYTES),
+            in_flight: Vec::new(),
             failures: HashMap::new(),
-            cached_zoom: 0.0,
+            bucket: ZoomBucket::enclosing(1.0),
+            zoom: 1.0,
             current_page: 0,
-            cached_count: 0,
             start_page,
             applied_start_page: false,
             frame: 0,
@@ -154,65 +176,105 @@ impl Viewer {
         }
     }
 
-    /// Rasterizes one page at the given device-pixel scale and uploads it.
-    fn rasterize(&mut self, ctx: &egui::Context, index: usize, device_scale: f32) {
-        let request = RenderRequest {
-            page_index: index,
-            scale: device_scale,
-        };
+    /// Absorbs finished renders into the cache. Never blocks.
+    fn collect_renders(&mut self, ctx: &egui::Context) {
+        for _ in 0..MAX_RESULTS_PER_FRAME {
+            let Some(outcome) = self.pool.try_recv() else {
+                break;
+            };
 
-        match self.renderer.render(&self.document, request) {
-            Ok(page) => match to_color_image(&page) {
-                Some(image) => {
-                    let handle = ctx.load_texture(
-                        format!("page-{index}"),
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    self.textures.insert(index, handle);
+            // The tag is the zoom rung we asked for. A result whose rung is no
+            // longer current is still worth keeping: it is a valid render of that
+            // page and serves as a fallback until the current rung arrives.
+            let Ok(rung) = i16::try_from(outcome.tag) else {
+                continue;
+            };
+            let key = CacheKey::new(outcome.page_index, ZoomBucket::from_rung(rung));
+            self.in_flight.retain(|pending| *pending != key);
+
+            match outcome.result {
+                Ok(page) => {
+                    let bytes = page.rgba.len();
+                    if let Some(image) = to_color_image(&page) {
+                        let handle = ctx.load_texture(
+                            format!("page-{}-r{rung}", outcome.page_index),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.cache.insert(key, handle, bytes);
+                        self.failures.remove(&key);
+                    } else {
+                        self.failures.insert(
+                            key,
+                            format!(
+                                "renderer returned {bytes} bytes for a {}x{} page",
+                                page.width, page.height
+                            ),
+                        );
+                    }
                 }
-                None => {
-                    self.failures.insert(
-                        index,
-                        format!(
-                            "renderer returned {} bytes for a {}x{} page",
-                            page.rgba.len(),
-                            page.width,
-                            page.height
-                        ),
-                    );
+                Err(error) => {
+                    self.failures.insert(key, error.to_string());
                 }
-            },
-            Err(error) => {
-                self.failures.insert(index, error.to_string());
             }
         }
     }
 
-    /// Drops textures far from the viewport so memory tracks the viewport rather
-    /// than the document length.
-    fn evict_outside(&mut self, visible: &Range<usize>) {
-        let low = visible.start.saturating_sub(RETAIN_MARGIN_PAGES);
-        let high = visible.end.saturating_add(RETAIN_MARGIN_PAGES);
-        self.textures.retain(|index, _| (low..high).contains(index));
-        // Failures are dropped too, so a page gets another chance if the user
-        // scrolls back to it — the cause may have been transient, like a timeout.
-        self.failures.retain(|index, _| (low..high).contains(index));
-        self.cached_count = self.textures.len();
+    /// Queues anything visible or nearby that is not already cached or in flight.
+    fn request_missing(&mut self, visible: &Range<usize>, pixels_per_point: f32) {
+        let order = request_order(visible.clone(), PREFETCH_PAGES, self.layout.page_count());
+        let scale = self.bucket.scale() * pixels_per_point;
+        let tag = i64::from(self.bucket.rung());
+
+        for page in order {
+            let key = CacheKey::new(page, self.bucket);
+            if self.cache.contains(key)
+                || self.in_flight.contains(&key)
+                || self.failures.contains_key(&key)
+            {
+                continue;
+            }
+            if self.pool.submit(page, scale, tag) {
+                self.in_flight.push(key);
+            }
+        }
     }
 
-    fn paint_page(&self, painter: &egui::Painter, index: usize, rect: egui::Rect) {
-        if let Some(texture) = self.textures.get(&index) {
-            painter.image(texture.id(), rect, FULL_UV, egui::Color32::WHITE);
+    /// The texture to draw for a page: the current rung, else the nearest cached
+    /// rung, else nothing.
+    fn texture_for(&mut self, page: usize) -> Option<egui::TextureId> {
+        let key = CacheKey::new(page, self.bucket);
+        if let Some(texture) = self.cache.get(key) {
+            return Some(texture.id());
+        }
+        // Deliberately a second statement rather than `or_else`: the first borrow
+        // is mutable (it touches LRU order) and the second is not.
+        self.cache
+            .best_for_page(page, self.bucket)
+            .map(|(_, texture)| texture.id())
+    }
+
+    fn paint_page(
+        &self,
+        painter: &egui::Painter,
+        page: usize,
+        rect: egui::Rect,
+        texture: Option<egui::TextureId>,
+    ) {
+        if let Some(id) = texture {
+            painter.image(id, rect, FULL_UV, egui::Color32::WHITE);
             return;
         }
 
-        if self.failures.contains_key(&index) {
+        if self
+            .failures
+            .contains_key(&CacheKey::new(page, self.bucket))
+        {
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(52, 30, 30));
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("page {} could not be rendered", index + 1),
+                format!("page {} could not be rendered", page + 1),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(230, 140, 140),
             );
@@ -235,14 +297,16 @@ impl Viewer {
         let ctx = ui.ctx().clone();
         let pixels_per_point = ctx.pixels_per_point();
 
-        let zoom = self.layout.fit_width_scale(ui.available_width());
-        if (zoom - self.cached_zoom).abs()
-            > self.cached_zoom.max(f32::EPSILON) * ZOOM_CHANGE_THRESHOLD
-        {
-            // Every cached texture was rasterized for the old zoom.
-            self.textures.clear();
+        self.zoom = self.layout.fit_width_scale(ui.available_width());
+        let wanted = ZoomBucket::enclosing(self.zoom);
+        if wanted != self.bucket {
+            // Queued work is for the old rung and no longer worth doing. Cached
+            // textures are kept deliberately — they are the fallback that stops a
+            // resize from flashing grey.
+            self.pool.cancel_pending();
+            self.in_flight.clear();
             self.failures.clear();
-            self.cached_zoom = zoom;
+            self.bucket = wanted;
         }
 
         #[expect(
@@ -250,8 +314,8 @@ impl Viewer {
             reason = "content extents are page dimensions; f32 is what egui works in"
         )]
         let content_size = egui::vec2(
-            self.layout.content_width_pt() as f32 * zoom,
-            self.layout.content_height_pt() as f32 * zoom,
+            self.layout.content_width_pt() as f32 * self.zoom,
+            self.layout.content_height_pt() as f32 * self.zoom,
         );
 
         let mut scroll_area = egui::ScrollArea::vertical();
@@ -263,7 +327,7 @@ impl Viewer {
                     clippy::cast_possible_truncation,
                     reason = "scroll offsets are bounded by content height"
                 )]
-                let offset = top_pt as f32 * zoom;
+                let offset = top_pt as f32 * self.zoom;
                 scroll_area = scroll_area.vertical_scroll_offset(offset);
             }
             self.applied_start_page = true;
@@ -275,8 +339,8 @@ impl Viewer {
 
             // `viewport` is in content coordinates, so dividing by zoom converts
             // the scroll window back into PDF points.
-            let top_pt = f64::from(viewport.min.y / zoom);
-            let height_pt = f64::from(viewport.height() / zoom);
+            let top_pt = f64::from(viewport.min.y / self.zoom);
+            let height_pt = f64::from(viewport.height() / self.zoom);
             let visible = self.layout.visible_pages(top_pt, height_pt);
 
             self.current_page = self
@@ -284,13 +348,12 @@ impl Viewer {
                 .page_at_pt(top_pt + height_pt / 2.0)
                 .unwrap_or(0);
 
-            let mut rendered = 0_usize;
-            let mut deferred = false;
+            self.request_missing(&visible, pixels_per_point);
 
-            for index in visible.clone() {
+            for page in visible.clone() {
                 let (Some(top_pt), Some(geometry)) = (
-                    self.layout.page_top_pt(index),
-                    self.document.geometry().get(index).copied(),
+                    self.layout.page_top_pt(page),
+                    self.document.geometry().get(page).copied(),
                 ) else {
                     continue;
                 };
@@ -300,37 +363,33 @@ impl Viewer {
                     reason = "page offsets are bounded by content height"
                 )]
                 let page_rect = {
-                    let size = egui::vec2(geometry.width_pt * zoom, geometry.height_pt * zoom);
+                    let size = egui::vec2(
+                        geometry.width_pt * self.zoom,
+                        geometry.height_pt * self.zoom,
+                    );
                     // Centre each page in the column, so a narrow page among wide
                     // ones does not sit flush left.
                     let x = (content_size.x - size.x) * 0.5;
                     egui::Rect::from_min_size(
-                        content_rect.min + egui::vec2(x, top_pt as f32 * zoom),
+                        content_rect.min + egui::vec2(x, top_pt as f32 * self.zoom),
                         size,
                     )
                 };
 
-                let missing =
-                    !self.textures.contains_key(&index) && !self.failures.contains_key(&index);
-                if missing {
-                    if rendered < MAX_RENDERS_PER_FRAME {
-                        self.rasterize(&ctx, index, zoom * pixels_per_point);
-                        rendered += 1;
-                    } else {
-                        deferred = true;
-                    }
-                }
-
-                self.paint_page(ui.painter(), index, page_rect);
+                let texture = self.texture_for(page);
+                self.paint_page(ui.painter(), page, page_rect, texture);
             }
 
-            // Something is still a placeholder, so come back and finish it.
-            if deferred {
-                ctx.request_repaint();
-            }
-
-            self.evict_outside(&visible);
+            // Keep memory proportional to the viewport rather than the document.
+            let low = visible.start.saturating_sub(PREFETCH_PAGES + 1);
+            let high = visible.end.saturating_add(PREFETCH_PAGES + 1);
+            self.cache.retain_pages(|page| (low..high).contains(&page));
         });
+
+        // Keep frames coming while anything is still being drawn.
+        if self.pool.is_busy() || !self.in_flight.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     fn draw_status(&self, ui: &mut egui::Ui) {
@@ -341,15 +400,20 @@ impl Viewer {
                 self.layout.page_count()
             ));
             ui.separator();
-            ui.label(format!("{:.0}% ", self.cached_zoom * 100.0));
+            ui.label(format!("{:.0}%", self.zoom * 100.0));
             ui.separator();
+            // Proof of virtualization: both stay small however long the document.
             ui.label(format!(
-                "{:.0} pt of scroll",
-                self.layout.content_height_pt()
+                "{} cached, {:.1} MB",
+                self.cache.len(),
+                self.cache.used_bytes() as f64 / (1024.0 * 1024.0)
             ));
             ui.separator();
-            // Proof of virtualization: this stays small however long the document.
-            ui.label(format!("{} page(s) cached", self.cached_count));
+            ui.label(format!(
+                "{} workers, {} in flight",
+                self.pool.worker_count(),
+                self.in_flight.len()
+            ));
             if !self.failures.is_empty() {
                 ui.separator();
                 ui.colored_label(
@@ -393,9 +457,11 @@ impl Viewer {
             return;
         };
 
-        // Wait for the placeholders to fill in as well as the window to appear,
-        // otherwise the capture shows grey tiles rather than pages.
-        let settled = self.frame >= request.warmup_frames && !self.textures.is_empty();
+        // Wait for the pipeline to drain as well as the window to appear,
+        // otherwise the capture shows placeholders rather than pages.
+        let settled = self.frame >= request.warmup_frames
+            && !self.cache.is_empty()
+            && self.in_flight.is_empty();
         if !self.screenshot_sent && settled {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.screenshot_sent = true;
@@ -421,10 +487,11 @@ impl Viewer {
 
 impl eframe::App for Viewer {
     // egui 0.34 replaced `App::update(ctx, frame)` with `App::ui(ui, frame)` plus
-    // this optional pre-pass. `logic` may not paint, which makes it exactly the
-    // right place to drive the screenshot state machine.
+    // this optional pre-pass. `logic` may not paint, which makes it the right
+    // place to absorb finished renders and drive the screenshot state machine.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame = self.frame.saturating_add(1);
+        self.collect_renders(ctx);
         self.drive_screenshot(ctx);
     }
 

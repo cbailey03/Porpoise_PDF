@@ -298,6 +298,10 @@ fn the_background_does_not_paint_over_content() {
 
 /// A renderer that takes a known amount of time, so the timeout path can be
 /// tested deterministically instead of racing a real rasterization.
+///
+/// `Clone` is required by [`porpoise_render::RenderPool`], which hands each worker
+/// its own renderer.
+#[derive(Clone)]
 struct SleepyRenderer {
     delay: Duration,
 }
@@ -374,6 +378,169 @@ fn the_timeout_path_produces_the_same_pixels_as_the_direct_path() {
 
     let diff = pixel_diff(&direct, &threaded, 0).expect("same dimensions");
     assert!(diff.is_clean(), "threading changed the output: {diff:?}");
+}
+
+// --- Worker pool -------------------------------------------------------------
+
+/// Collects outcomes until `count` arrive or the deadline passes.
+fn drain_outcomes(
+    pool: &porpoise_render::RenderPool,
+    count: usize,
+    within: Duration,
+) -> Vec<porpoise_render::RenderOutcome> {
+    let deadline = std::time::Instant::now() + within;
+    let mut collected = Vec::new();
+    while collected.len() < count && std::time::Instant::now() < deadline {
+        if let Some(outcome) = pool.try_recv() {
+            collected.push(outcome);
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    collected
+}
+
+#[test]
+fn the_pool_rasterizes_every_submitted_page() {
+    let document = Arc::new(open_minimal());
+    let pool = porpoise_render::RenderPool::new(
+        document,
+        HayroRenderer::new(),
+        2,
+        Duration::from_secs(30),
+    );
+
+    for tag in 0..4 {
+        assert!(pool.submit(0, 1.0, tag), "submit should be accepted");
+    }
+
+    let outcomes = drain_outcomes(&pool, 4, Duration::from_secs(30));
+    assert_eq!(outcomes.len(), 4, "expected four results");
+    for outcome in &outcomes {
+        assert_eq!(outcome.page_index, 0);
+        let page = outcome.result.as_ref().expect("should rasterize");
+        assert_eq!((page.width, page.height), (200, 100));
+    }
+
+    // Tags come back untouched, which is what lets the viewer match a result to a
+    // cache key without the pool knowing about zoom.
+    let mut tags: Vec<i64> = outcomes.iter().map(|outcome| outcome.tag).collect();
+    tags.sort_unstable();
+    assert_eq!(tags, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn the_pool_reports_render_errors_rather_than_dropping_them() {
+    let document = Arc::new(open_minimal());
+    let pool = porpoise_render::RenderPool::new(
+        document,
+        HayroRenderer::new(),
+        1,
+        Duration::from_secs(30),
+    );
+
+    pool.submit(99, 1.0, 0);
+
+    let outcomes = drain_outcomes(&pool, 1, Duration::from_secs(30));
+    let outcome = outcomes.first().expect("an outcome for a bad page");
+    assert!(
+        matches!(
+            outcome.result,
+            Err(RenderError::NoSuchPage { index: 99, .. })
+        ),
+        "unexpected result: {:?}",
+        outcome.result
+    );
+}
+
+#[test]
+fn cancel_pending_drops_queued_work() {
+    let document = Arc::new(open_minimal());
+    // One worker and a slow renderer, so jobs pile up in the queue rather than
+    // being served immediately.
+    let pool = porpoise_render::RenderPool::new(
+        document,
+        SleepyRenderer {
+            delay: Duration::from_millis(400),
+        },
+        1,
+        Duration::from_secs(30),
+    );
+
+    for tag in 0..8 {
+        pool.submit(0, 1.0, tag);
+    }
+    let dropped = pool.cancel_pending();
+
+    assert!(
+        dropped >= 6,
+        "expected most of 8 jobs to still be queued, dropped {dropped}"
+    );
+    assert_eq!(pool.queued(), 0, "queue should be empty after cancelling");
+}
+
+#[test]
+fn a_hung_render_does_not_permanently_consume_a_worker() {
+    // The pool would otherwise starve: enough hangs and no page ever renders
+    // again. Workers go through render_with_timeout precisely so the worker
+    // survives while the hung thread is abandoned.
+    let document = Arc::new(open_minimal());
+    let pool = porpoise_render::RenderPool::new(
+        Arc::clone(&document),
+        SleepyRenderer {
+            delay: Duration::from_secs(120),
+        },
+        1,
+        Duration::from_millis(50),
+    );
+
+    // Three jobs that all hang. With a healthy worker each times out in turn.
+    for tag in 0..3 {
+        pool.submit(0, 1.0, tag);
+    }
+
+    let outcomes = drain_outcomes(&pool, 3, Duration::from_secs(20));
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "the worker stopped serving the queue after a hang"
+    );
+    for outcome in &outcomes {
+        assert!(
+            matches!(outcome.result, Err(RenderError::TimedOut { .. })),
+            "unexpected result: {:?}",
+            outcome.result
+        );
+    }
+}
+
+#[test]
+fn a_full_queue_is_bounded_rather_than_unbounded() {
+    let document = Arc::new(open_minimal());
+    let pool = porpoise_render::RenderPool::new(
+        document,
+        SleepyRenderer {
+            delay: Duration::from_secs(30),
+        },
+        1,
+        Duration::from_secs(60),
+    );
+
+    // Far more than the internal cap.
+    for tag in 0..500 {
+        pool.submit(0, 1.0, tag);
+    }
+    assert!(
+        pool.queued() <= 64,
+        "queue grew to {} with no bound",
+        pool.queued()
+    );
+}
+
+#[test]
+fn recommended_workers_leaves_room_for_the_ui_thread() {
+    let workers = porpoise_render::RenderPool::recommended_workers();
+    assert!((1..=4).contains(&workers), "got {workers}");
 }
 
 // --- PNG ---------------------------------------------------------------------

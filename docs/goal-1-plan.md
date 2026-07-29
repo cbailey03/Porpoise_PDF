@@ -2,23 +2,35 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M3 landed.** The viewer scrolls a whole document, and virtualization is real rather than
-aspirational: a 400-page drawing set with two distinct page sizes holds two textures whether you
-are at page 1, page 200, or page 400. The stack decision below is validated rather than assumed —
-hayro parses and rasterizes correctly on Windows MSVC and Linux, 58 of 58 real-world PDFs on the
-dev machine parsed without error, and renders have been inspected by eye rather than only
-pixel-counted against a synthetic fixture. M4 (async raster pipeline) is next.
+**Status: M4 landed.** Rasterization is off the UI thread. The frame loop polls for finished pages,
+requests missing ones, and paints whatever the cache holds — it never waits. On the 400-page
+drawing set at page 200 that is 6 cached pages and **15.7 MB**, against a 192 MB budget and a
+500 MB target for the whole document.
 
-Two pieces of M4 arrived early at M3, because leaving them out would have shipped an obvious
-defect rather than a known limitation:
+The stack decision below is validated rather than assumed — hayro parses and rasterizes correctly
+on Windows MSVC and Linux, 58 of 58 real-world PDFs on the dev machine parsed without error, and
+renders have been inspected by eye rather than only pixel-counted against a synthetic fixture.
+M5 (paged scrolling, keyboard navigation, explicit zoom) is next.
 
-- **Texture eviction.** Without it, scrolling 400 pages accumulates 400 textures, which breaks the
-  bounded-memory exit criterion outright. Pages outside the visible range plus a two-page margin
-  are dropped.
-- **A per-frame render cap.** Rasterization is synchronous, so a viewport that suddenly shows many
-  pages would otherwise block for as long as it takes to draw all of them. Two pages per frame
-  keeps a frame bounded, and the remainder draw as placeholders and fill in next frame — which is
-  also what makes the placeholder path real rather than theoretical.
+Three details do most of the work in making it feel continuous rather than merely asynchronous:
+
+- **Zoom bucketing.** Renders key to a quantized zoom rung on a geometric ladder — eight rungs per
+  octave, so relative error is constant across the whole zoom range. Without this, a window drag
+  invalidates every texture on every pixel of movement.
+- **Stale-resolution fallback.** While the correct rung renders, the nearest cached rung is drawn
+  scaled. Slightly soft beats a grey flash, and it is what makes a resize look continuous.
+- **Prefetch.** Pages just outside the viewport are requested *after* all visible ones, so
+  ordinary scrolling usually finds the next page already rendered.
+
+Two subtleties worth recording, both found by tests rather than by reasoning:
+
+- **`ZoomBucket::enclosing` must be idempotent.** `log2` of a rung's own scale lands a hair below
+  the integer, so a naive `ceil` climbs one rung every layout pass and the zoom creeps upward
+  forever. A small slack term before rounding fixes it, at the cost of a texture up to 0.1%
+  smaller than its display size.
+- **Positive infinity is not a degenerate zoom, it is an absurd one.** Grouping it with `NaN`
+  snapped it to the *floor*, which would have rendered a hugely magnified page at minimum
+  resolution. It clamps to the ceiling instead.
 
 Two things worth knowing before M3, both found by looking at output rather than by testing:
 
@@ -186,9 +198,11 @@ xStep/yStep). So the untrusted-input boundary needed real handling from M1, not 
   the area cap are what we actually have, and they cover the realistic cases. Revisit if we
   implement `Device` ourselves, which would put us inside the interpretation loop.
 - *Real cancellation.* Rust cannot cancel a thread, so a timeout abandons the worker rather than
-  killing it. An infinite loop occupies a core until the process exits. Acceptable for a one-shot
-  CLI render; **not** acceptable for the viewer, which needs a bounded worker pool at M4 so
-  timeouts cannot accumulate, and process isolation after that.
+  killing it. **Improved at M4 but not solved:** `RenderPool`'s workers call `render_with_timeout`
+  rather than rendering directly, so a hung page abandons one anonymous thread while the worker
+  itself returns to the queue. That means the pool cannot be starved — there is a test for exactly
+  this — but a hung render still leaks a thread until the process exits. Process isolation remains
+  the real fix.
 
 ## 3. Project structure
 
@@ -233,7 +247,7 @@ free and prevents the monolith.
 | **M1** ✅ | Headless CLI: `porpoise info` and `porpoise render --page N --dpi D -o out.png`. `RenderLimits` (per-axis **and** total-pixel caps), `render_with_timeout`, `catch_unwind`, PNG encoding. | hayro works on real files. Fully testable with no GUI. |
 | **M2** ✅ | eframe window (wgpu backend), page 1 fit-to-width, opened from a CLI path. Plus a hidden `--screenshot` flag so the window can be verified headlessly. No file dialog yet. | End-to-end pixels on screen. |
 | **M3** ✅ | Continuous scroll across all pages at one shared zoom, drawing only the visible set, with placeholders and texture eviction. Rasterization still synchronous, capped at 2 pages per frame. `--start-page` opens deep in a document. | Scroll geometry is right. Verified on a 400-page two-page-size document at pages 1, 200 and 400, holding **2 textures** throughout. |
-| **M4** | Async raster pipeline: worker pool, LRU byte budget, prefetch margin, zoom buckets, job cancellation. | Smoothness. This is the milestone that makes it feel good. |
+| **M4** ✅ | Async raster pipeline: `RenderPool` worker threads, byte-budgeted LRU `PageCache` keyed by page and zoom rung, prefetch margin, `ZoomBucket` quantization, queued-job cancellation, and stale-resolution fallback. | Smoothness. The UI thread never waits for a render. |
 | **M5** | Mode switch — paged (snap) vs free scroll. Keyboard nav (PgUp/PgDn, Home/End, arrows), ctrl+wheel zoom, fit-width/fit-page. | **Goal 1 feature-complete.** |
 | **M6** | Hardening: malformed-PDF corpus run, `cargo-fuzz` targets on the parse path, PDFium differential pixel-diff. | It survives hostile input, and we have data on hayro's accuracy. |
 

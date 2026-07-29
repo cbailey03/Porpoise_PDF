@@ -299,6 +299,12 @@ layer, in eframe, wgpu, the driver, or the compositor, and is not yet explained.
 before calling the viewer world-class, but it does not block Goal 1: 99% of frames are within
 budget under a scroll rate no human generates.
 
+**Not perceptible in real use (Christian, 2026-07-29).** Scrolling the 400-page document by hand
+felt responsive, with no hitch reported. Combined with the benchmark's ~40 pages per second, that
+suggests the outlier is provoked by the synthetic scroll rate rather than by ordinary interaction.
+Still worth explaining eventually — an unexplained stall is a latent risk — but it should be
+prioritised as a curiosity, not as a user-facing defect.
+
 **Benchmark document.** The standing M4 performance target should be a document with roughly
 these properties: **400 pages, two distinct page sizes** (e.g. 792x612 and 1224x792), and
 ~321,000 pt of total scroll height. That combination exercises heterogeneous geometry,

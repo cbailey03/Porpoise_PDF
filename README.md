@@ -16,9 +16,12 @@ Hardened against damaged input: 4,000 deterministic mutations plus every possibl
 of a valid PDF, all of which either open or return an error — none panic, none hang, and rejecting
 damaged input averages 7 µs.
 
-Still missing: a file dialog (a path is required), and **measured** evidence of rendering accuracy.
-The PDFium differential oracle is written and compiling but needs a PDFium library to run — see
-`docs/goal-1-plan.md` section 6a.
+Still missing: a file dialog — a path is required.
+
+Rendering fidelity is validated against real documents and for determinism, not against another
+engine. Comparing output to PDFium is explicitly a non-goal: building this in pure Rust is the
+objective, so the C++ engine we declined is not the yardstick. See `docs/goal-1-plan.md`
+sections 1 and 6a.
 
 ## Keys
 

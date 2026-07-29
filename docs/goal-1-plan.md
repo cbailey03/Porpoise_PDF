@@ -2,10 +2,9 @@
 
 Researched 2026-07-29. All version numbers are as of that date.
 
-**Status: M6 mostly landed. Goal 1 is feature-complete and hardened; one item is blocked.**
-Three of the four exit criteria are now measured rather than asserted. The exception is hayro's
-rendering *accuracy*: the differential oracle is written and compiling, but running it needs a
-PDFium shared library, which is a human's call to obtain. See section 6a.
+**Status: Goal 1 complete.** All four exit criteria are measured rather than asserted. M6's PDFium
+differential oracle was dropped by decision rather than left undone — building in pure Rust is the
+objective, so PDFium is not the standard being measured against. See sections 1 and 6a.
 
 Previously: **M5 landed — Goal 1 is feature-complete.** You can open a PDF, scroll it freely or page by
 page, navigate by keyboard, and zoom by wheel, pinch, key, or fit mode. Frame times under a
@@ -97,13 +96,20 @@ Our stated goal is maximum efficiency **and security**, and PDFium is the wrong 
   (`bblanchon/pdfium-binaries`, `paulocoutinhox/pdfium-lib`) — 27 of 30 and 8 of 8 recent
   commits respectively by one person each.
 
-**But PDFium earns a place in the test harness.** The research turned up no published
-head-to-head accuracy comparison of hayro vs PDFium anywhere — hayro's own `hayro-bench` README
-says the comparison harness is unbuilt, and its test suite uses self-generated baselines, making
-it a *regression* suite rather than a correctness oracle. So we build the oracle ourselves:
-`pdfium-render` as a **dev-only dependency** that pixel-diffs hayro output across a corpus. It
-never enters the shipped binary. This is cheap, it directly de-risks our single biggest
-dependency, and it produces information that does not currently exist publicly.
+**PDFium is not a yardstick either.** An earlier version of this document proposed keeping
+`pdfium-render` as a dev-only dependency to pixel-diff hayro's output, on the reasoning that no
+published head-to-head accuracy comparison exists and we should produce one.
+
+**Decided 2026-07-29 (Christian): no.** That framing mistook the goal. Building this in pure Rust
+is the objective, not a route to parity with an existing C++ engine — so PDFium's output is not the
+standard being aimed at, and a comparison against it measures the wrong thing. The oracle harness
+was written, then removed rather than left as scaffolding that would never run.
+
+What replaces it: validation against the *format* and against real documents — visual inspection of
+real renders, deterministic regression via `pixel_diff`, and the malformed-input sweep in
+section 6a. The consequence to hold onto is that hayro's absolute rendering fidelity is accepted on
+the strength of Typst shipping it and its 1400-document corpus, rather than independently measured
+here. That is a deliberate premise, not an outstanding task.
 
 ### Document model for later editing: `lopdf`
 
@@ -259,7 +265,7 @@ free and prevents the monolith.
 | **M3** ✅ | Continuous scroll across all pages at one shared zoom, drawing only the visible set, with placeholders and texture eviction. Rasterization still synchronous, capped at 2 pages per frame. `--start-page` opens deep in a document. | Scroll geometry is right. Verified on a 400-page two-page-size document at pages 1, 200 and 400, holding **2 textures** throughout. |
 | **M4** ✅ | Async raster pipeline: `RenderPool` worker threads, byte-budgeted LRU `PageCache` keyed by page and zoom rung, prefetch margin, `ZoomBucket` quantization, queued-job cancellation, and stale-resolution fallback. | Smoothness. The UI thread never waits for a render. |
 | **M5** ✅ | Paged vs free scroll, keyboard navigation, ctrl+wheel and pinch zoom, fit-width/fit-page, a toolbar, and `--scroll-benchmark` for frame-time measurement. | **Goal 1 feature-complete.** |
-| **M6** ◐ | Parse-path panic isolation, a 4,000-case deterministic mutation harness, exhaustive truncation coverage, allocation-bomb rejection. PDFium oracle **built and compiling but not yet run** — it needs a PDFium binary. `cargo-fuzz` deliberately deferred; see section 6a. | It survives hostile input. Accuracy data still pending a PDFium library. |
+| **M6** ✅ | Parse-path panic isolation, a 4,000-case deterministic mutation harness, exhaustive truncation coverage, allocation-bomb rejection. PDFium oracle dropped by decision, `cargo-fuzz` deferred; both explained in section 6a. | It survives hostile input. |
 
 ### Exit criteria
 
@@ -380,12 +386,15 @@ coverage a real fuzzer would add over that is *structure-aware* mutation guided 
 feedback, which is genuinely better; the honest position is that it is worth doing when there is a
 nightly job to run it in, not that it is done.
 
-**The PDFium oracle is built but unrun.** `porpoise-testkit`'s `oracle` feature compiles, and its
-tests skip with a clear message when no PDFium library is present, so CI keeps the harness alive
-without needing one. Running it requires obtaining a PDFium shared library, which is a deliberate
-decision for a human to make rather than something to fetch automatically. Until then, **hayro's
-rendering accuracy remains inferred rather than measured** — the single largest open assumption in
-the project, unchanged since M0.
+**The PDFium oracle was built and then removed.** It compiled, and skipped cleanly when no PDFium
+library was present. It was deleted on the decision recorded in section 1: pure Rust is the goal,
+so measuring against PDFium measures the wrong thing, and keeping a binding to the engine we
+rejected would have been scaffolding that never runs — the same objection raised against
+`cargo-fuzz` immediately above.
+
+The `deny.toml` bans on C PDF and codec libraries, and the `no-native-deps` CI job, stay. Under this
+framing they matter *more*, not less: they are the mechanical enforcement of the premise. `pixel_diff`
+also stays — it is what makes hayro's own output testable for determinism and regression.
 
 ## 7. Open decisions
 

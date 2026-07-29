@@ -39,9 +39,6 @@ parking_lot = "0.12"
 
 # --- Dev / test only ---
 insta = "1.48"
-# Differential-testing oracle ONLY. Must never reach the shipped binary; it is an
-# optional dev-dependency of porpoise-testkit behind the `oracle` feature.
-pdfium-render = "0.9"
 
 # Applied to every member via `[lints] workspace = true`.
 [workspace.lints.rust]

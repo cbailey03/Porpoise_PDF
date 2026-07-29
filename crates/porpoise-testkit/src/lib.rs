@@ -13,9 +13,6 @@
 //!   hayro-vs-PDFium accuracy comparison exists, so we build the oracle
 //!   ourselves at M6.
 
-#[cfg(feature = "oracle")]
-pub mod oracle;
-
 use porpoise_render::RenderedPage;
 
 /// Deterministic pseudo-random mutations of a valid PDF.

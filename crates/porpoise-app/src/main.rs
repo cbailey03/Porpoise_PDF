@@ -18,6 +18,7 @@ mod protocol;
 mod queue;
 mod retain;
 mod saver;
+mod selection;
 mod thumbnails;
 mod tiles;
 mod viewer;

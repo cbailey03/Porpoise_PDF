@@ -24,8 +24,18 @@ to ask about unsaved page changes.
 
 `Ctrl+T` opens a grid of page thumbnails, with two tabs deciding what a click in it means:
 **Navigation** — the default — jumps the main view to the page you click, and **Reorganize** lets you
-drag pages into a new order. Two modes rather than one gesture that guesses, so a click has exactly
-one meaning and a misfire while browsing cannot reorder the document. Pages can also be reordered and
+pick pages out and drag them into a new order. Two modes rather than one gesture that guesses, so a
+click has exactly one meaning and a misfire while browsing cannot reorder the document.
+
+In **Reorganize** you can work on several pages at once. Click a page to pick it, `Ctrl+click` to add
+or remove one, or `Shift+click` to take everything between it and the last one you picked. Dragging a
+box over empty space selects what it touches — from *empty* space, because a drag that starts on a page
+is that page moving. Dragging any picked page moves the whole group, which arrives together and in
+order however scattered it was, and **Delete** removes all of them. Either way it is one undo step, so
+`Ctrl+Z` puts the whole group back rather than one page of it. The status bar says how many pages are
+picked, since the grid can be scrolled away from them.
+
+Pages can also be reordered and
 deleted from the toolbar or the keyboard, with undo, then written back with **Save** or to a new file
 with `save_as`. Nothing on disk changes until you save, and a save either completes or leaves the
 original untouched — it writes beside the file and renames into place. Documents whose page tree is

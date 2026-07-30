@@ -108,7 +108,10 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         Command::View(_)
         | Command::Capture { .. }
         | Command::MovePage { .. }
+        | Command::MovePages { .. }
         | Command::DeletePage { .. }
+        | Command::DeletePages { .. }
+        | Command::SetSelection { .. }
         | Command::Undo
         | Command::Save
         | Command::SaveAs { .. }

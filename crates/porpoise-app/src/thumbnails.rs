@@ -34,15 +34,20 @@
 //! does get a command, because it changes what is on screen and an agent that opens it
 //! can also close it. See `docs/goal-4-plan.md` §7.
 //!
-//! Clicking a page to *go* to it is the same idea applied to `GoToPage`. But it cannot
-//! share a widget with the drag, which is why the panel has two modes rather than one
-//! clever gesture — see [`GridMode`].
+//! Clicking a page to *go* to it is the same idea applied to `GoToPage`, and picking
+//! several out to move together is the same idea again: ctrl+click, shift+click and a
+//! marquee all author a `set_selection`, and dragging the result authors a `move_pages`.
+//! Which of those a press means depends on the mode and on where the press began — see
+//! [`GridMode`]. Which pages are picked is [`crate::selection`]'s decision, not this
+//! module's; all that happens here is turning rectangles into positions.
 
 use eframe::egui;
+use eframe::egui::containers::scroll_area::{DragScroll, ScrollSource};
 use porpoise_doc::{Document, PageOrder};
 use porpoise_view::{CacheKey, PageCache, PageNumber, ZoomBucket};
 
 use crate::queue::RenderQueue;
+use crate::selection::{Pick, Selection};
 use crate::tiles::FULL_UV;
 
 /// How wide a thumbnail should be, in points of screen space.
@@ -59,21 +64,32 @@ const LABEL_HEIGHT: f32 = 16.0;
 
 /// What a click in the grid means.
 ///
-/// # Why a mode, and not one gesture that is both
+/// # Why a mode, and not one gesture that guesses
 ///
-/// Clicking and dragging the same thumbnail was tried first, and does not work. A
-/// drag source that senses only drags becomes "being dragged" the instant the button
-/// goes down — egui does not wait to see whether the pointer moves, because with no
-/// click to disambiguate there is nothing to wait for. `dnd_drag_source` then paints
-/// its contents into a tooltip layer, which re-parents the widget inside it, so the
-/// click that arrives on release belongs to an id that no longer exists where it was.
-/// It never fires. Sensing *both* on one widget avoids that and buys a different
-/// problem: every reorder would then have to wait for egui to rule out a click first.
+/// A click has to mean one thing at a time, and "go to this page" and "pick this page
+/// out" are both reasonable meanings for the same press. Rather than guess, the panel
+/// asks: navigate, or reorganize. Then within each mode every gesture is unambiguous,
+/// which is the rule the rest of the program already follows — one decision, one
+/// producer. See [`crate::edits`] for the same idea applied to the toolbar.
 ///
-/// So the mode is the answer. In one, a cell is a click target and nothing else; in
-/// the other, a drag source and nothing else. A click has exactly one meaning at a
-/// time, which is the rule the rest of the program already follows — one decision,
-/// one producer. See [`crate::edits`] for the same idea applied to the toolbar.
+/// # How the gestures avoid each other
+///
+/// Worth writing down, because the first attempt at this did not work at all. A widget
+/// that senses only drags is marked dragged the instant the button goes down — with no
+/// click to disambiguate there is nothing to wait for — and `dnd_drag_source` then
+/// repaints its contents into a tooltip layer, re-parenting the widget inside it, so a
+/// click nested in there resolves to an id that has moved and never fires.
+///
+/// So reorganize mode does not use `dnd_drag_source`. Its cells sense
+/// [`egui::Sense::click_and_drag`], which egui explicitly supports by postponing the
+/// decision until the pointer has moved far enough or been released, and the drag is
+/// carried by [`egui::DragAndDrop`] directly. The cost is the postponement itself: a
+/// reorder starts a few pixels of movement in, which is how every drag-and-drop list
+/// behaves.
+///
+/// The marquee is kept off that decision entirely by *where it starts*: a drag beginning
+/// on a cell moves pages, and one beginning on empty space draws a selection box. Two
+/// gestures that look identical, told apart by their origin rather than by a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GridMode {
@@ -81,7 +97,7 @@ pub(crate) enum GridMode {
     /// is what the grid is opened for far more often than reshuffling one.
     #[default]
     Navigate,
-    /// Drag a page to move it. Clicking does nothing, so a misfire cannot reorder.
+    /// Pick pages out and drag them into a new order. See [`crate::selection`].
     Reorganize,
 }
 
@@ -119,11 +135,15 @@ impl GridMode {
     }
 
     /// What the tab's tooltip says the mode does. Worth spelling out, because the whole
-    /// point of the mode is that the same click does two different things.
+    /// point of the mode is that the same click does two different things — and because
+    /// ctrl and shift are not discoverable by clicking about.
     fn hint(self) -> &'static str {
         match self {
             Self::Navigate => "Click a page to go to it",
-            Self::Reorganize => "Drag a page to move it; clicking does nothing",
+            Self::Reorganize => {
+                "Click to pick a page, ctrl+click for several, shift+click for a range, \
+                 or drag a box over empty space. Drag a page to move what is picked."
+            }
         }
     }
 }
@@ -145,6 +165,9 @@ pub(crate) struct Grid<'a> {
     pub(crate) current: usize,
     /// What a click does. See [`GridMode`].
     pub(crate) mode: GridMode,
+    /// Which pages are picked out. Only drawn, and only read, in
+    /// [`GridMode::Reorganize`].
+    pub(crate) selection: &'a Selection,
     /// Physical pixels per screen point, so a thumbnail is rasterized at the size it
     /// will actually be drawn.
     pub(crate) pixels_per_point: f32,
@@ -197,11 +220,22 @@ pub(crate) fn rows_for(pages: usize, columns: usize) -> usize {
 /// What the grid did this frame.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Drawn {
-    /// A move, if one was dropped: `(from, to)` in display positions.
+    /// A move, if one was dropped: which display positions, and where the group goes.
     ///
     /// Nothing is changed here — the caller turns this into a command, so a drag goes
     /// through the same dispatch as every other edit.
-    pub(crate) moved: Option<(usize, usize)>,
+    pub(crate) moved: Option<(Vec<usize>, usize)>,
+    /// A click on a thumbnail in reorganize mode, and what it was asking for.
+    ///
+    /// The position, not the resulting set: what ctrl+click *does* to a selection is
+    /// [`crate::selection`]'s decision, and this module would only get a second opinion
+    /// wrong. Same reason the drag reports a position rather than a new order.
+    pub(crate) picked: Option<(usize, Pick)>,
+    /// Display positions a finished marquee covered, replacing the selection.
+    ///
+    /// `Some(empty)` is meaningful and different from `None`: dragging a box over blank
+    /// space is how you deselect everything.
+    pub(crate) marquee: Option<Vec<usize>>,
     /// A thumbnail that was clicked, in display position. Only ever set in
     /// [`GridMode::Navigate`].
     ///
@@ -252,7 +286,19 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     // viewport-sized list rather than a document-sized one.
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
+        // Drag-to-scroll would be a third meaning for a drag on empty space, and it is
+        // the marquee's. Off explicitly rather than relying on the default, which only
+        // happens to be off because this is not a touch screen.
+        .scroll_source(ScrollSource {
+            drag: DragScroll::Never,
+            ..ScrollSource::default()
+        })
         .show_rows(ui, cell_height, rows, |ui, row_range| {
+            // What the marquee measures against: the visible part of the scroll area,
+            // which excludes the scroll bar, so a drag on that is not a selection.
+            let viewport = ui.clip_rect();
+            let mut cells: Vec<(usize, egui::Rect)> = Vec::new();
+
             for row in row_range {
                 ui.horizontal(|ui| {
                     for column in 0..columns {
@@ -267,10 +313,26 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
                         if outcome.clicked {
                             drawn.navigated = Some(position);
                         }
+                        if let Some(pick) = outcome.picked {
+                            drawn.picked = Some((position, pick));
+                        }
+                        cells.push((position, outcome.rect));
                         // The source page, because that is what the cache is keyed by.
                         drawn.showing.extend(grid.order.source_of(position));
                     }
                 });
+            }
+
+            // After the cells, because it needs their rectangles for both jobs: telling a
+            // marquee from a page drag, and working out what the box covers.
+            if grid.mode == GridMode::Reorganize
+                && let Some(box_) = marquee(ui, viewport, &cells)
+            {
+                let covered = covered_by(&box_.rect, &cells);
+                paint_marquee(ui, &box_.rect, &covered, &cells);
+                if box_.finished {
+                    drawn.marquee = Some(covered);
+                }
             }
         });
 
@@ -295,14 +357,34 @@ fn tabs(ui: &mut egui::Ui, current: GridMode) -> Option<GridMode> {
     chosen
 }
 
-/// What one cell reported. At most one of these is ever set, because the mode decides
-/// which of them the cell was even able to produce.
-#[derive(Debug, Default, Clone, Copy)]
+/// What one cell reported.
+#[derive(Debug, Clone)]
 struct CellOutcome {
-    /// The position dragged from, if a drop landed here this frame.
-    dropped: Option<usize>,
-    /// Whether this thumbnail was clicked.
+    /// The positions dragged from, if a drop landed here this frame.
+    dropped: Option<Vec<usize>>,
+    /// Whether this thumbnail was clicked in navigation mode.
     clicked: bool,
+    /// What a click in reorganize mode was asking of the selection.
+    picked: Option<Pick>,
+    /// Where the cell was drawn. Needed after the fact for the marquee, which has to
+    /// tell a drag that began on a page from one that began on empty space.
+    rect: egui::Rect,
+}
+
+impl Default for CellOutcome {
+    /// Nothing happened, and nothing was drawn.
+    ///
+    /// Hand-written because `egui::Rect` has no `Default`, and [`egui::Rect::NOTHING`] is
+    /// the right blank anyway: it is empty, so a marquee cannot start "on" it and it
+    /// intersects no box.
+    fn default() -> Self {
+        Self {
+            dropped: None,
+            clicked: false,
+            picked: None,
+            rect: egui::Rect::NOTHING,
+        }
+    }
 }
 
 /// One thumbnail, wired up for whichever mode the panel is in.
@@ -332,39 +414,164 @@ fn cell(
         grid.queue.want(key, grid.pixels_per_point);
     }
 
+    let selected =
+        grid.mode == GridMode::Reorganize && grid.selection.contains_position(grid.order, position);
     let thumbnail = Thumbnail {
         position,
         size,
         texture,
         current: position == grid.current,
+        selected,
     };
 
     // The one place the mode is read. Everything else about a cell is the same either
     // way, which is why the modes differ by what wraps `paint` and nothing more.
     match grid.mode {
-        GridMode::Navigate => CellOutcome {
-            dropped: None,
-            clicked: egui::Frame::default()
+        GridMode::Navigate => {
+            let response = egui::Frame::default()
                 .show(ui, |ui| paint(ui, &thumbnail, egui::Sense::click()))
-                .inner
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked(),
-        },
-        GridMode::Reorganize => {
-            let (_, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::default(), |ui| {
-                let id = egui::Id::new(("porpoise-thumbnail", position));
-                ui.dnd_drag_source(id, position, |ui| {
-                    // `hover`, not `click`: the drag source above already senses this
-                    // rect for drags, and a second sense here is what did not work.
-                    paint(ui, &thumbnail, egui::Sense::hover());
-                });
-            });
+                .inner;
             CellOutcome {
-                dropped: dropped.map(|from| *from).filter(|from| *from != position),
+                rect: response.rect,
+                clicked: response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked(),
+                ..CellOutcome::default()
+            }
+        }
+        GridMode::Reorganize => {
+            let response = egui::Frame::default()
+                .show(ui, |ui| {
+                    paint(ui, &thumbnail, egui::Sense::click_and_drag())
+                })
+                .inner;
+
+            // What travels when the drag starts. A drag from a page that is not picked
+            // out takes that page alone — and the click reported alongside makes it the
+            // selection, so the highlight always matches what is moving.
+            let mut picked = None;
+            if response.drag_started() {
+                let group = if selected {
+                    grid.selection.positions(grid.order)
+                } else {
+                    picked = Some(Pick::Only);
+                    vec![position]
+                };
+                egui::DragAndDrop::set_payload(ui.ctx(), Dragged(group));
+            }
+
+            // Read before the click, because a release that completes a drag must not
+            // also register as a pick on whatever it landed on.
+            let dropped = response.dnd_release_payload::<Dragged>();
+            if dropped.is_none() && response.clicked() {
+                let (toggle, range) =
+                    ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+                picked = Some(Pick::of(toggle, range));
+            }
+
+            CellOutcome {
+                rect: response.rect,
+                dropped: dropped.map(|group| group.0.clone()),
                 clicked: false,
+                picked,
             }
         }
     }
+}
+
+/// The pages in flight during a drag, as display positions.
+///
+/// A newtype rather than a bare `Vec<usize>` because the payload is looked up *by type*:
+/// anything else in the program that dragged a list of numbers would otherwise be
+/// accepted here as a page move.
+#[derive(Debug, Clone)]
+struct Dragged(Vec<usize>);
+
+/// A marquee in progress.
+struct Marquee {
+    /// The box, in screen coordinates.
+    rect: egui::Rect,
+    /// Whether the pointer came up this frame, which is when the selection is committed.
+    finished: bool,
+}
+
+/// The selection box being dragged, if one is.
+///
+/// Told apart from a page drag by where the press began rather than by which widget
+/// claimed it: raw pointer state, and then the cell rectangles to rule out a press that
+/// landed on a page. Doing it this way means the cells and the marquee never compete for
+/// the same press, so neither has to win a hit test.
+fn marquee(ui: &egui::Ui, viewport: egui::Rect, cells: &[(usize, egui::Rect)]) -> Option<Marquee> {
+    // A page is in flight, so this drag is a move and not a selection.
+    if egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        return None;
+    }
+
+    let (origin, latest, down, released) = ui.input(|i| {
+        (
+            i.pointer.press_origin(),
+            i.pointer.latest_pos(),
+            i.pointer.primary_down(),
+            i.pointer.any_released(),
+        )
+    });
+    if !(down || released) {
+        return None;
+    }
+    let origin = origin?;
+    let latest = latest?;
+    if !viewport.contains(origin) {
+        return None;
+    }
+    // The gesture that starts on a page is that page's, not the marquee's.
+    if cells.iter().any(|(_, rect)| rect.contains(origin)) {
+        return None;
+    }
+
+    Some(Marquee {
+        rect: egui::Rect::from_two_pos(origin, latest),
+        finished: released,
+    })
+}
+
+/// Display positions whose thumbnail the box touches.
+///
+/// Intersection rather than containment: dragging a box that clips the corner of a page
+/// is asking for that page, and requiring full enclosure makes a selection near the edge
+/// of the panel impossible.
+fn covered_by(box_: &egui::Rect, cells: &[(usize, egui::Rect)]) -> Vec<usize> {
+    cells
+        .iter()
+        .filter(|(_, rect)| rect.intersects(*box_))
+        .map(|(position, _)| *position)
+        .collect()
+}
+
+/// Paints the box and tints what it is about to take.
+///
+/// Live rather than on release, because a selection you cannot see until you let go is
+/// one you have to redo. The tint is painted over the cells that are already drawn, which
+/// is the whole reason this runs after them.
+fn paint_marquee(
+    ui: &egui::Ui,
+    box_: &egui::Rect,
+    covered: &[usize],
+    cells: &[(usize, egui::Rect)],
+) {
+    let painter = ui.painter();
+    let accent = ui.visuals().selection.bg_fill;
+    for (position, rect) in cells {
+        if covered.contains(position) {
+            painter.rect_filled(*rect, 2.0, accent.gamma_multiply(0.35));
+        }
+    }
+    painter.rect_filled(*box_, 0.0, accent.gamma_multiply(0.15));
+    painter.rect_stroke(
+        *box_,
+        0.0,
+        egui::Stroke::new(1.0, accent),
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// One thumbnail's appearance, separated from how it is interacted with.
@@ -376,6 +583,8 @@ struct Thumbnail {
     texture: Option<egui::TextureId>,
     /// Whether this is the page the main view is showing.
     current: bool,
+    /// Whether this page is picked out. Only ever true in reorganize mode.
+    selected: bool,
 }
 
 /// Paints a thumbnail and its page number, and returns the image's own response.
@@ -400,14 +609,28 @@ fn paint(ui: &mut egui::Ui, thumbnail: &Thumbnail, sense: egui::Sense) -> egui::
                     .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
             }
         }
-        // Outlined as well as numbered in colour, because a coloured number is easy to
-        // miss in a panel of forty thumbnails and finding where you are is what
-        // navigation mode is for.
+        // Picked out: tinted over the page rather than outlined, so it stays legible when
+        // twelve in a row are selected — twelve outlines read as a grid, a wash of colour
+        // reads as a group.
+        if thumbnail.selected {
+            let accent = ui.visuals().selection.bg_fill;
+            ui.painter()
+                .rect_filled(rect, 2.0, accent.gamma_multiply(0.35));
+            ui.painter().rect_stroke(
+                rect,
+                2.0,
+                egui::Stroke::new(2.0, accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // Where the main view is, outlined as well as numbered in colour, because a
+        // coloured number is easy to miss in a panel of forty thumbnails. White rather
+        // than the accent so it is still tellable from a selected page.
         if thumbnail.current {
             ui.painter().rect_stroke(
                 rect,
                 2.0,
-                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
                 egui::StrokeKind::Inside,
             );
         }
@@ -499,6 +722,69 @@ mod tests {
             let scale = bucket_for(width, 1.0).scale();
             assert!(scale.is_finite() && scale > 0.0, "width {width} -> {scale}");
         }
+    }
+
+    /// Four cells in a row, each 100 wide with a 10 pt gap, 140 tall.
+    fn row() -> Vec<(usize, egui::Rect)> {
+        (0..4)
+            .map(|position| {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "four positions in a test fixture"
+                )]
+                let x = position as f32 * 110.0;
+                (
+                    position,
+                    egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(100.0, 140.0)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_box_takes_the_cells_it_touches() {
+        // Spans the first two and stops in the gap before the third.
+        let box_ = egui::Rect::from_min_max(egui::pos2(5.0, 5.0), egui::pos2(205.0, 100.0));
+        assert_eq!(covered_by(&box_, &row()), vec![0, 1]);
+    }
+
+    #[test]
+    fn clipping_a_corner_is_enough() {
+        // Intersection rather than containment: requiring a cell to be wholly inside
+        // makes selecting anything at the edge of a narrow panel impossible.
+        let box_ = egui::Rect::from_min_max(egui::pos2(95.0, 135.0), egui::pos2(115.0, 200.0));
+        assert_eq!(covered_by(&box_, &row()), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_box_over_empty_space_takes_nothing() {
+        // How you deselect, so it must come back empty rather than unchanged.
+        let box_ = egui::Rect::from_min_max(egui::pos2(0.0, 300.0), egui::pos2(400.0, 400.0));
+        assert_eq!(covered_by(&box_, &row()), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_box_dragged_upwards_still_selects() {
+        // `Rect::from_two_pos` normalizes, but this is what would break if a future
+        // change built the rect by hand from min/max — and dragging up-and-left is at
+        // least half of all drags.
+        let box_ = egui::Rect::from_two_pos(egui::pos2(205.0, 100.0), egui::pos2(5.0, 5.0));
+        assert_eq!(covered_by(&box_, &row()), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_box_covering_everything_takes_every_cell() {
+        let box_ = egui::Rect::from_min_max(egui::pos2(-10.0, -10.0), egui::pos2(500.0, 500.0));
+        assert_eq!(covered_by(&box_, &row()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_cell_that_was_never_drawn_is_never_covered() {
+        // `Rect::NOTHING` is what a skipped cell reports, and a marquee must not pick it
+        // up — it would select a page that is not on screen.
+        let cells = vec![(7_usize, egui::Rect::NOTHING)];
+        let box_ = egui::Rect::from_min_max(egui::pos2(-1e6, -1e6), egui::pos2(1e6, 1e6));
+        assert_eq!(covered_by(&box_, &cells), Vec::<usize>::new());
     }
 
     #[test]

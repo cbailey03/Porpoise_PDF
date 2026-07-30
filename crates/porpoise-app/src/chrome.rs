@@ -95,6 +95,12 @@ pub(crate) struct StatusDocument {
     pub(crate) timing: FrameTiming,
     /// Rasterizations given up on. A page still being retried is not one yet.
     pub(crate) abandoned: usize,
+    /// How many pages are picked out in the grid. Zero when none are.
+    ///
+    /// Shown because the grid can be scrolled away from what is picked, and **Delete**
+    /// acts on it — so "how many pages would that button take" has to be readable without
+    /// hunting for highlights.
+    pub(crate) selected: usize,
 }
 
 /// Draws the toolbar and reports what was clicked.
@@ -276,6 +282,13 @@ pub(crate) fn status(ui: &mut egui::Ui, state: &Status<'_>) {
                     "ui {:.1} ms, frame {:.1} ms",
                     open.timing.ui_ms, open.timing.frame_ms
                 ));
+                if open.selected > 0 {
+                    ui.separator();
+                    ui.colored_label(
+                        ui.visuals().selection.bg_fill,
+                        format!("{} selected", open.selected),
+                    );
+                }
                 if open.abandoned > 0 {
                     ui.separator();
                     ui.colored_label(

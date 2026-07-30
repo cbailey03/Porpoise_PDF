@@ -23,8 +23,9 @@ use crate::command::Command;
 /// Everything needed to decide which edits apply.
 ///
 /// Plain values, so this module never learns what a `Viewer` is and can be tested
-/// without a window, a document, or a GPU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// without a window, a document, or a GPU. No longer `Copy` since the selection arrived,
+/// which costs one allocation per frame and buys the toolbar knowing what is picked.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Situation {
     /// The page on screen, counting from 1. Ignored when `pages` is zero.
     pub(crate) current: PageNumber,
@@ -38,6 +39,12 @@ pub(crate) struct Situation {
     pub(crate) saving: bool,
     /// Whether the page grid is showing.
     pub(crate) thumbnails: bool,
+    /// Pages picked out in the grid, ascending. Empty when nothing is picked.
+    ///
+    /// Only **Delete** reads it. Moving stays anchored to the page in view, because the
+    /// toolbar's Up and Down mean "this page, one step" and a group move is a drag —
+    /// there is no sensible "one step" for five scattered pages.
+    pub(crate) selection: Vec<PageNumber>,
 }
 
 /// The commands available in this situation. `None` means "not possible right now".
@@ -71,6 +78,7 @@ impl Edits {
             unsaved_changes,
             saving,
             thumbnails,
+            selection,
         } = situation;
 
         let here = current.get();
@@ -88,7 +96,19 @@ impl Edits {
                 .map(|to| Command::MovePage { from: current, to }),
             // The last page cannot go: a PDF with no pages is not a PDF. `PageOrder`
             // refuses it too, so this only spares the person a button that does nothing.
-            delete: (open && pages > 1).then_some(Command::DeletePage { page: current }),
+            //
+            // With pages picked out in the grid, Delete acts on those instead of on the
+            // page in view — otherwise the highlight would be visibly ignored by the one
+            // button it obviously applies to. Deleting every page is refused for the same
+            // reason deleting the last one is, and here that means not offering it.
+            delete: match (open, selection.as_slice()) {
+                (false, _) => None,
+                (true, []) => (pages > 1).then_some(Command::DeletePage { page: current }),
+                (true, picked) if picked.len() < pages => Some(Command::DeletePages {
+                    pages: picked.to_vec(),
+                }),
+                (true, _) => None,
+            },
             undo: can_undo.then_some(Command::Undo),
             // Not while one is running. This is the line the two producers disagreed on.
             save: (unsaved_changes && !saving).then_some(Command::Save),
@@ -107,7 +127,7 @@ mod tests {
         PageNumber::new(number).expect("page numbers in tests start at 1")
     }
 
-    /// A ten-page document sitting on page 5, freshly opened.
+    /// A ten-page document sitting on page 5, freshly opened, nothing picked out.
     fn settled() -> Situation {
         Situation {
             current: page(5),
@@ -116,6 +136,7 @@ mod tests {
             unsaved_changes: false,
             saving: false,
             thumbnails: false,
+            selection: Vec::new(),
         }
     }
 
@@ -228,6 +249,67 @@ mod tests {
             during.save, None,
             "offered a save while one was already running"
         );
+    }
+
+    #[test]
+    fn delete_acts_on_the_selection_when_there_is_one() {
+        // Otherwise the highlight would be ignored by the one button it obviously
+        // applies to.
+        let picked = Edits::available(Situation {
+            selection: vec![page(2), page(3), page(7)],
+            ..settled()
+        });
+        assert_eq!(
+            picked.delete,
+            Some(Command::DeletePages {
+                pages: vec![page(2), page(3), page(7)]
+            })
+        );
+    }
+
+    #[test]
+    fn delete_falls_back_to_the_page_in_view_with_nothing_picked() {
+        assert_eq!(
+            Edits::available(settled()).delete,
+            Some(Command::DeletePage { page: page(5) })
+        );
+    }
+
+    #[test]
+    fn deleting_every_selected_page_is_not_offered() {
+        // `PageOrder::remove_pages` refuses to empty a document, so offering it would be
+        // a lit button that does nothing.
+        let all = Edits::available(Situation {
+            pages: 3,
+            current: page(1),
+            selection: vec![page(1), page(2), page(3)],
+            ..settled()
+        });
+        assert_eq!(all.delete, None);
+    }
+
+    #[test]
+    fn a_selection_does_not_change_which_way_a_page_can_move() {
+        // Up and Down mean "this page, one step". There is no sensible one step for five
+        // scattered pages, so a group move is a drag and the buttons stay as they were.
+        let picked = Edits::available(Situation {
+            selection: vec![page(2), page(8)],
+            ..settled()
+        });
+        let plain = Edits::available(settled());
+        assert_eq!(picked.move_earlier, plain.move_earlier);
+        assert_eq!(picked.move_later, plain.move_later);
+    }
+
+    #[test]
+    fn a_selection_with_no_document_deletes_nothing() {
+        // Reachable for a frame after a close, since the selection outlives the document.
+        let empty = Edits::available(Situation {
+            pages: 0,
+            selection: vec![page(1)],
+            ..settled()
+        });
+        assert_eq!(empty.delete, None);
     }
 
     #[test]

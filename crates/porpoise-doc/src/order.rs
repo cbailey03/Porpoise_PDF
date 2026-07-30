@@ -125,12 +125,55 @@ impl PageOrder {
     /// convention the view commands use, where being already where you asked to go is
     /// `Unchanged` rather than a rejection.
     pub fn move_page(&mut self, from: usize, to: usize) -> bool {
-        if from >= self.order.len() || to >= self.order.len() || from == to {
+        self.move_pages(&[from], to)
+    }
+
+    /// Moves every page in `positions` so the group starts at `to`, keeping their
+    /// relative order.
+    ///
+    /// `to` is where the group ends up **after** the move, which is the contract
+    /// [`Self::move_page`] has always had — not "insert before whatever is at `to`
+    /// now". The two spellings disagree whenever the group moves forward, so the choice
+    /// matters: `move_pages(&[0], 2)` on `[0,1,2,3]` gives `[1,2,0,3]`, with the moved
+    /// page third as asked.
+    ///
+    /// One undo step for the whole group, which is the reason this is not a loop over
+    /// [`Self::move_page`] at the call site: dragging five pages and pressing undo once
+    /// has to put all five back.
+    ///
+    /// Duplicate and unordered positions are fine. Out of range in either argument
+    /// changes nothing, as above.
+    pub fn move_pages(&mut self, positions: &[usize], to: usize) -> bool {
+        let Some(taken) = self.normalize(positions) else {
+            return false;
+        };
+        if to >= self.order.len() {
+            return false;
+        }
+
+        // Clamp so the group lands wholly inside the document. `to` is already known to
+        // be a valid position, so for a single page this can never bite — which is what
+        // keeps `move_page`'s existing behaviour exactly as it was.
+        let landing = to.min(self.order.len() - taken.len());
+
+        let group: Vec<usize> = taken
+            .iter()
+            .filter_map(|&position| self.order.get(position).copied())
+            .collect();
+        let mut rest: Vec<usize> = self
+            .order
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !taken.contains(position))
+            .map(|(_, &page)| page)
+            .collect();
+        rest.splice(landing..landing, group);
+
+        if rest == self.order {
             return false;
         }
         self.remember();
-        let page = self.order.remove(from);
-        self.order.insert(to, page);
+        self.order = rest;
         true
     }
 
@@ -139,12 +182,48 @@ impl PageOrder {
     /// Refuses to remove the last one: a PDF with no pages is not a valid PDF, and
     /// producing one would be a worse outcome than declining.
     pub fn remove(&mut self, position: usize) -> bool {
-        if position >= self.order.len() || self.order.len() == 1 {
+        self.remove_pages(&[position])
+    }
+
+    /// Removes every page in `positions`, as one undo step.
+    ///
+    /// Refuses to remove them *all*, for the reason [`Self::remove`] refuses the last
+    /// one. Note that it refuses rather than deleting all but one: which page a person
+    /// did not mean to delete is not something this can guess, and leaving the selection
+    /// intact lets them narrow it.
+    pub fn remove_pages(&mut self, positions: &[usize]) -> bool {
+        let Some(taken) = self.normalize(positions) else {
+            return false;
+        };
+        if taken.len() == self.order.len() {
             return false;
         }
         self.remember();
-        self.order.remove(position);
+        self.order = self
+            .order
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !taken.contains(position))
+            .map(|(_, &page)| page)
+            .collect();
         true
+    }
+
+    /// Sorted, deduplicated, in-range positions — or `None` if there is nothing to act
+    /// on.
+    ///
+    /// Shared by both group edits so "which positions did you mean" is answered once.
+    /// A single out-of-range position makes the whole call a no-op rather than being
+    /// dropped silently: a caller that asked to move five pages and got four moved
+    /// would have no way to tell.
+    fn normalize(&self, positions: &[usize]) -> Option<Vec<usize>> {
+        if positions.is_empty() || positions.iter().any(|&p| p >= self.order.len()) {
+            return None;
+        }
+        let mut taken = positions.to_vec();
+        taken.sort_unstable();
+        taken.dedup();
+        Some(taken)
     }
 
     /// Goes back one step. Returns whether there was a step to go back to.
@@ -257,6 +336,160 @@ mod tests {
         let mut order = PageOrder::identity(3);
         assert!(!order.remove(7));
         assert_eq!(order.as_slice(), &[0, 1, 2]);
+    }
+
+    // --- Group edits ---------------------------------------------------------
+
+    #[test]
+    fn a_group_moves_as_a_block_and_keeps_its_order() {
+        let mut order = PageOrder::identity(6);
+        assert!(order.move_pages(&[0, 1], 3));
+        assert_eq!(order.as_slice(), &[2, 3, 4, 0, 1, 5]);
+        assert_eq!(
+            order.source_of(3),
+            Some(0),
+            "the group should start where it was asked to"
+        );
+    }
+
+    #[test]
+    fn a_group_moving_backward_lands_where_asked() {
+        let mut order = PageOrder::identity(6);
+        assert!(order.move_pages(&[3, 4], 1));
+        assert_eq!(order.as_slice(), &[0, 3, 4, 1, 2, 5]);
+    }
+
+    #[test]
+    fn a_scattered_group_is_gathered_together() {
+        // Picking pages out of a long document and dropping them side by side is the
+        // point of selecting more than one, so they arrive contiguous.
+        let mut order = PageOrder::identity(6);
+        assert!(order.move_pages(&[0, 2, 4], 2));
+        assert_eq!(order.as_slice(), &[1, 3, 0, 2, 4, 5]);
+    }
+
+    #[test]
+    fn a_group_dropped_past_the_end_lands_flush_against_it() {
+        // Clamped rather than refused: dragging three pages at the bottom of the grid
+        // means "put them last", and refusing would read as the drag not working.
+        let mut order = PageOrder::identity(5);
+        assert!(order.move_pages(&[0, 1, 2], 4));
+        assert_eq!(order.as_slice(), &[3, 4, 0, 1, 2]);
+    }
+
+    #[test]
+    fn a_single_page_group_moves_exactly_like_move_page() {
+        // The two share one implementation, and this is what pins that they agree —
+        // `move_page`'s contract predates groups and its callers depend on it.
+        for from in 0..5 {
+            for to in 0..5 {
+                let mut one = PageOrder::identity(5);
+                let mut group = PageOrder::identity(5);
+                assert_eq!(
+                    one.move_page(from, to),
+                    group.move_pages(&[from], to),
+                    "{from} -> {to} disagreed about whether anything changed"
+                );
+                assert_eq!(one.as_slice(), group.as_slice(), "{from} -> {to}");
+            }
+        }
+    }
+
+    #[test]
+    fn moving_a_group_onto_itself_changes_nothing() {
+        let mut order = PageOrder::identity(5);
+        assert!(!order.move_pages(&[1, 2], 1));
+        assert_eq!(order.as_slice(), &[0, 1, 2, 3, 4]);
+        assert!(
+            !order.can_undo(),
+            "a move that did nothing recorded history"
+        );
+    }
+
+    #[test]
+    fn moving_every_page_at_once_changes_nothing() {
+        let mut order = PageOrder::identity(4);
+        assert!(!order.move_pages(&[0, 1, 2, 3], 0));
+        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_group_edit_is_one_undo_step() {
+        // The reason these are not loops over the single-page versions. Dragging five
+        // pages and pressing undo once has to put all five back, not one of them.
+        let mut order = PageOrder::identity(6);
+        order.move_pages(&[0, 1, 2], 3);
+        assert_eq!(order.as_slice(), &[3, 4, 5, 0, 1, 2]);
+        assert!(order.undo());
+        assert_eq!(order.as_slice(), &[0, 1, 2, 3, 4, 5]);
+        assert!(!order.can_undo(), "one drag left more than one step behind");
+    }
+
+    #[test]
+    fn a_group_delete_is_one_undo_step() {
+        let mut order = PageOrder::identity(6);
+        assert!(order.remove_pages(&[1, 3, 5]));
+        assert_eq!(order.as_slice(), &[0, 2, 4]);
+        assert!(order.undo());
+        assert_eq!(order.as_slice(), &[0, 1, 2, 3, 4, 5]);
+        assert!(!order.can_undo());
+    }
+
+    #[test]
+    fn duplicate_and_unordered_positions_are_accepted() {
+        // The UI hands over a set in click order, which is neither sorted nor
+        // necessarily unique once a range overlaps an earlier pick.
+        let mut order = PageOrder::identity(6);
+        assert!(order.move_pages(&[4, 0, 4, 0], 2));
+        assert_eq!(order.as_slice(), &[1, 2, 0, 4, 3, 5]);
+    }
+
+    #[test]
+    fn deleting_every_page_is_refused() {
+        // Refused, not "all but one": which page was not meant to go is not something
+        // this can guess.
+        let mut order = PageOrder::identity(3);
+        assert!(!order.remove_pages(&[0, 1, 2]));
+        assert_eq!(order.as_slice(), &[0, 1, 2]);
+        assert!(!order.can_undo());
+    }
+
+    #[test]
+    fn one_bad_position_makes_the_whole_group_edit_a_no_op() {
+        // Rather than silently acting on the rest. A caller that asked to move three
+        // pages and got two moved has no way to notice.
+        let mut order = PageOrder::identity(4);
+        assert!(!order.move_pages(&[0, 1, 9], 2));
+        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+        assert!(!order.remove_pages(&[0, 9]));
+        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn an_empty_group_changes_nothing() {
+        let mut order = PageOrder::identity(3);
+        assert!(!order.move_pages(&[], 1));
+        assert!(!order.remove_pages(&[]));
+        assert_eq!(order.as_slice(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn a_group_edit_never_loses_or_duplicates_a_page() {
+        // The invariant the render path depends on, exercised over the group edits the
+        // way the single-page ones already are below.
+        let mut order = PageOrder::identity(8);
+        order.move_pages(&[0, 3, 7], 2);
+        order.remove_pages(&[1, 4]);
+        order.move_pages(&[0, 1], 4);
+
+        let mut seen = order.as_slice().to_vec();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "a page appeared twice: {order:?}");
+        for &source in order.as_slice() {
+            assert!(source < order.source_len(), "invented page {source}");
+        }
     }
 
     #[test]

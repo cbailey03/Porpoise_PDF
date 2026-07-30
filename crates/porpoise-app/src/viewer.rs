@@ -87,6 +87,7 @@ use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::queue::RenderQueue;
 use crate::retain;
 use crate::saver::Saver;
+use crate::selection::Selection;
 use crate::thumbnails::{self, Grid, GridMode};
 use crate::tiles::{FULL_UV, to_color_image};
 
@@ -366,6 +367,12 @@ struct Viewer {
     /// silently put a click back to meaning something else.
     grid_mode: GridMode,
 
+    /// Pages picked out in the grid. See [`crate::selection`].
+    ///
+    /// Outside `open`, so it is not one of the things a reorder has to remember to fix up
+    /// — it holds source pages and follows them on its own.
+    selection: Selection,
+
     /// A request held back because it would discard unsaved page changes.
     ///
     /// See [`crate::confirm`]. `None` whenever nothing is waiting, which is almost
@@ -453,6 +460,7 @@ impl Viewer {
             saver: Saver::default(),
             thumbnails: false,
             grid_mode: GridMode::default(),
+            selection: Selection::default(),
             guard: None,
             quitting: false,
             last_error: None,
@@ -529,6 +537,7 @@ impl Viewer {
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
             grid_mode: self.grid_mode,
+            selection: self.selected_pages(),
             unsaved_changes: self.unsaved_changes(),
             awaiting_answer: match &self.guard {
                 Some(Guard::Asking(intent)) => Some(intent.describe()),
@@ -765,7 +774,28 @@ impl Viewer {
             Command::MovePage { from, to } => {
                 self.edit(|order| order.move_page(from.index(), to.index()))
             }
+            Command::MovePages { from, to } => {
+                let positions: Vec<usize> = from.iter().map(|page| page.index()).collect();
+                self.edit(|order| order.move_pages(&positions, to.index()))
+            }
             Command::DeletePage { page } => self.edit(|order| order.remove(page.index())),
+            Command::DeletePages { pages } => {
+                let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
+                self.edit(|order| order.remove_pages(&positions))
+            }
+            Command::SetSelection { pages } => {
+                let Some(open) = &self.open else {
+                    return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+                };
+                let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
+                let mut wanted = self.selection.clone();
+                wanted.set_positions(&open.order, &positions);
+                if wanted == self.selection {
+                    return DispatchResult::Unchanged;
+                }
+                self.selection = wanted;
+                DispatchResult::View(Outcome::Changed)
+            }
             Command::Undo => self.edit(PageOrder::undo),
             Command::Save => {
                 let Some(open) = &self.open else {
@@ -775,11 +805,18 @@ impl Viewer {
                 self.begin_save(destination, Overwrite::Allow)
             }
             Command::SaveAs { path } => self.begin_save(path, Overwrite::Refuse),
+            // Both of these can hide the selection, and a selection nobody can see is a
+            // trap: **Delete** acts on it, so it has to go when the highlight does.
+            // Cleared on the way out rather than ignored while hidden, so the state and
+            // the snapshot always say the same thing.
             Command::SetThumbnails { visible } => {
                 if self.thumbnails == visible {
                     return DispatchResult::Unchanged;
                 }
                 self.thumbnails = visible;
+                if !visible {
+                    self.selection.clear();
+                }
                 DispatchResult::View(Outcome::Changed)
             }
             Command::SetGridMode { mode } => {
@@ -787,6 +824,9 @@ impl Viewer {
                     return DispatchResult::Unchanged;
                 }
                 self.grid_mode = mode;
+                if mode != GridMode::Reorganize {
+                    self.selection.clear();
+                }
                 DispatchResult::View(Outcome::Changed)
             }
             Command::Capture { path } => {
@@ -1004,7 +1044,39 @@ impl Viewer {
             unsaved_changes: self.unsaved_changes(),
             saving: self.saver.is_busy(),
             thumbnails: self.thumbnails,
+            selection: self.selected_pages(),
         })
+    }
+
+    /// Sends a gesture's intended selection through the command channel.
+    ///
+    /// The gestures work out *which* pages they want by asking [`Selection`], then hand
+    /// the answer over as `set_selection` rather than writing it in place — so a click in
+    /// the grid and an agent's `set_selection` take exactly the same path, and there is no
+    /// selection a person can reach that a client cannot.
+    fn dispatch_selection(&mut self, ctx: &egui::Context, wanted: &Selection) {
+        let Some(open) = &self.open else { return };
+        let pages: Vec<PageNumber> = wanted
+            .positions(&open.order)
+            .into_iter()
+            .map(PageNumber::from_index)
+            .collect();
+        self.dispatch(ctx, Command::SetSelection { pages });
+    }
+
+    /// Selected pages as display page numbers, ascending. Empty with no document.
+    ///
+    /// The one place the selection is read out for anything other than drawing it, so
+    /// the toolbar, the snapshot and the keyboard cannot disagree about what is picked.
+    fn selected_pages(&self) -> Vec<PageNumber> {
+        let Some(open) = &self.open else {
+            return Vec::new();
+        };
+        self.selection
+            .positions(&open.order)
+            .into_iter()
+            .map(PageNumber::from_index)
+            .collect()
     }
 
     /// Turns a page-edit key press into a command against the page on screen.
@@ -1499,8 +1571,9 @@ impl Viewer {
         // See `wheel_is_for_the_pages`.
         self.thumbnails_rect = ui.available_rect_before_wrap();
         let current = self.view().current_page();
-        // Both read before `open` is borrowed mutably below.
+        // All read before `open` is borrowed mutably below.
         let mode = self.grid_mode;
+        let selection = self.selection.clone();
         let Some(open) = &mut self.open else {
             ui.label("No document open.");
             return;
@@ -1513,21 +1586,42 @@ impl Viewer {
             queue: RenderQueue::new(&open.pool, &mut open.in_flight, &mut open.failures),
             current,
             mode,
+            selection: &selection,
             pixels_per_point,
         };
         let drawn = thumbnails::draw(ui, &mut grid);
         // Kept for `retain_textures`, which runs once both panels have had their say.
         self.grid_pages = drawn.showing;
 
+        // Picks first: a drag that begins on an unpicked page reports both, and the
+        // selection has to be right before the move reads it.
+        if let Some((position, pick)) = drawn.picked {
+            let ctx = ui.ctx().clone();
+            let mut wanted = self.selection.clone();
+            if let Some(open) = &self.open {
+                wanted.pick(&open.order, position, pick);
+            }
+            self.dispatch_selection(&ctx, &wanted);
+        }
+        if let Some(covered) = drawn.marquee {
+            let ctx = ui.ctx().clone();
+            let mut wanted = self.selection.clone();
+            if let Some(open) = &self.open {
+                wanted.set_positions(&open.order, &covered);
+            }
+            self.dispatch_selection(&ctx, &wanted);
+        }
+
         // Through the normal dispatch, so a drag is indistinguishable from an agent
-        // sending `move_page` — which is the whole point of the command model.
+        // sending `move_pages` — which is the whole point of the command model.
         if let Some((from, to)) = drawn.moved {
             let ctx = ui.ctx().clone();
-            if let (Some(from), Some(to)) = (
-                PageNumber::new(from.saturating_add(1)),
-                PageNumber::new(to.saturating_add(1)),
-            ) {
-                self.dispatch(&ctx, Command::MovePage { from, to });
+            let from: Vec<PageNumber> = from
+                .iter()
+                .filter_map(|position| PageNumber::new(position.saturating_add(1)))
+                .collect();
+            if let (false, Some(to)) = (from.is_empty(), PageNumber::new(to.saturating_add(1))) {
+                self.dispatch(&ctx, Command::MovePages { from, to });
             }
         }
 
@@ -1615,6 +1709,7 @@ impl Viewer {
                     renders_in_flight: open.in_flight.len(),
                     timing: self.timing,
                     abandoned: open.abandoned(),
+                    selected: self.selection.count(&open.order),
                 }),
                 saving_to: self.saver.destination(),
                 unsaved_changes: self.unsaved_changes(),

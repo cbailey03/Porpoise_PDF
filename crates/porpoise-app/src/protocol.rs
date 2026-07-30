@@ -207,6 +207,37 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         PageNumber::new(number).ok_or_else(|| complain("page numbers start at 1".to_owned()))
     };
 
+    // A list of page numbers, for the group edits and the selection. Every element goes
+    // through the same `PageNumber` gate a single `page` does, so `[0]` and `[-1]` are
+    // refused here rather than deeper in.
+    let pages_argument = |field: &str| -> Result<Vec<PageNumber>, DecodeFailure> {
+        let complain = |detail: String| {
+            DecodeError::BadArguments {
+                command: name.to_owned(),
+                detail,
+            }
+            .at(id)
+        };
+        let raw = object
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| complain(format!("expected an array \"{field}\" of page numbers")))?;
+        raw.iter()
+            .map(|element| {
+                let number = element
+                    .as_u64()
+                    .and_then(|raw| usize::try_from(raw).ok())
+                    .ok_or_else(|| {
+                        complain(format!(
+                            "\"{field}\" holds something that is not a page number"
+                        ))
+                    })?;
+                PageNumber::new(number)
+                    .ok_or_else(|| complain("page numbers start at 1".to_owned()))
+            })
+            .collect()
+    };
+
     let body = match name {
         "snapshot" => RequestBody::Snapshot,
         "commands" => RequestBody::Commands,
@@ -221,8 +252,18 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
             from: page_argument("from")?,
             to: page_argument("to")?,
         }),
+        "move_pages" => RequestBody::Command(Command::MovePages {
+            from: pages_argument("from")?,
+            to: page_argument("to")?,
+        }),
         "delete_page" => RequestBody::Command(Command::DeletePage {
             page: page_argument("page")?,
+        }),
+        "delete_pages" => RequestBody::Command(Command::DeletePages {
+            pages: pages_argument("pages")?,
+        }),
+        "set_selection" => RequestBody::Command(Command::SetSelection {
+            pages: pages_argument("pages")?,
         }),
         "undo" => RequestBody::Command(Command::Undo),
         "save" => RequestBody::Command(Command::Save),
@@ -326,6 +367,12 @@ pub(crate) struct Snapshot {
     /// What clicking a page in the grid does. Reported whether or not the grid is
     /// showing, because it is remembered across closing and reopening the panel.
     pub(crate) grid_mode: GridMode,
+    /// Pages picked out in the grid, counting from 1, ascending.
+    ///
+    /// Display positions, like every other page number here — so after a reorder these
+    /// are where the selected pages are *now*. Empty when nothing is picked, which is
+    /// also when **Delete** falls back to acting on the page in view.
+    pub(crate) selection: Vec<PageNumber>,
     /// Whether the page order differs from the file on disk.
     ///
     /// False again once a save of that exact order reports success — so a document that

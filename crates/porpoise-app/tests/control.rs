@@ -712,6 +712,184 @@ fn the_page_grid_can_be_opened_and_closed_by_command() {
 }
 
 #[test]
+fn pages_can_be_picked_out_and_moved_as_a_group() {
+    let Some(_window) = e2e("pages_can_be_picked_out_and_moved_as_a_group") else {
+        return;
+    };
+
+    // The grid's ctrl+click, shift+click and marquee all come down to `set_selection`,
+    // and dragging the result comes down to `move_pages`. Neither gesture can be
+    // synthesized here, but both commands can — so what a gesture *authors* is covered
+    // even though the pointer itself is not.
+    let document = fixture("e2e-group-edit.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let selection = |serve: &mut Serve| -> Vec<u64> {
+        serve
+            .snapshot()
+            .get("selection")
+            .and_then(Value::as_array)
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+
+    assert!(
+        selection(&mut serve).is_empty(),
+        "something was picked out before anything asked for it"
+    );
+
+    let id = serve.send("set_selection", &[("pages", Value::from(vec![2, 4, 5]))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(selection(&mut serve), vec![2, 4, 5]);
+
+    // Scattered pages arrive contiguous, in the order they were shown in, starting where
+    // they were asked to. Pages 2, 4 and 5 of 1..6 landing at 2 leaves 1, then them.
+    let id = serve.send(
+        "move_pages",
+        &[("from", Value::from(vec![2, 4, 5])), ("to", Value::from(2))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+
+    // And the selection followed the pages rather than staying on the positions: they are
+    // now at 2, 3, 4.
+    assert_eq!(
+        selection(&mut serve),
+        vec![2, 3, 4],
+        "the selection did not follow the pages it was pointing at"
+    );
+
+    // One undo puts the whole group back, not one page of it.
+    let id = serve.send("undo", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+    assert_eq!(
+        selection(&mut serve),
+        vec![2, 4, 5],
+        "undo left the group half moved"
+    );
+
+    // A group delete, also one step.
+    let id = serve.send("delete_pages", &[("pages", Value::from(vec![2, 4, 5]))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(3),
+        "a six-page document lost the wrong number of pages"
+    );
+    assert!(
+        selection(&mut serve).is_empty(),
+        "pages that are gone still counted as picked out"
+    );
+
+    // Deleting everything is refused rather than leaving an arbitrary page behind. It
+    // comes back `unchanged` rather than as an error, which is the same convention
+    // `delete_page` has always followed for the last remaining page — asking for
+    // something that changes nothing is not a failure here. What matters is the
+    // document, so that is what this checks.
+    let id = serve.send("delete_pages", &[("pages", Value::from(vec![1, 2, 3]))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(3),
+        "emptying the document was accepted"
+    );
+
+    // `{"pages":[0]}` is refused for the reason `{"page":0}` is: page numbers start at 1.
+    let id = serve.send("set_selection", &[("pages", Value::from(vec![0]))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(false),
+        "page zero was accepted in a list"
+    );
+
+    // The group edits leave real unsaved changes, so quitting is guarded exactly as it is
+    // after a single-page edit — worth pinning here too, since a group edit that skipped
+    // the guard would lose work quietly.
+    let id = serve.send("quit", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("needs_answer"),
+        "a group edit did not count as unsaved changes"
+    );
+    let id = serve.send("answer", &[("choice", Value::from("discard"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("quitting")
+    );
+    serve.expect_exit();
+}
+
+#[test]
+fn leaving_reorganize_mode_forgets_the_selection() {
+    let Some(_window) = e2e("leaving_reorganize_mode_forgets_the_selection") else {
+        return;
+    };
+
+    // A selection nobody can see is a trap, because Delete acts on it. Cleared on the way
+    // out rather than ignored while hidden, so the state and the snapshot agree.
+    let document = fixture("e2e-selection-clear.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let picked = |serve: &mut Serve| -> usize {
+        serve
+            .snapshot()
+            .get("selection")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+
+    serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    serve.send("set_grid_mode", &[("mode", Value::from("reorganize"))]);
+    serve.send("set_selection", &[("pages", Value::from(vec![1, 2]))]);
+    assert_eq!(picked(&mut serve), 2);
+
+    // Navigation mode does not show a selection, so it must not keep one.
+    serve.send("set_grid_mode", &[("mode", Value::from("navigate"))]);
+    assert_eq!(
+        picked(&mut serve),
+        0,
+        "switching to navigation kept a selection nothing was drawing"
+    );
+
+    // And the same when the panel closes entirely.
+    serve.send("set_grid_mode", &[("mode", Value::from("reorganize"))]);
+    serve.send("set_selection", &[("pages", Value::from(vec![1, 2]))]);
+    assert_eq!(picked(&mut serve), 2);
+    serve.send("set_thumbnails", &[("visible", Value::from(false))]);
+    assert_eq!(
+        picked(&mut serve),
+        0,
+        "closing the grid kept a selection nothing was drawing"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn the_page_grid_mode_can_be_set_by_command() {
     let Some(_window) = e2e("the_page_grid_mode_can_be_set_by_command") else {
         return;

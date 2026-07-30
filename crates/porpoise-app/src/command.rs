@@ -53,12 +53,42 @@ pub(crate) enum Command {
         /// Where it should end up.
         to: PageNumber,
     },
+    /// Move several pages at once, so the group ends up starting at `to`.
+    ///
+    /// The pages keep their relative order and arrive contiguous, however scattered they
+    /// were. One undo step for the whole group — see `PageOrder::move_pages`, which is
+    /// also where `to` is pinned down as *where the group ends up* rather than what it is
+    /// inserted before.
+    MovePages {
+        /// The pages to move, counting from 1. Order and duplicates do not matter.
+        from: Vec<PageNumber>,
+        /// Where the group should start.
+        to: PageNumber,
+    },
     /// Remove a page from the document.
     ///
     /// Refused for the last remaining page: a PDF with no pages is not a PDF.
     DeletePage {
         /// The page to remove, counting from 1.
         page: PageNumber,
+    },
+    /// Remove several pages at once, as one undo step.
+    ///
+    /// Refused if it would empty the document, rather than keeping an arbitrary page
+    /// back — which page was not meant to go is not something this can guess.
+    DeletePages {
+        /// The pages to remove, counting from 1.
+        pages: Vec<PageNumber>,
+    },
+    /// Pick out pages in the grid, replacing whatever was picked before.
+    ///
+    /// A command rather than click-only for the reason [`Self::SetGridMode`] is: it
+    /// changes what is on screen, and it decides what **Delete** acts on — so a client
+    /// that cannot read it cannot tell what the button in front of it would do. An empty
+    /// list clears the selection.
+    SetSelection {
+        /// The pages to pick out, counting from 1.
+        pages: Vec<PageNumber>,
     },
     /// Undo the last page edit.
     Undo,
@@ -112,7 +142,10 @@ impl Command {
             Self::Close => "close",
             Self::Capture { .. } => "capture",
             Self::MovePage { .. } => "move_page",
+            Self::MovePages { .. } => "move_pages",
             Self::DeletePage { .. } => "delete_page",
+            Self::DeletePages { .. } => "delete_pages",
+            Self::SetSelection { .. } => "set_selection",
             Self::Undo => "undo",
             Self::Save => "save",
             Self::SaveAs { .. } => "save_as",
@@ -145,8 +178,18 @@ impl Command {
                 from: PageNumber::FIRST,
                 to: PageNumber::FIRST,
             },
+            Self::MovePages {
+                from: vec![PageNumber::FIRST],
+                to: PageNumber::FIRST,
+            },
             Self::DeletePage {
                 page: PageNumber::FIRST,
+            },
+            Self::DeletePages {
+                pages: vec![PageNumber::FIRST],
+            },
+            Self::SetSelection {
+                pages: vec![PageNumber::FIRST],
             },
             Self::Undo,
             Self::Save,
@@ -220,7 +263,10 @@ mod tests {
                 | Command::Close
                 | Command::Capture { .. }
                 | Command::MovePage { .. }
+                | Command::MovePages { .. }
                 | Command::DeletePage { .. }
+                | Command::DeletePages { .. }
+                | Command::SetSelection { .. }
                 | Command::Undo
                 | Command::Save
                 | Command::SaveAs { .. }
@@ -235,7 +281,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            12,
+            15,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

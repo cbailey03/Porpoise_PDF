@@ -9,6 +9,12 @@
 //! This is also the seam where `lopdf` joins for incremental save once the editor
 //! phase begins. See `docs/goal-1-plan.md`, section 1.
 
+mod order;
+mod save;
+
+pub use order::PageOrder;
+pub use save::{Overwrite, SaveError, save_reordered};
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 

@@ -19,9 +19,13 @@ porpoise-testkit = { path = "crates/porpoise-testkit" }
 # --- PDF: parsing and rendering (see docs/goal-1-plan.md, section 1) ---
 hayro = "0.7.1"
 hayro-syntax = "0.7.2"
-# Document model for incremental save. Not used until the editor phase; declared
-# here so the version decision lives in one place.
-lopdf = "0.44"
+# Rewrites the page tree when saving a reordered document (docs/goal-4-plan.md).
+#
+# `default-features = false` on purpose. The defaults pull in `rayon` — which this
+# workspace deliberately removed — plus three separate date libraries (`chrono`,
+# `jiff`, `time`) for metadata we never read. We only need to load a page tree,
+# permute it, and write it back.
+lopdf = { version = "0.44", default-features = false }
 
 # --- Shell ---
 egui = "0.35"

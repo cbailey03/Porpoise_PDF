@@ -33,3 +33,15 @@ The dialog is a way of *choosing an argument* for the existing `open` command, n
 new capability — so an agent gains nothing it did not already have.
 
 Plan: [docs/goal-3-plan.md](docs/goal-3-plan.md)
+
+## Goal 4: Reorganize Pages and Save
+
+Let a person change the order of a document's pages and keep the result, with:
+- Moving a page to a different position, and deleting a page
+- Undo, so a mistake costs nothing
+- **Save** over the original, and **Save As** to a new file
+
+This is the first thing that writes to disk, so a save must either produce a
+complete correct file or leave the original untouched — never something in between.
+
+Plan: [docs/goal-4-plan.md](docs/goal-4-plan.md)

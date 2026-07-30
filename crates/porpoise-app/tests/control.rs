@@ -10,8 +10,11 @@
 //!
 //! `porpoise serve` opens a window, so these tests need a display server. They are
 //! skipped — loudly, never silently — when `PORPOISE_E2E` is unset, so that a
-//! headless `cargo test` does not report a failure it cannot help. CI sets it and
-//! runs under `xvfb-run` on Linux.
+//! headless `cargo test` does not report a failure it cannot help.
+//!
+//! Nothing sets it for you since CI was removed, so a plain `cargo test` reports these
+//! as passing without running them. `PORPOISE_E2E=1 cargo test` is in the README's
+//! *Checks* section for that reason.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

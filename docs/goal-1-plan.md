@@ -252,7 +252,8 @@ Why these seams specifically:
   bucketing, and cache eviction are pure logic over numbers. Keeping them out of the GUI crate
   means they are unit-testable with zero windowing, and it caps the cost of a shell migration.
 - **`porpoise-testkit` separate** so fixtures and test-only dependencies cannot leak into the
-  shipped binary. A CI job asserts this rather than trusting it.
+  shipped binary. This was asserted by a CI job until CI was removed; the `cargo tree` check that
+  did it is now in the README's *Checks* section, and nothing runs it automatically.
 
 `porpoise-view` and `porpoise-testkit` will be nearly empty at M1. Creating them up front is
 free and prevents the monolith.
@@ -401,8 +402,10 @@ so measuring against PDFium measures the wrong thing, and keeping a binding to t
 rejected would have been scaffolding that never runs — the same objection raised against
 `cargo-fuzz` immediately above.
 
-The `deny.toml` bans on C PDF and codec libraries, and the `no-native-deps` CI job, stay. Under this
-framing they matter *more*, not less: they are the mechanical enforcement of the premise. `pixel_diff`
+The `deny.toml` bans on C PDF and codec libraries stay, and matter *more* under this framing, not
+less: they are the mechanical enforcement of the premise. The `no-native-deps` job that backed them
+up went when CI did — its check survives as a command in the README, which is weaker, because it now
+depends on somebody running it. `pixel_diff`
 also stays — it is what makes hayro's own output testable for determinism and regression.
 
 ## 6b. Post-Goal-1 code audit (2026-07-29)

@@ -1,8 +1,9 @@
 //! Test fixtures and comparison helpers.
 //!
 //! This crate exists so that fixtures and comparison logic cannot leak into the
-//! shipped binary. Nothing here is reachable from `porpoise-app`, and a CI job
-//! asserts as much.
+//! shipped binary. Nothing here is reachable from `porpoise-app` — a `cargo tree`
+//! check in the README's *Checks* section confirms it, though since CI was removed
+//! nothing runs that check unless somebody does.
 //!
 //! Three things live here:
 //!

@@ -159,7 +159,11 @@ Two flags exist because a PDF is untrusted input, and both have sane defaults:
 
 ## Checks
 
-These are the same gates CI runs, in the order it runs them:
+**There is no CI.** These run locally, and nothing runs them for you — so a commit is only as
+checked as whoever made it. Removed deliberately while the commit rate is high; the workflow is in
+git history if it earns its place back.
+
+Run all of them before a commit that matters:
 
 ```bash
 cargo fmt --all --check
@@ -179,6 +183,31 @@ cargo test --workspace --all-features
 ```bash
 cargo deny check bans licenses sources advisories
 ```
+
+Three more that used to run only in CI, and are easy to forget for that reason.
+
+The end-to-end tests open a real window and are skipped unless asked for, so a plain `cargo test`
+reports them as passing without running them:
+
+```bash
+PORPOISE_E2E=1 cargo test --workspace --all-features
+```
+
+The oldest floor still has to build:
+
+```bash
+cargo +1.92 check --workspace --all-features --all-targets
+```
+
+And the one that guards this project's central claim — no C PDF or codec library in the shipped
+binary. `deny.toml` bans the known names, but this catches anything arriving by a new path, including
+a test-only dependency leaking out of `porpoise-testkit`:
+
+```bash
+cargo tree --package porpoise-app --edges normal | grep -iE "pdfium|mupdf|openjpeg|jpeg2k|jbig2dec|testkit"
+```
+
+No output is a pass.
 
 ## Conventions
 

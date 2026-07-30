@@ -498,12 +498,12 @@ which is the argument for doing that whenever a test is written to pin a specifi
 ## 8. Open decisions
 
 1. **Does an agent get a window at all?** Still open, and now with a concrete cost attached: because
-   `porpoise serve` opens a window, M10 needs a display *and* a GPU adapter wgpu will accept. The
-   Windows CI runner supplies both. On Linux, xvfb gives a display but not an adapter — that needs a
-   software Vulkan or GL stack (lavapipe / llvmpipe) which is not wired up, so the end-to-end job
-   runs on Windows only. A headless mode would remove that asymmetry as a side effect. The tests skip
-   themselves loudly rather than silently when `PORPOISE_E2E` is unset, so a headless `cargo test`
-   neither fails nor pretends to have covered this.
+   `porpoise serve` opens a window, M10 needs a display *and* a GPU adapter wgpu will accept. A
+   Windows desktop supplies both. On Linux, xvfb gives a display but not an adapter — that needs a
+   software Vulkan or GL stack (lavapipe / llvmpipe) which is not wired up. A headless mode would
+   remove that asymmetry as a side effect, and would matter more now that these tests only run when
+   somebody sets `PORPOISE_E2E` by hand: CI has been removed, so nothing runs them otherwise. They
+   skip loudly rather than silently, so a plain `cargo test` does not pretend to have covered this.
 2. **How much history does the event stream keep?** An agent that connects late, or reads slowly,
    will miss events. A small ring buffer replayed on connect is the usual answer. Needs a decision
    before M9, not before M7.

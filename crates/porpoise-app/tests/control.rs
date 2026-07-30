@@ -453,6 +453,166 @@ fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
 }
 
 #[test]
+fn an_agent_can_reorder_a_document_and_save_it() {
+    let Some(_window) = e2e("an_agent_can_reorder_a_document_and_save_it") else {
+        return;
+    };
+
+    // Goal 4 through the running program rather than the library. `porpoise-render`'s
+    // reorder tests prove the *bytes* are right by comparing pixels; this proves the
+    // command path reaches them — that a move changes what the window shows, that the
+    // page count follows a delete, that undo walks back, and that the saved file has
+    // the pages the session ended with.
+    let document = fixture("e2e-reorder.pdf");
+    let saved = scratch("e2e-reorder-saved.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(false),
+        "a freshly opened document reported unsaved changes"
+    );
+
+    // Move page 1 to position 3. Nothing on disk changes.
+    let id = serve.send(
+        "move_page",
+        &[("from", Value::from(1)), ("to", Value::from(3))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "move_page did not report an edit: {reply}"
+    );
+    // `pages_reordered`, not `idle`. An edit takes effect in the frame that accepts it,
+    // and `idle` is emitted on the *settling edge* — so an edit needing no new
+    // rasterization produces no new `idle` at all, and waiting for one hangs. Found
+    // exactly that way.
+    let event = serve.wait_for_event("pages_reordered");
+    assert_eq!(
+        event.get("page_count").and_then(Value::as_u64),
+        Some(PAGES as u64)
+    );
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        snapshot.get("can_undo").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(PAGES as u64),
+        "a move changed the page count"
+    );
+
+    // Delete a page: the count follows.
+    let id = serve.send("delete_page", &[("page", Value::from(2))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+    serve.wait_for_event("idle");
+    assert_eq!(
+        serve.view().get("page_count").and_then(Value::as_u64),
+        Some(PAGES as u64 - 1),
+        "the deleted page is still counted"
+    );
+
+    // Undo walks back one edit, not all of them.
+    let id = serve.send("undo", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(PAGES as u64),
+        "undo did not restore the deleted page"
+    );
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(true),
+        "undo went back further than one edit"
+    );
+
+    // Save As to a new file, and wait for it — the reply only means it started.
+    let id = serve.send(
+        "save_as",
+        &[("path", Value::from(saved.to_string_lossy().as_ref()))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("saving"),
+        "a save must not claim to be finished before the file exists"
+    );
+    let event = serve.wait_for_event("saved");
+    assert!(
+        event
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.contains("e2e-reorder-saved")),
+        "unexpected save event: {event}"
+    );
+
+    // The file exists, opens, and has the pages the session ended with.
+    let bytes = std::fs::read(&saved).expect("the save should exist on disk");
+    assert!(bytes.starts_with(b"%PDF"), "not a PDF");
+    let reopened = Serve::start(&saved);
+    reopened.wait_for_event("idle");
+    let mut reopened = reopened;
+    assert_eq!(
+        reopened.view().get("page_count").and_then(Value::as_u64),
+        Some(PAGES as u64),
+        "the saved document has the wrong number of pages"
+    );
+    reopened.quit();
+
+    serve.quit();
+}
+
+#[test]
+fn saving_an_unedited_document_over_itself_is_refused() {
+    let Some(_window) = e2e("saving_an_unedited_document_over_itself_is_refused") else {
+        return;
+    };
+
+    // Rewriting the file would not even be byte-identical — the writer makes its own
+    // encoding choices — so an unedited save is a no-op rather than a harmless one.
+    let document = fixture("e2e-no-op-save.pdf");
+    let before = std::fs::read(&document).expect("should read");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let id = serve.send("save", &[]);
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("unchanged"),
+        "an unedited save was not refused: {reply}"
+    );
+    assert_eq!(
+        std::fs::read(&document).expect("should read"),
+        before,
+        "the file was rewritten anyway"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn an_empty_window_can_still_be_captured() {
     let Some(_window) = e2e("an_empty_window_can_still_be_captured") else {
         return;

@@ -19,6 +19,40 @@ pub(crate) const VIEWPORT_STEP_FRACTION: f64 = 0.9;
 /// How far an arrow key scrolls or pans, in PDF points.
 pub(crate) const ARROW_STEP_PT: f64 = 48.0;
 
+/// A page edit asked for by a key press.
+///
+/// Separate from [`command_for_key`] because these need to know *which* page is on
+/// screen, and this module deliberately knows nothing about the document. The caller
+/// supplies the current page; this only decides what was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditKey {
+    /// Move the current page one position earlier.
+    MoveEarlier,
+    /// Move the current page one position later.
+    MoveLater,
+    /// Undo the last page edit.
+    Undo,
+    /// Write the changes over the original.
+    Save,
+}
+
+/// Which page edit, if any, this key press asks for.
+///
+/// All under Ctrl, because they change the document rather than the view and a bare
+/// arrow key already means "scroll".
+pub(crate) fn edit_for_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<EditKey> {
+    if !(modifiers.command || modifiers.ctrl) {
+        return None;
+    }
+    match key {
+        egui::Key::ArrowUp => Some(EditKey::MoveEarlier),
+        egui::Key::ArrowDown => Some(EditKey::MoveLater),
+        egui::Key::Z => Some(EditKey::Undo),
+        egui::Key::S => Some(EditKey::Save),
+        _ => None,
+    }
+}
+
 /// Whether this key press asks for the file dialog.
 ///
 /// Separate from [`command_for_key`] because the dialog is not a command — see

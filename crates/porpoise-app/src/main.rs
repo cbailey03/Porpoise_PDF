@@ -11,6 +11,7 @@ mod failure;
 mod input;
 mod picker;
 mod protocol;
+mod saver;
 mod tiles;
 mod viewer;
 

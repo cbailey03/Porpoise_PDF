@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use porpoise_view::ViewCommand;
+use porpoise_view::{PageNumber, ViewCommand};
 
 /// Anything an operator — a person at the keyboard, or an agent — can ask of the
 /// program.
@@ -40,6 +40,32 @@ pub(crate) enum Command {
         /// Where to write the PNG.
         path: PathBuf,
     },
+    /// Move a page to a different position in the document.
+    ///
+    /// Both are positions in the document *as currently shown*, counting from 1. The
+    /// file on disk is untouched until a save.
+    MovePage {
+        /// The page to move.
+        from: PageNumber,
+        /// Where it should end up.
+        to: PageNumber,
+    },
+    /// Remove a page from the document.
+    ///
+    /// Refused for the last remaining page: a PDF with no pages is not a PDF.
+    DeletePage {
+        /// The page to remove, counting from 1.
+        page: PageNumber,
+    },
+    /// Undo the last page edit.
+    Undo,
+    /// Write the edited document over the file it came from.
+    Save,
+    /// Write the edited document to a new file, refusing to replace one.
+    SaveAs {
+        /// Where to write it.
+        path: PathBuf,
+    },
     /// Close the window and exit.
     Quit,
 }
@@ -52,8 +78,47 @@ impl Command {
             Self::Open { .. } => "open",
             Self::Close => "close",
             Self::Capture { .. } => "capture",
+            Self::MovePage { .. } => "move_page",
+            Self::DeletePage { .. } => "delete_page",
+            Self::Undo => "undo",
+            Self::Save => "save",
+            Self::SaveAs { .. } => "save_as",
             Self::Quit => "quit",
         }
+    }
+
+    /// One of each shell command, for building the reference list.
+    ///
+    /// The argument values are placeholders; only the variant matters. Kept exhaustive
+    /// by `every_shell_command_is_in_the_reference_list`, which matches on every
+    /// variant and so fails to compile when one is added — the same mechanism
+    /// [`ViewCommand::ALL`] uses. Without it, a new command would simply be missing
+    /// from what the control channel advertises, and an agent would have no way to
+    /// discover it.
+    fn shell_commands() -> Vec<Self> {
+        let placeholder = || PathBuf::new();
+        vec![
+            Self::Open {
+                path: placeholder(),
+            },
+            Self::Close,
+            Self::Capture {
+                path: placeholder(),
+            },
+            Self::MovePage {
+                from: PageNumber::FIRST,
+                to: PageNumber::FIRST,
+            },
+            Self::DeletePage {
+                page: PageNumber::FIRST,
+            },
+            Self::Undo,
+            Self::Save,
+            Self::SaveAs {
+                path: placeholder(),
+            },
+            Self::Quit,
+        ]
     }
 
     /// Every shell command, plus every view command, as a reference list.
@@ -63,20 +128,7 @@ impl Command {
     /// view command appears here without anyone remembering to add it.
     pub(crate) fn all_names() -> Vec<&'static str> {
         let mut names: Vec<&'static str> = ViewCommand::ALL.iter().map(ViewCommand::name).collect();
-        names.extend(
-            [
-                Self::Open {
-                    path: PathBuf::new(),
-                },
-                Self::Close,
-                Self::Capture {
-                    path: PathBuf::new(),
-                },
-                Self::Quit,
-            ]
-            .iter()
-            .map(Self::name),
-        );
+        names.extend(Self::shell_commands().iter().map(Self::name));
         names
     }
 }
@@ -112,14 +164,78 @@ mod tests {
     }
 
     #[test]
+    fn every_shell_command_is_in_the_reference_list() {
+        // This match is the enforcement. Adding a variant to `Command` without adding
+        // it to `shell_commands` fails to compile *here*, which is the only reason the
+        // list can be trusted as what the control channel advertises. `ViewCommand`
+        // has had this since Goal 2; the shell list was built by hand and did not.
+        let listed = Command::shell_commands();
+        for command in &listed {
+            match command {
+                Command::View(_)
+                | Command::Open { .. }
+                | Command::Close
+                | Command::Capture { .. }
+                | Command::MovePage { .. }
+                | Command::DeletePage { .. }
+                | Command::Undo
+                | Command::Save
+                | Command::SaveAs { .. }
+                | Command::Quit => {}
+            }
+        }
+
+        // And the reverse: a variant matched above but forgotten in the list would
+        // slip through, so count them.
+        assert_eq!(
+            listed.len(),
+            9,
+            "shell_commands has {} entries; update this count deliberately",
+            listed.len()
+        );
+    }
+
+    #[test]
     fn the_reference_list_covers_view_and_shell_commands() {
         let names = Command::all_names();
         assert!(names.contains(&"next_page"), "missing a view command");
         assert!(names.contains(&"open"), "missing a shell command");
+        assert!(names.contains(&"move_page"), "missing an edit command");
+        assert!(names.contains(&"save_as"));
         assert!(names.contains(&"quit"));
 
-        // Every view command appears, and the count is view + the four shell ones.
-        assert_eq!(names.len(), ViewCommand::ALL.len() + 4);
+        assert_eq!(
+            names.len(),
+            ViewCommand::ALL.len() + Command::shell_commands().len()
+        );
+    }
+
+    #[test]
+    fn the_edit_commands_are_named() {
+        assert_eq!(
+            Command::MovePage {
+                from: PageNumber::FIRST,
+                to: PageNumber::FIRST
+            }
+            .name(),
+            "move_page"
+        );
+        assert_eq!(
+            Command::DeletePage {
+                page: PageNumber::FIRST
+            }
+            .name(),
+            "delete_page"
+        );
+        assert_eq!(Command::Undo.name(), "undo");
+        assert_eq!(Command::Save.name(), "save");
+        assert_eq!(
+            Command::SaveAs {
+                path: PathBuf::from("out.pdf")
+            }
+            .name(),
+            "save_as"
+        );
     }
 
     #[test]

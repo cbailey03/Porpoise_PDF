@@ -6,7 +6,7 @@ See [GOALS.md](GOALS.md) for what we're building and
 [docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
 milestone plan.
 
-**Current state: Goals 1, 2 and 3 are complete.** Open a PDF, scroll it freely or page by page,
+**Current state: Goals 1 to 4 are complete.** Open a PDF, scroll it freely or page by page,
 navigate by keyboard, zoom by wheel, pinch, key, or fit mode, and pan sideways once a sheet is
 wider than the window. Pages rasterize on worker threads
 so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
@@ -20,6 +20,12 @@ damaged input averages 7 µs.
 Open a file with `Ctrl+O` or the **Open…** button, or pass a path on the command line. Launching with
 no path opens an empty window rather than refusing to start.
 
+Pages can be reordered and deleted, with undo, then written back with **Save** or to a new file with
+`save_as`. Nothing on disk changes until you save, and a save either completes or leaves the original
+untouched — it writes beside the file and renames into place. Documents whose page tree is nested are
+refused rather than reordered, because reordering one can silently change what pages inherit; all
+three drawing sets tested here are flat. See `docs/goal-4-plan.md` section 2.
+
 Rendering fidelity is validated against real documents and for determinism, not against another
 engine. Comparing output to PDFium is explicitly a non-goal: building this in pure Rust is the
 objective, so the C++ engine we declined is not the yardstick. See `docs/goal-1-plan.md`
@@ -30,6 +36,9 @@ sections 1 and 6a.
 | | |
 |---|---|
 | `Ctrl` `O` | Open a PDF |
+| `Ctrl` `↑` / `Ctrl` `↓` | Move this page earlier / later |
+| `Ctrl` `Z` | Undo the last page edit |
+| `Ctrl` `S` | Save over the original |
 | `PageDown` / `Space` | Next page, or next screenful in free mode |
 | `PageUp` / `Shift+Space` | Previous |
 | `Home` / `End` | First / last page |

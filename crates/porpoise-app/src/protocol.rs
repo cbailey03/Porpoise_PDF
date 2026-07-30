@@ -186,6 +186,25 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
             })
     };
 
+    // Page numbers count from 1, and `PageNumber` cannot hold zero, so `{"page":0}`
+    // and `{"page":-1}` are refused here rather than by a bounds check further in.
+    let page_argument = |field: &str| -> Result<PageNumber, DecodeFailure> {
+        let complain = |detail: String| {
+            DecodeError::BadArguments {
+                command: name.to_owned(),
+                detail,
+            }
+            .at(id)
+        };
+        let raw = object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| complain(format!("expected a positive integer \"{field}\"")))?;
+        let number =
+            usize::try_from(raw).map_err(|_| complain(format!("\"{field}\" is too big")))?;
+        PageNumber::new(number).ok_or_else(|| complain("page numbers start at 1".to_owned()))
+    };
+
     let body = match name {
         "snapshot" => RequestBody::Snapshot,
         "commands" => RequestBody::Commands,
@@ -196,6 +215,18 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
             path: path_argument("path")?,
         }),
         "close" => RequestBody::Command(Command::Close),
+        "move_page" => RequestBody::Command(Command::MovePage {
+            from: page_argument("from")?,
+            to: page_argument("to")?,
+        }),
+        "delete_page" => RequestBody::Command(Command::DeletePage {
+            page: page_argument("page")?,
+        }),
+        "undo" => RequestBody::Command(Command::Undo),
+        "save" => RequestBody::Command(Command::Save),
+        "save_as" => RequestBody::Command(Command::SaveAs {
+            path: path_argument("path")?,
+        }),
         "quit" => RequestBody::Command(Command::Quit),
         other => {
             // A view command is internally tagged on the same `command` field, so
@@ -243,6 +274,16 @@ pub(crate) struct Snapshot {
     /// Cleared by the next successful open or close.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_error: Option<String>,
+    /// Whether the page order differs from the file on disk.
+    pub(crate) unsaved_changes: bool,
+    /// Whether there is a page edit to undo.
+    pub(crate) can_undo: bool,
+    /// Where a save in flight is going, if one is running.
+    ///
+    /// A save takes about a second on a 400-page document, so a client needs to be
+    /// able to tell "not saved yet" from "saving right now".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) saving_to: Option<String>,
     /// Nothing queued, nothing in flight, everything visible is drawn.
     ///
     /// The most useful field here. An agent that scrolls and then captures without
@@ -282,6 +323,21 @@ pub(crate) enum Event {
         reason: String,
         /// Whether another attempt is coming.
         will_retry: bool,
+    },
+    /// The page order changed.
+    PagesReordered {
+        /// How many pages the document now shows.
+        page_count: usize,
+    },
+    /// The document was written out.
+    Saved {
+        /// Where it went.
+        path: String,
+    },
+    /// A save could not be completed. The original is untouched.
+    SaveFailed {
+        /// Why.
+        error: String,
     },
     /// A capture was written.
     Captured {
@@ -719,8 +775,14 @@ mod tests {
     fn the_commands_reply_advertises_every_command() {
         let reply = Reply::with_commands(None);
         let commands = reply.commands.expect("a command list");
-        assert_eq!(commands.len(), ViewCommand::ALL.len() + 4);
-        assert!(commands.contains(&"go_to_page"));
+        // Against `all_names` rather than a hardcoded count. The literal `+ 4` here
+        // failed the moment Goal 4 added five commands, which is the right failure but
+        // in the wrong place: `command.rs` already has the exhaustive-match check that
+        // makes the list trustworthy, so this only needs to confirm the reply carries
+        // the whole thing.
+        assert_eq!(commands.len(), Command::all_names().len());
+        assert!(commands.contains(&"go_to_page"), "missing a view command");
+        assert!(commands.contains(&"move_page"), "missing an edit command");
         assert!(commands.contains(&"quit"));
     }
 

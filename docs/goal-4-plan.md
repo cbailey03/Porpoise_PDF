@@ -1,6 +1,6 @@
 # Goal 4 — Reorganize pages and save
 
-Status: **in progress**. Milestones M14–M18 below.
+Status: **complete**. Milestones M14–M18 below.
 
 This is the first goal that writes to disk. Everything before it could be wrong and cost you nothing;
 this one can cost you a document. That shapes most of the decisions here.
@@ -90,11 +90,11 @@ where a working one used to be.
 
 | | | |
 |---|---|---|
-| **M14** | `PageOrder`: the permutation, undo, and its tests | |
-| **M15** | Writing a reordered PDF, proved by rendering it back | |
-| **M16** | Commands: move, delete, undo, save, save as | |
-| **M17** | The viewer shows the edited order | |
-| **M18** | Controls a person can actually use | |
+| **M14** | `PageOrder`: the permutation, undo, and its tests | ✅ |
+| **M15** | Writing a reordered PDF, proved by rendering it back | ✅ |
+| **M16** | Commands: move, delete, undo, save, save as | ✅ |
+| **M17** | The viewer shows the edited order | ✅ |
+| **M18** | Controls a person can actually use | ✅ |
 
 **M14.** Pure logic in `porpoise-doc`. Move, delete, undo, and the invariants: a position is always a
 valid source page, the last page cannot be deleted (a PDF with no pages is not a PDF), and undo
@@ -134,6 +134,31 @@ And **the file grows by about 3%**. `lopdf` rewrites every object with its own c
 preserving the original's, so this is expected rather than a leak. It does mean a save is not
 byte-identical even when the order is unchanged, which is a further reason saving an unedited
 document is refused rather than being a harmless no-op.
+
+## 5b. What building it changed
+
+**The cache was being pruned by the wrong kind of page number.** `retain_pages` kept textures whose
+key fell inside the visible *display* range — but the cache is keyed by *source* page. Before any
+edit the two are identical, so it was correct until the first reorder, at which point it would evict
+pages that are on screen and keep ones that are not. Caught while reading the paint loop, not by a
+test, and it is exactly the hazard §3 predicted: the fourth appearance in this project of two
+similar numbers that must not be confused.
+
+**`idle` is an edge, not a level, and that surprised the test I wrote.** The end-to-end test waited
+for `idle` after a `move_page` and hung for a minute. An edit takes effect in the frame that accepts
+it, and if it needs no new rasterization the program never leaves the settled state — so there is no
+falling edge and therefore no new `idle` event. The event is emitted on the *transition*. Clients
+should treat the snapshot's `idle` field as the level and the event as a notification, and wait on
+`pages_reordered` after an edit. Worth stating plainly because it is a natural thing to get wrong.
+
+**The arrow glyphs did not render.** `↑` and `↓` are missing from egui's bundled fonts and appeared
+as empty boxes in the toolbar. Found by looking at a capture of the real window; no test would have.
+They are the words *Up* and *Down* now.
+
+**Verified by hand on a real drawing set.** Moving sheet 10 of the GDOT plan to the front and saving
+over a copy: the window then showed *Traffic Control Plan (Shoulder Work), TCP-3* as page 1 of 10,
+the status bar said *unsaved changes* until the save finished, and the saved file reopened with the
+new order.
 
 ## 6. Known gaps
 

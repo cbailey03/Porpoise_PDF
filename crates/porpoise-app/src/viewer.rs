@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use porpoise_doc::Document;
+use porpoise_doc::{Document, Overwrite, PageGeometry, PageOrder};
 use porpoise_render::{HayroRenderer, RenderPool, RenderedPage};
 use porpoise_view::{
     CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PAGE_GAP_PT, PageCache, PageNumber, ScrollLayout,
@@ -63,9 +63,10 @@ use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
 };
 use crate::failure::Failure;
-use crate::input::{command_for_key, opens_the_picker};
+use crate::input::{EditKey, command_for_key, edit_for_key, opens_the_picker};
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
+use crate::saver::Saver;
 use crate::tiles::{FULL_UV, to_color_image};
 
 /// Byte budget for cached page textures.
@@ -114,6 +115,15 @@ const CAPTURE_BUDGET_FRAMES: u32 = 240;
 struct OpenDocument {
     path: PathBuf,
     document: Arc<Document>,
+    /// What order the pages are shown in. Identity until somebody edits it.
+    ///
+    /// Everything that rasterizes, caches or measures a page goes through this to turn
+    /// a *display position* into a *source page*. The two are the same only before the
+    /// first edit; see `porpoise-doc`'s `order` module for why that distinction gets
+    /// its own crossing point.
+    order: PageOrder,
+    /// Page positions laid out in a column. Rebuilt whenever [`Self::order`] changes,
+    /// because the column is in display order while geometry is in source order.
     layout: ScrollLayout,
     pool: RenderPool,
     cache: PageCache<egui::TextureHandle>,
@@ -126,10 +136,21 @@ struct OpenDocument {
     submitted_bucket: ZoomBucket,
 }
 
+/// Page sizes in display order, for laying out the scrolling column.
+fn geometry_in_display_order(document: &Document, order: &PageOrder) -> Vec<PageGeometry> {
+    order
+        .as_slice()
+        .iter()
+        .filter_map(|&source| document.geometry().get(source).copied())
+        .collect()
+}
+
 impl OpenDocument {
     fn new(path: PathBuf, document: Document, bucket: ZoomBucket) -> Self {
         let document = Arc::new(document);
-        let layout = ScrollLayout::vertical(document.geometry(), PAGE_GAP_PT);
+        let order = PageOrder::identity(document.page_count());
+        let layout =
+            ScrollLayout::vertical(&geometry_in_display_order(&document, &order), PAGE_GAP_PT);
         let pool = RenderPool::new(
             Arc::clone(&document),
             HayroRenderer::new(),
@@ -139,6 +160,7 @@ impl OpenDocument {
         Self {
             path,
             document,
+            order,
             layout,
             pool,
             cache: PageCache::new(TEXTURE_BUDGET_BYTES),
@@ -146,6 +168,19 @@ impl OpenDocument {
             failures: HashMap::new(),
             submitted_bucket: bucket,
         }
+    }
+
+    /// Rebuilds the column after an edit.
+    ///
+    /// The layout is in display order and the document's geometry is in source order,
+    /// so any change to [`Self::order`] makes the column wrong until this runs. Cached
+    /// textures are deliberately *not* touched: they are keyed by source page, so
+    /// moving page 300 to the front costs nothing to redraw.
+    fn relayout(&mut self) {
+        self.layout = ScrollLayout::vertical(
+            &geometry_in_display_order(&self.document, &self.order),
+            PAGE_GAP_PT,
+        );
     }
 
     /// Whether every requested page has arrived and nothing is outstanding.
@@ -245,6 +280,9 @@ struct Viewer {
     /// The system file dialog, when one is open. See [`crate::picker`].
     picker: FilePicker,
 
+    /// A save in flight, if any. See [`crate::saver`] for why it is not inline.
+    saver: Saver,
+
     /// Why the last command failed, for the person to read.
     ///
     /// Failures used to go only to `tracing::warn!`, which for a windowed app means
@@ -311,6 +349,7 @@ impl Viewer {
             start_page: options.start_page,
             applied_start_page: false,
             picker: FilePicker::default(),
+            saver: Saver::default(),
             last_error: None,
             frame: 0,
             benchmark,
@@ -383,6 +422,15 @@ impl Viewer {
             renders_in_flight: self.open.as_ref().map_or(0, |open| open.in_flight.len()),
             failed_pages,
             last_error: self.last_error.clone(),
+            unsaved_changes: self
+                .open
+                .as_ref()
+                .is_some_and(|open| !open.order.is_unedited()),
+            can_undo: self.open.as_ref().is_some_and(|open| open.order.can_undo()),
+            saving_to: self
+                .saver
+                .destination()
+                .map(|path| path.display().to_string()),
             idle: self.settled(),
         }
     }
@@ -405,7 +453,11 @@ impl Viewer {
     fn settled(&self) -> bool {
         let no_pending_move = self.state.requested_scroll_pt().is_none()
             && self.state.requested_scroll_left_pt().is_none();
-        no_pending_move && self.open.as_ref().is_none_or(OpenDocument::settled)
+        // A save in flight is outstanding work too. Reporting idle during one would
+        // let a client read the file before it exists.
+        no_pending_move
+            && !self.saver.is_busy()
+            && self.open.as_ref().is_none_or(OpenDocument::settled)
     }
 
     // --- Control channel ----------------------------------------------------
@@ -503,6 +555,60 @@ impl Viewer {
         result
     }
 
+    /// Applies a page edit and rebuilds what depends on the order.
+    ///
+    /// One place for all of them, because every edit has the same three consequences:
+    /// the column has to be laid out again, the scroll position may now be past the end
+    /// of a shorter document, and an unchanged order is `Unchanged` rather than an
+    /// error. Missing any of those in one command and not another is exactly how the
+    /// view and the document drift apart.
+    fn edit(&mut self, change: impl FnOnce(&mut PageOrder) -> bool) -> DispatchResult {
+        let Some(open) = &mut self.open else {
+            return DispatchResult::Failed("nothing is open".to_owned());
+        };
+        if !change(&mut open.order) {
+            return DispatchResult::Unchanged;
+        }
+        open.relayout();
+        let pages = open.order.len();
+
+        // Deleting pages can leave the viewport past the end of the document. Clamping
+        // through the normal command keeps one definition of "how far can we scroll".
+        let here = self.state.scroll_top_pt();
+        porpoise_view::apply(
+            &mut self.state,
+            Self::layout_of(&self.open),
+            self.viewport,
+            ViewCommand::ScrollTo { points: here },
+        );
+        self.emit(|| Event::PagesReordered { page_count: pages });
+        DispatchResult::Edited
+    }
+
+    /// Starts writing the document out, off the UI thread.
+    fn begin_save(&mut self, destination: PathBuf, overwrite: Overwrite) -> DispatchResult {
+        let Some(open) = &self.open else {
+            return DispatchResult::Failed("nothing is open".to_owned());
+        };
+        if self.saver.is_busy() {
+            return DispatchResult::Failed("a save is already running".to_owned());
+        }
+        // Saving an unedited document over itself would rewrite the file for no gain —
+        // and not even byte-identically, since the writer makes its own choices about
+        // object encoding. See `docs/goal-4-plan.md` §5a.
+        if open.order.is_unedited() && destination == open.path {
+            return DispatchResult::Unchanged;
+        }
+        if self
+            .saver
+            .start(&open.path, &open.order, &destination, overwrite)
+        {
+            DispatchResult::Saving
+        } else {
+            DispatchResult::Failed("a save is already running".to_owned())
+        }
+    }
+
     fn carry_out(&mut self, ctx: &egui::Context, command: Command) -> DispatchResult {
         match command {
             Command::View(view) => {
@@ -539,6 +645,19 @@ impl Viewer {
                 self.emit(|| Event::DocumentClosed);
                 DispatchResult::Closed
             }
+            Command::MovePage { from, to } => {
+                self.edit(|order| order.move_page(from.index(), to.index()))
+            }
+            Command::DeletePage { page } => self.edit(|order| order.remove(page.index())),
+            Command::Undo => self.edit(PageOrder::undo),
+            Command::Save => {
+                let Some(open) = &self.open else {
+                    return DispatchResult::Failed("nothing is open".to_owned());
+                };
+                let destination = open.path.clone();
+                self.begin_save(destination, Overwrite::Allow)
+            }
+            Command::SaveAs { path } => self.begin_save(path, Overwrite::Refuse),
             Command::Capture { path } => {
                 // Clear any previous result, so "the slot holds the outcome of the
                 // most recent capture" is true by construction rather than by an
@@ -615,8 +734,63 @@ impl Viewer {
                 self.picker.open();
                 continue;
             }
+            // Page edits are handled here rather than in `command_for_key` because
+            // they need to know which page is on screen, and that function is pure by
+            // design. It decides *what was asked for*; this turns it into a command.
+            if let Some(edit) = edit_for_key(key, modifiers) {
+                if let Some(command) = self.command_for_edit(edit) {
+                    self.dispatch(ctx, command);
+                }
+                continue;
+            }
             if let Some(command) = command_for_key(key, modifiers, mode) {
                 self.dispatch(ctx, command);
+            }
+        }
+    }
+
+    /// Turns a page-edit key press into a command against the page on screen.
+    ///
+    /// `None` when the edit does not apply — the first page cannot move earlier, and
+    /// nothing can be edited with no document open. Returning `None` rather than
+    /// dispatching a command that would be refused keeps the control channel's
+    /// `unchanged` replies meaning "you asked for something already true" rather than
+    /// "a key did nothing".
+    fn command_for_edit(&self, edit: EditKey) -> Option<Command> {
+        let open = self.open.as_ref()?;
+        let here = PageNumber::from_index(self.view().current_page());
+        match edit {
+            EditKey::MoveEarlier => Some(Command::MovePage {
+                from: here,
+                to: PageNumber::new(here.get().checked_sub(1)?)?,
+            }),
+            EditKey::MoveLater if here.get() < open.order.len() => Some(Command::MovePage {
+                from: here,
+                to: PageNumber::new(here.get() + 1)?,
+            }),
+            EditKey::MoveLater => None,
+            EditKey::Undo => Some(Command::Undo),
+            EditKey::Save => Some(Command::Save),
+        }
+    }
+
+    /// Reports a finished save. Never blocks.
+    fn collect_save(&mut self) {
+        let Some(saved) = self.saver.poll() else {
+            return;
+        };
+        let where_to = saved.path.display().to_string();
+        match saved.error {
+            None => {
+                self.last_error = None;
+                self.emit(|| Event::Saved { path: where_to });
+            }
+            Some(error) => {
+                tracing::warn!(path = %saved.path.display(), %error, "could not save");
+                // Visible, not just logged. A save that quietly failed would leave
+                // somebody believing their reordering is on disk.
+                self.last_error = Some(error.clone());
+                self.emit(|| Event::SaveFailed { error });
             }
         }
     }
@@ -742,11 +916,17 @@ impl Viewer {
             open.submitted_bucket = bucket;
         }
 
-        let order = request_order(visible, PREFETCH_PAGES, open.layout.page_count());
+        let wanted = request_order(visible, PREFETCH_PAGES, open.layout.page_count());
         let scale = bucket.scale() * pixels_per_point;
         let tag = i64::from(bucket.rung());
 
-        for page in order {
+        for position in wanted {
+            // `request_order` works in display positions, because that is what the
+            // layout and the viewport are in. The renderer and the cache work in source
+            // pages, so this is where the two meet.
+            let Some(page) = open.order.source_of(position) else {
+                continue;
+            };
             let key = CacheKey::new(page, bucket);
             if open.cache.contains(key) || open.in_flight.contains(&key) {
                 continue;
@@ -929,8 +1109,13 @@ impl Viewer {
             // layout and geometry immutably.
             let tiles: Vec<(usize, egui::Rect, Option<egui::TextureId>)> = visible
                 .clone()
-                .filter_map(|page| {
-                    let top_pt = open.layout.page_top_pt(page)?;
+                .filter_map(|position| {
+                    // `position` is where the page sits in the column; `page` is which
+                    // page of the source document that is. They differ after any edit,
+                    // so the layout is asked in positions and the geometry, cache and
+                    // renderer in source pages.
+                    let page = open.order.source_of(position)?;
+                    let top_pt = open.layout.page_top_pt(position)?;
                     let geometry = open.document.geometry().get(page).copied()?;
 
                     #[expect(
@@ -960,9 +1145,18 @@ impl Viewer {
             }
 
             // Keep memory proportional to the viewport rather than the document.
+            //
+            // The window is a range of display *positions*, and the cache is keyed by
+            // *source* page — so the positions have to be resolved before comparing.
+            // Comparing the two directly evicts textures for pages that are on screen
+            // and keeps ones that are not, which after a reorder shows up as pages
+            // flashing grey while scrolling near an edit.
             let low = visible.start.saturating_sub(RETAIN_PAGES);
             let high = visible.end.saturating_add(RETAIN_PAGES);
-            open.cache.retain_pages(|page| (low..high).contains(&page));
+            let keep: Vec<usize> = (low..high)
+                .filter_map(|position| open.order.source_of(position))
+                .collect();
+            open.cache.retain_pages(|page| keep.contains(&page));
         });
 
         // Keep frames coming while anything is still being drawn.
@@ -997,6 +1191,62 @@ impl Viewer {
             }
             if ui.button("⏭").on_hover_text("Last page (End)").clicked() {
                 issued.push(ViewCommand::LastPage.into());
+            }
+            ui.separator();
+
+            // Page editing. Every one of these produces the same command an agent
+            // would send, so there is nothing here a script cannot do.
+            let here = PageNumber::from_index(self.view().current_page());
+            let pages = self.open.as_ref().map_or(0, |open| open.order.len());
+            let can_edit = pages > 0;
+
+            if ui
+                .add_enabled(can_edit && here.get() > 1, egui::Button::new("Up"))
+                // Words, not arrow glyphs. U+2191/U+2193 are missing from egui's
+                // bundled fonts and rendered as empty boxes -- caught by looking at a
+                // capture of the real toolbar rather than by any test.
+                .on_hover_text("Move this page earlier (Ctrl+Up)")
+                .clicked()
+                && let Some(to) = PageNumber::new(here.get() - 1)
+            {
+                issued.push(Command::MovePage { from: here, to });
+            }
+            if ui
+                .add_enabled(can_edit && here.get() < pages, egui::Button::new("Down"))
+                .on_hover_text("Move this page later (Ctrl+Down)")
+                .clicked()
+                && let Some(to) = PageNumber::new(here.get() + 1)
+            {
+                issued.push(Command::MovePage { from: here, to });
+            }
+            if ui
+                .add_enabled(pages > 1, egui::Button::new("Delete"))
+                .on_hover_text("Delete this page")
+                .clicked()
+            {
+                issued.push(Command::DeletePage { page: here });
+            }
+            if ui
+                .add_enabled(
+                    self.open.as_ref().is_some_and(|open| open.order.can_undo()),
+                    egui::Button::new("Undo"),
+                )
+                .on_hover_text("Undo the last page edit (Ctrl+Z)")
+                .clicked()
+            {
+                issued.push(Command::Undo);
+            }
+
+            let edited = self
+                .open
+                .as_ref()
+                .is_some_and(|open| !open.order.is_unedited());
+            if ui
+                .add_enabled(edited && !self.saver.is_busy(), egui::Button::new("Save"))
+                .on_hover_text("Write the changes over the original (Ctrl+S)")
+                .clicked()
+            {
+                issued.push(Command::Save);
             }
             ui.separator();
 
@@ -1110,6 +1360,25 @@ impl Viewer {
                 }
             }
 
+            // Editing state, before the error, so a save failure reads next to it.
+            if let Some(destination) = self.saver.destination() {
+                ui.separator();
+                ui.label(format!(
+                    "saving to {}…",
+                    destination.file_name().map_or_else(
+                        || destination.display().to_string(),
+                        |name| name.to_string_lossy().into_owned()
+                    )
+                ));
+            } else if self
+                .open
+                .as_ref()
+                .is_some_and(|open| !open.order.is_unedited())
+            {
+                ui.separator();
+                ui.colored_label(ui.visuals().warn_fg_color, "unsaved changes");
+            }
+
             // Last, and on every path: a failure with no document open is exactly the
             // case the picker creates, so it must not live inside the `Some` arm.
             if let Some(error) = &self.last_error {
@@ -1191,6 +1460,12 @@ enum DispatchResult {
     Opened,
     Closed,
     CaptureStarted,
+    /// A page edit took effect. The file on disk is unchanged.
+    Edited,
+    /// A save has *started*. Like a capture, the file does not exist yet.
+    Saving,
+    /// The command asked for something that was already true.
+    Unchanged,
     Quitting,
     Failed(String),
 }
@@ -1209,6 +1484,12 @@ impl DispatchResult {
             // this as completion would read a file that is not there yet, so it has
             // to wait for the `captured` event.
             Self::CaptureStarted => Reply::ok(id, "capturing"),
+            Self::Edited => Reply::ok(id, "edited"),
+            // Started, not finished. A 400-page save takes about a second, so an agent
+            // that treated this as completion would read a file that is not there yet;
+            // it has to wait for the `saved` event or for `idle`.
+            Self::Saving => Reply::ok(id, "saving"),
+            Self::Unchanged => Reply::ok(id, "unchanged"),
             Self::Quitting => Reply::ok(id, "quitting"),
             Self::Failed(error) => Reply::failed(id, error),
         }
@@ -1229,6 +1510,7 @@ impl eframe::App for Viewer {
         let started = Instant::now();
         self.collect_renders(ctx);
         self.collect_picked_file(ctx);
+        self.collect_save();
         self.handle_input(ctx);
         self.serve_control(ctx);
         self.timing.logic_ms = started.elapsed().as_secs_f32() * 1000.0;

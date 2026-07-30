@@ -187,8 +187,12 @@ the snapshot.
 **What is not tested:** the drag itself. egui's drag-and-drop cannot be driven from the control
 channel, so "picking up a thumbnail and dropping it two slots over" has no automated test. The seam is
 placed so that everything either side is covered — the grid's arithmetic has unit tests, `MovePage` has
-end-to-end tests, and `set_thumbnails` has one — but the gesture connecting them was verified by
-looking at a capture of the real window and needs a person to confirm it feels right.
+end-to-end tests, and `set_thumbnails` has one — but the gesture connecting them can only be checked by
+a person.
+
+Confirmed by hand: pages land where you expect when you let go. That is the whole of the evidence for
+this one, and it will stay that way unless a way to inject synthetic pointer events arrives — worth
+remembering if the drop behaviour is ever changed, because nothing will fail if it breaks.
 
 ## 6. Known gaps
 

@@ -1010,6 +1010,92 @@ fn closing_stdin_shuts_the_program_down() {
     assert!(status.success(), "exited with {status}");
 }
 
+#[test]
+fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
+    let Some(_window) =
+        e2e("paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page")
+    else {
+        return;
+    };
+
+    // A regression a person found before any test did. The last page's top sits at
+    // `content_height - page_height` and scrolling stops at `content_height -
+    // viewport_height`, so once the window is TALLER than a page, the last page's top is
+    // past the end of the scroll range: it can fill the window and still never be the page
+    // you are "on". The counter stuck at 5 of 6 and PageDown did nothing.
+    //
+    // The fixture's pages are 300 pt, so this zooms until the window covers slightly more
+    // than one of them. Every other test here runs at fit-width, where the window is
+    // *shorter* than a page — which is exactly why none of them caught it.
+    let document = fixture("e2e-paged-end.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let id = serve.send("set_scroll_mode", &[("mode", Value::from("paged"))]);
+    serve.reply_to(id);
+    let id = serve.send(
+        "set_zoom",
+        &[("target", serde_json::json!({ "fixed": 2.3 }))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let view = serve.view();
+    let content = view
+        .get("content_height_pt")
+        .and_then(Value::as_f64)
+        .expect("a content height");
+    let max_scroll = view
+        .get("max_scroll_pt")
+        .and_then(Value::as_f64)
+        .expect("a scroll limit");
+    let viewport_pt = content - max_scroll;
+    assert!(
+        viewport_pt > 300.0,
+        "the window is not taller than a page, so this cannot reproduce: {viewport_pt} pt"
+    );
+
+    // Step forward past the end. Paged mode advances one page at a time, so more steps
+    // than pages guarantees arrival.
+    for _ in 0..PAGES + 2 {
+        let id = serve.send("next_page", &[]);
+        serve.reply_to(id);
+    }
+    let view = serve.view();
+    assert_eq!(
+        view.get("current_page").and_then(Value::as_u64),
+        Some(PAGES as u64),
+        "paged navigation stalled short of the last page: {view}"
+    );
+
+    // And the direct jump agrees with the walk.
+    let id = serve.send("first_page", &[]);
+    serve.reply_to(id);
+    let id = serve.send("last_page", &[]);
+    serve.reply_to(id);
+    let view = serve.view();
+    assert_eq!(
+        view.get("current_page").and_then(Value::as_u64),
+        Some(PAGES as u64),
+        "last_page did not land on the last page: {view}"
+    );
+
+    // Going back from the end moves exactly one page, rather than skipping one because the
+    // end of the document reported the page before it.
+    let id = serve.send("previous_page", &[]);
+    serve.reply_to(id);
+    let view = serve.view();
+    assert_eq!(
+        view.get("current_page").and_then(Value::as_u64),
+        Some(PAGES as u64 - 1),
+        "going back from the end skipped a page: {view}"
+    );
+
+    serve.quit();
+}
+
 // --- Unsaved page changes ---------------------------------------------------
 //
 // The guard sits in front of dispatch rather than on the X button, and these tests are

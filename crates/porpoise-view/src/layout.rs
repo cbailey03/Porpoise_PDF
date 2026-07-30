@@ -122,6 +122,67 @@ impl ScrollLayout {
         self.bottoms.get(index).copied()
     }
 
+    /// Which page the view is *on*, for a viewport of `viewport_height_pt` whose top edge
+    /// is at `viewport_top_pt`. `None` only when the document has no pages.
+    ///
+    /// The first visible page showing **at least half of as much of itself as it possibly
+    /// could** — half of `min(page height, viewport height)` — falling back to the topmost
+    /// visible page when none qualifies.
+    ///
+    /// # Why not simply the topmost visible page
+    ///
+    /// That was the rule until it produced a reachability bug, and the bug is worth
+    /// recording because the arithmetic is not obvious.
+    ///
+    /// The last page's top sits at `content_height - last_page_height`, and scrolling
+    /// stops at `content_height - viewport_height`. So when **the viewport is taller than
+    /// the last page**, the last page's top is past the end of the scroll range: you can
+    /// see the whole page, but you can never put its top edge at the top of the window.
+    /// Under the topmost-visible rule the previous page went on claiming the view from a
+    /// sliver at the top — so the page counter never reached the end of the document, and
+    /// paged navigation stopped one page early with nothing to explain why.
+    ///
+    /// Measured on a 10-page drawing set of 792 pt pages: at fit-width in a 1024x768
+    /// window the viewport is 865 pt, and page 10 showed 792 pt of itself while page 9
+    /// showed 61 pt and won.
+    ///
+    /// # Why *half of what it could show*, rather than an absolute size
+    ///
+    /// Because it keeps the property the topmost rule was chosen for. Navigating to a page
+    /// puts its top at the window's top, which shows the most of it that geometry allows —
+    /// twice the threshold, whatever the zoom, page size or window. So *"go to page N, then
+    /// ask which page we are on"* still answers N exactly, which is the round trip every
+    /// client depends on. "Most visible page" does not survive that test with pages of
+    /// mixed heights, and an absolute threshold would not survive zooming.
+    #[must_use]
+    pub fn current_page(&self, viewport_top_pt: f64, viewport_height_pt: f64) -> Option<usize> {
+        if self.tops.is_empty() {
+            return None;
+        }
+        let visible = self.visible_pages(viewport_top_pt, viewport_height_pt);
+        let Some(topmost) = visible.clone().next() else {
+            // Nothing on screen: a zero-height or degenerate viewport. Answer with
+            // whatever page the top edge is inside rather than with nothing.
+            return self.page_at_pt(viewport_top_pt);
+        };
+
+        let viewport_bottom_pt = viewport_top_pt + viewport_height_pt;
+        for index in visible {
+            let (Some(&top), Some(&bottom)) = (self.tops.get(index), self.bottoms.get(index))
+            else {
+                break;
+            };
+            let shown = (bottom.min(viewport_bottom_pt) - top.max(viewport_top_pt)).max(0.0);
+            let most_it_could_show = (bottom - top).min(viewport_height_pt);
+            // Doubled rather than halved, so a zero-height page still qualifies instead of
+            // dividing by nothing.
+            if shown * 2.0 >= most_it_could_show {
+                return Some(index);
+            }
+        }
+        Some(topmost)
+    }
+
     /// The pages intersecting a viewport of `viewport_height_pt` whose top edge
     /// is at `viewport_top_pt`.
     ///
@@ -224,6 +285,145 @@ mod tests {
     /// US Letter at 72 DPI.
     fn letter() -> PageGeometry {
         page(612.0, 792.0)
+    }
+
+    // --- Which page the view is on -------------------------------------------
+
+    /// The drawing set the regression was found on: 10 landscape sheets, 12 pt gaps.
+    fn ten_sheets() -> ScrollLayout {
+        ScrollLayout::vertical(&[page(1224.0, 792.0); 10], 12.0)
+    }
+
+    #[test]
+    fn the_last_page_is_reachable_when_the_window_is_taller_than_it() {
+        // The regression, in the arithmetic that produced it. A 1024x768 window at
+        // fit-width on these sheets gives an 865 pt viewport against 792 pt pages, so the
+        // last page's top (7236) sits past where scrolling stops (7162.6). Under the old
+        // "topmost visible page" rule, page 9 kept the view from a 61 pt sliver and the
+        // counter never reached 10.
+        let layout = ten_sheets();
+        let viewport = 865.4;
+        let max_scroll = layout.content_height_pt() - viewport;
+        assert!(
+            layout.page_top_pt(9).expect("ten pages") > max_scroll,
+            "the fixture no longer reproduces the condition"
+        );
+        assert_eq!(
+            layout.current_page(max_scroll, viewport),
+            Some(9),
+            "scrolled to the very bottom and still not on the last page"
+        );
+    }
+
+    #[test]
+    fn a_sliver_of_the_page_above_does_not_claim_the_view() {
+        // The same shape anywhere in the document, not only at the end.
+        let layout = ten_sheets();
+        let viewport = 865.4;
+        // One point below page 5's top, so page 4 shows a single point.
+        let top = layout.page_top_pt(4).expect("ten pages") - 1.0;
+        assert_eq!(layout.current_page(top, viewport), Some(4));
+    }
+
+    #[test]
+    fn most_of_the_top_page_showing_keeps_it_current() {
+        // The other side of the same rule, and the case a naive fix gets wrong: when the
+        // page above still fills most of the window, it is still the page you are on even
+        // though the next one has appeared at the bottom.
+        let layout = ten_sheets();
+        let viewport = 865.4;
+        let top = layout.page_top_pt(8).expect("ten pages") + 68.0;
+        let visible = layout.visible_pages(top, viewport);
+        assert!(visible.contains(&9), "page 10 should have come into view");
+        assert_eq!(
+            layout.current_page(top, viewport),
+            Some(8),
+            "gave the view away to a page that has only just appeared"
+        );
+    }
+
+    #[test]
+    fn going_to_a_page_reports_that_page_whatever_the_window() {
+        // The property both rejected definitions broke, checked across window heights
+        // that span "shorter than a page" to "several pages tall". Navigating puts the
+        // page's top at the window's top, which shows the most of it geometry allows — so
+        // this has to hold by construction, not by luck.
+        let layout = ten_sheets();
+        for viewport in [100.0, 396.0, 792.0, 865.4, 1000.0, 1600.0] {
+            let max_scroll = layout.content_height_pt() - viewport;
+            for index in 0..10 {
+                let top = layout.page_top_pt(index).expect("ten pages");
+                // Only pages the view can actually be scrolled to; past that the clamp
+                // decides where you end up, not this rule.
+                if top > max_scroll {
+                    continue;
+                }
+                assert_eq!(
+                    layout.current_page(top, viewport),
+                    Some(index),
+                    "viewport {viewport} pt: went to page {index} and was told otherwise"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn going_to_a_page_reports_it_with_pages_of_mixed_heights() {
+        // "Most visible page" fails here, which is why it was not the fix: a short page
+        // followed by a tall one has the tall one occupying more of the window.
+        let layout = ScrollLayout::vertical(
+            &[
+                page(612.0, 200.0),
+                page(612.0, 900.0),
+                page(612.0, 300.0),
+                page(612.0, 900.0),
+            ],
+            12.0,
+        );
+        let viewport = 1000.0;
+        for index in 0..4 {
+            let top = layout.page_top_pt(index).expect("four pages");
+            if top > layout.content_height_pt() - viewport {
+                continue;
+            }
+            assert_eq!(layout.current_page(top, viewport), Some(index));
+        }
+    }
+
+    #[test]
+    fn an_empty_document_is_on_no_page() {
+        let empty = ScrollLayout::vertical(&[], 12.0);
+        assert_eq!(empty.current_page(0.0, 800.0), None);
+    }
+
+    #[test]
+    fn a_degenerate_window_still_names_a_page() {
+        // Zero height, or a nonsense height, sees no pages at all — but "which page are we
+        // on" still has to answer something, or the status bar would go blank on a window
+        // that has been resized to nothing.
+        let layout = ten_sheets();
+        for viewport in [0.0, -10.0, f64::NAN, f64::INFINITY] {
+            let answer = layout.current_page(3000.0, viewport);
+            assert!(
+                answer.is_some_and(|index| index < 10),
+                "viewport {viewport} gave {answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_height_page_does_not_claim_the_view_or_divide_by_nothing() {
+        // A malformed PDF can report a page with no height. It covers no part of the
+        // window, so `visible_pages` rightly leaves it out and the answer is the real page
+        // beside it — the point here is that the "half of what it could show" comparison
+        // does not divide by its zero height on the way to that answer.
+        let layout = ScrollLayout::vertical(&[page(612.0, 0.0), letter()], 12.0);
+        assert_eq!(layout.current_page(0.0, 800.0), Some(1));
+
+        // And with one in the middle, where it *is* inside the window's span.
+        let layout = ScrollLayout::vertical(&[letter(), page(612.0, 0.0), letter()], 12.0);
+        let answer = layout.current_page(0.0, 900.0);
+        assert!(answer.is_some_and(|index| index < 3), "{answer:?}");
     }
 
     #[test]

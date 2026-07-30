@@ -236,7 +236,7 @@ impl View<'_> {
             .visible_pages(self.state.scroll_top_pt, self.visible_height_pt())
     }
 
-    /// The topmost page on screen, as a zero-based index.
+    /// The page the view is on, as a zero-based index.
     ///
     /// An index rather than a [`PageNumber`] because callers here use it to reach
     /// into the layout and the cache. [`ViewSnapshot::current_page`] is the same
@@ -245,23 +245,27 @@ impl View<'_> {
     /// Derived from where the view *actually is*, not from a pending request, so
     /// this always describes what a person can see.
     ///
-    /// # Why the top and not the centre
+    /// # The definition, and two rejected ones
     ///
-    /// This was originally the page under the viewport's centre, which reads well
-    /// in a status bar and is wrong in a way that matters. A viewport taller than a
-    /// page — a small page, or a wide window at fit-width — has its centre inside
-    /// the *next* page, so `GoToPage(3)` followed by reading this returned 4. The
-    /// end-to-end control test caught it immediately, because that round trip is the
-    /// first thing an agent depends on.
+    /// [`ScrollLayout::current_page`] owns the rule and explains it: the first visible
+    /// page showing at least half of as much of itself as it could. Two simpler rules were
+    /// tried first and both broke the one property that matters — that navigating to a page
+    /// and then asking where you are agree.
     ///
-    /// "Most visible page" has the same flaw: after `GoToPage(N)` with three pages
-    /// on screen, page N+1 can occupy more of the view than N does. Anchoring to the
-    /// top is the only definition under which navigating somewhere and asking where
-    /// you are agree.
+    /// **The viewport's centre** reads well in a status bar and is wrong in a way that
+    /// matters: a viewport taller than a page has its centre inside the *next* page, so
+    /// `GoToPage(3)` then reading this returned 4. The end-to-end control test caught that
+    /// immediately.
+    ///
+    /// **The topmost visible page** replaced it and held until the units fix made the
+    /// viewport's height honest. Then, on any document whose pages are shorter than the
+    /// window, the last page became unreachable — see `ScrollLayout::current_page` for the
+    /// arithmetic. That was a real regression a person hit before any test did.
     #[must_use]
     pub fn current_page(&self) -> usize {
-        let last = self.layout.page_count().saturating_sub(1);
-        self.visible_pages().start.min(last)
+        self.layout
+            .current_page(self.state.scroll_top_pt, self.visible_height_pt())
+            .unwrap_or(0)
     }
 
     /// The furthest the view can scroll before running out of document.
@@ -498,7 +502,17 @@ fn step_page(
     }
     // Navigation works from the *effective* position so that a batch of commands
     // in one frame composes; see `ViewState::effective_scroll_pt`.
-    let from = layout.page_at_pt(state.effective_scroll_pt()).unwrap_or(0);
+    //
+    // The same rule the status bar reads, deliberately. This used to ask
+    // `page_at_pt` — which page contains the top edge — and that is a different
+    // question: at the end of a document the top edge is inside the second-to-last
+    // page even when the last page fills the window. So "next page" targeted a page
+    // it was already showing, the scroll clamped, and nothing happened. Two answers
+    // to one question, and paged navigation stopped a page early because of it.
+    let viewport_height_pt = state.with(layout, viewport).visible_height_pt();
+    let from = layout
+        .current_page(state.effective_scroll_pt(), viewport_height_pt)
+        .unwrap_or(0);
     let target = if delta >= 0 {
         from.saturating_add(delta.unsigned_abs())
     } else {
@@ -1256,6 +1270,85 @@ mod tests {
     }
 
     // --- Derived values ------------------------------------------------------
+
+    /// The shape the regression needed: pages *shorter* than the window.
+    ///
+    /// Every other test here uses a viewport half a page tall, which is exactly why none
+    /// of them caught it — the condition is the opposite one.
+    fn short_pages_in_a_tall_window() -> (ScrollLayout, Viewport) {
+        // Ten 792 pt sheets with 12 pt gaps, and a window that covers 865 pt of them at
+        // zoom 1.0. Matches a 1024x768 window at fit-width on a landscape drawing set.
+        let sheet = PageGeometry {
+            width_pt: 1224.0,
+            height_pt: 792.0,
+        };
+        let layout = ScrollLayout::vertical(&[sheet; 10], 12.0);
+        (layout, Viewport::new(1224.0, 865.4))
+    }
+
+    #[test]
+    fn paged_navigation_reaches_the_last_page_when_it_is_shorter_than_the_window() {
+        // The regression a person found before any test did. The last page's top sits past
+        // where scrolling stops, so it can be fully on screen and still never be the page
+        // you are "on" — which left the counter stuck at 9 of 10 and PageDown doing
+        // nothing. See `ScrollLayout::current_page`.
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+
+        assert_eq!(
+            run_and_settle(&mut state, ViewCommand::LastPage),
+            Outcome::Changed
+        );
+        assert_eq!(
+            state.with(&layout, viewport).current_page(),
+            9,
+            "last_page did not land on the last page"
+        );
+    }
+
+    #[test]
+    fn next_page_walks_all_the_way_to_the_end_of_a_short_paged_document() {
+        // The other half of what a person sees: stepping forward has to arrive at the last
+        // page rather than stalling one short of it. `step_page` used to ask which page
+        // contained the top edge, which is a different question at the end of a document.
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+
+        let mut reached = vec![state.with(&layout, viewport).current_page()];
+        for _ in 0..12 {
+            run_and_settle(&mut state, ViewCommand::NextPage);
+            reached.push(state.with(&layout, viewport).current_page());
+        }
+        assert_eq!(
+            reached.last(),
+            Some(&9),
+            "next_page never arrived at the last page: {reached:?}"
+        );
+        // And it visited every page on the way rather than skipping one.
+        for index in 0..10 {
+            assert!(
+                reached.contains(&index),
+                "page {index} was skipped: {reached:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn previous_page_from_the_end_goes_back_exactly_one_page() {
+        // The symptom that came with it: because the end of the document reported the
+        // second-to-last page, going back from there skipped a page.
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+
+        run_and_settle(&mut state, ViewCommand::LastPage);
+        assert_eq!(state.with(&layout, viewport).current_page(), 9);
+        run_and_settle(&mut state, ViewCommand::PreviousPage);
+        assert_eq!(
+            state.with(&layout, viewport).current_page(),
+            8,
+            "going back from the end skipped a page"
+        );
+    }
 
     #[test]
     fn current_page_is_the_topmost_page_on_screen() {

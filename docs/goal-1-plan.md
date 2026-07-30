@@ -468,6 +468,63 @@ unexplained, though `ui` time at its worst is 0.24 ms, so it is still not our co
 doctests anywhere in the workspace — the prose is thorough but nothing compiles it, so it can drift
 the same way §3 and §5 just did.
 
+## 6c. Regression: paged scrolling could not reach the last page (2026-07-30)
+
+Reported by a person using the program, not by a test. In paged mode the counter stuck one short of
+the end — *page 9 of 10* — and `PageDown` did nothing, while the last sheet sat fully visible on
+screen.
+
+### The arithmetic
+
+Scrolling stops at `content_height - viewport_height`. The last page's top is at
+`content_height - last_page_height`. So the moment **the window is taller than a page**, the last
+page's top is *past the end of the scroll range*: you can see all of it, and you can never put its
+top edge at the top of the window.
+
+`current_page` was "the topmost page overlapping the viewport". At the bottom of the document the
+previous page still overlaps by a sliver, so it kept the view. Measured on `ROLT14_GDOT-U_6.pdf`:
+
+| Zoom | Viewport | Scroll stops at | Last page's top | Reported |
+|---|---|---|---|---|
+| fit-width | 865 pt | 7162.6 | 7236.0 | page 9 ❌ |
+| 1.0 | 724 pt | 7304.0 | 7236.0 | page 10 ✅ |
+
+Fit-width is the default, and these are 792 pt sheets in a 1024x768 window — so it was broken by
+default on every landscape drawing set and correct as soon as you zoomed in. That is why it read as
+a regression rather than as a missing feature.
+
+### What introduced it
+
+`1c43f6e`, the fix that stopped screen pixels being used as PDF points. Before it, the viewport's
+height was taken as 724 *points* at every zoom, and 724 < 792 — so the last page happened to be
+reachable. **The units fix was correct and exposed a latent bug**: the third time in this project
+that something unreachable turned out to be mishandled the moment it became reachable.
+
+### The fix, and two definitions that do not work
+
+`current_page` is now **the first visible page showing at least half of as much of itself as it
+possibly could** — half of `min(page height, viewport height)` — falling back to the topmost visible
+page. `ScrollLayout::current_page` owns it, and `step_page` reads the same function, which is what
+makes forward and backward stepping agree with the counter.
+
+- **The viewport's centre** was the original rule. A window taller than a page has its centre in the
+  *next* page, so `GoToPage(3)` reported 4.
+- **Most visible page** fails with pages of mixed heights: a short page followed by a tall one has
+  the tall one occupying more of the window right after you navigate to the short one.
+- **Half of what it could show** survives both, and not by luck: navigating puts a page's top at the
+  window's top, which shows the most of it geometry allows — twice the threshold, at any zoom, page
+  size or window size. So the round trip holds *by construction*.
+
+One honest limit: when the window is tall enough to show several pages, the pages near the end cannot
+be scrolled to at all, so `GoToPage(N)` then asking cannot return N for them. That is the scroll
+clamp, not the rule, and no definition of "current page" can change it.
+
+### Why no test caught it
+
+Every `porpoise-view` test used a viewport **half a page tall** — the opposite of the condition. The
+regression needed a window *taller* than a page, and nothing exercised that. There are now nine tests
+that do, three of which were confirmed to fail against the old rule before the fix was kept.
+
 ## 7. Open decisions
 
 1. ~~**Our license.**~~ **Decided 2026-07-29: `MIT OR Apache-2.0`**, copyright Christian Bailey,

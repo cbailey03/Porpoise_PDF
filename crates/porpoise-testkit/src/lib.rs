@@ -213,7 +213,26 @@ pub fn single_page_pdf(width_pt: u32, height_pt: u32) -> Vec<u8> {
 /// `pages` is clamped to at least one.
 #[must_use]
 pub fn multi_page_pdf(pages: usize, width_pt: u32, height_pt: u32) -> Vec<u8> {
-    let pages = pages.max(1);
+    let sizes = vec![(width_pt, height_pt); pages.max(1)];
+    pdf_with_page_sizes(&sizes)
+}
+
+/// Synthesizes a valid PDF whose pages have the given sizes in points.
+///
+/// Real PDFs mix page sizes freely, and several behaviours only appear when they do —
+/// fit-width takes the widest page, the scroll layout cannot assume a uniform height, and a
+/// page whose aspect ratio is extreme enough will exceed the renderer's pixel cap at every
+/// zoom, which is the only way to produce a deterministically unrenderable page.
+///
+/// An empty slice gives one default page, because a PDF with no pages is a different test.
+#[must_use]
+pub fn pdf_with_page_sizes(sizes: &[(u32, u32)]) -> Vec<u8> {
+    let owned = if sizes.is_empty() {
+        vec![(200, 100)]
+    } else {
+        sizes.to_vec()
+    };
+    let pages = owned.len();
 
     // Objects 1 and 2 are the catalog and the page tree; each page then takes two
     // objects, a page dictionary followed by its content stream.
@@ -231,7 +250,7 @@ pub fn multi_page_pdf(pages: usize, width_pt: u32, height_pt: u32) -> Vec<u8> {
         .into_bytes(),
     ];
 
-    for index in 0..pages {
+    for (index, &(width_pt, height_pt)) in owned.iter().enumerate() {
         let page_object = first_page_object + index * 2;
         let content_object = page_object + 1;
 

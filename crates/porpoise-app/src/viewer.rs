@@ -84,6 +84,7 @@ use crate::input::{
 use crate::label::file_label;
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
+use crate::queue::RenderQueue;
 use crate::retain;
 use crate::saver::Saver;
 use crate::thumbnails::{self, Grid};
@@ -1208,6 +1209,10 @@ impl Viewer {
             // Queued work is for the old rung and no longer worth doing. Cached
             // textures are kept deliberately — they are the fallback that stops a
             // resize from flashing grey.
+            //
+            // Everything, not only this rung's, because `cancel_pending` is
+            // all-or-nothing: the grid's queued thumbnails go with it, so their in-flight
+            // records have to go too or they would never be asked for again.
             open.pool.cancel_pending();
             open.in_flight.clear();
             open.failures.clear();
@@ -1215,8 +1220,8 @@ impl Viewer {
         }
 
         let wanted = request_order(visible, PREFETCH_PAGES, open.layout.page_count());
-        let scale = bucket.scale() * pixels_per_point;
-        let tag = i64::from(bucket.rung());
+        let cache = &open.cache;
+        let mut queue = RenderQueue::new(&open.pool, &mut open.in_flight, &mut open.failures);
 
         for position in wanted {
             // `request_order` works in display positions, because that is what the
@@ -1226,19 +1231,12 @@ impl Viewer {
                 continue;
             };
             let key = CacheKey::new(page, bucket);
-            if open.cache.contains(key) || open.in_flight.contains(&key) {
+            if cache.contains(key) {
                 continue;
             }
-            // A failure with retries left earns another attempt, spending one.
-            // Without a budget this would re-request a hopeless page every frame.
-            if let Some(failure) = open.failures.get_mut(&key)
-                && !failure.take_retry()
-            {
-                continue;
-            }
-            if open.pool.submit(page, scale, tag) {
-                open.in_flight.push(key);
-            }
+            // Everything else — already queued, or given up on — is [`RenderQueue`]'s to
+            // decide, because the thumbnail grid has to decide it the same way.
+            queue.want(key, pixels_per_point);
         }
     }
 
@@ -1495,8 +1493,7 @@ impl Viewer {
             order: &open.order,
             document: &open.document,
             cache: &mut open.cache,
-            pool: &open.pool,
-            in_flight: &mut open.in_flight,
+            queue: RenderQueue::new(&open.pool, &mut open.in_flight, &mut open.failures),
             current,
             pixels_per_point,
         };

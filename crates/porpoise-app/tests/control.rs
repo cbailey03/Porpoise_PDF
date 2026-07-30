@@ -18,6 +18,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -25,7 +26,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use porpoise_testkit::multi_page_pdf;
+use porpoise_testkit::{multi_page_pdf, pdf_with_page_sizes};
 use porpoise_view::PAGE_GAP_PT;
 use serde_json::Value;
 
@@ -77,6 +78,11 @@ struct Serve {
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    /// How many `page_failed` events have come past, counted on the way through.
+    ///
+    /// Every read path funnels through [`Self::next_message`], so counting there catches
+    /// them whoever was waiting for what. A `Cell` because that method takes `&self`.
+    failures_seen: Cell<usize>,
 }
 
 impl Serve {
@@ -117,6 +123,7 @@ impl Serve {
             stdin,
             lines,
             next_id: 1,
+            failures_seen: Cell::new(0),
         }
     }
 
@@ -143,14 +150,27 @@ impl Serve {
 
     /// Reads the next message, whatever it is.
     fn next_message(&self) -> Value {
-        match self.lines.recv_timeout(REPLY_TIMEOUT) {
+        let message: Value = match self.lines.recv_timeout(REPLY_TIMEOUT) {
             Ok(line) => serde_json::from_str(&line)
                 .unwrap_or_else(|error| panic!("unparsable output {line:?}: {error}")),
             Err(RecvTimeoutError::Timeout) => {
                 panic!("no output within {REPLY_TIMEOUT:?}")
             }
             Err(RecvTimeoutError::Disconnected) => panic!("the program exited unexpectedly"),
+        };
+        if message.get("event").and_then(Value::as_str) == Some("page_failed") {
+            self.failures_seen.set(self.failures_seen.get() + 1);
         }
+        message
+    }
+
+    /// How many pages have been reported as failing to rasterize, cumulatively.
+    ///
+    /// A page the renderer refuses should be reported a bounded number of times and then
+    /// left alone. This counter is how that is checked, because "stopped asking" is not
+    /// visible in a snapshot — only in the absence of further events.
+    fn failures_seen(&self) -> usize {
+        self.failures_seen.get()
     }
 
     /// Reads until the reply to `id` arrives, ignoring events along the way.
@@ -467,6 +487,7 @@ fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
         stdin,
         lines,
         next_id: 1,
+        failures_seen: Cell::new(0),
     };
 
     let view = serve.view();
@@ -753,6 +774,7 @@ fn an_empty_window_can_still_be_captured() {
         stdin,
         lines,
         next_id: 1,
+        failures_seen: Cell::new(0),
     };
 
     let id = serve.send(
@@ -1309,6 +1331,70 @@ fn the_page_grid_does_not_fight_the_page_column_over_textures() {
             "read {read}: a texture was evicted and re-made while both panels wanted it: {state}"
         );
     }
+
+    serve.quit();
+}
+
+#[test]
+fn the_page_grid_stops_asking_for_a_page_the_renderer_refuses() {
+    let Some(_window) = e2e("the_page_grid_stops_asking_for_a_page_the_renderer_refuses") else {
+        return;
+    };
+
+    // The grid submitted renders without the retry budget the page column uses, so a page
+    // that cannot be rasterized was re-requested from the grid on every frame it was on
+    // screen — a worker permanently busy producing an answer already known.
+    //
+    // One page with an absurd aspect ratio, which is the only way found to fail
+    // deterministically: at 100 x 4,000,000 pt it comes to 64 x 2,593,679 px even at the tiny
+    // zoom thumbnails use, past the backend's 65,535 px per-axis limit — and a refused size
+    // is not the kind of failure worth retrying. The other pages are ordinary and must go on
+    // rendering.
+    //
+    // Note that only the *grid* asks for it. Page 6 is outside the page column's prefetch
+    // window at the top of the document, so this isolates the path being tested.
+    let mut sizes = vec![(200_u32, 300_u32); 12];
+    sizes[5] = (100, 4_000_000);
+    let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    path.push("e2e-grid-hopeless.pdf");
+    std::fs::write(&path, pdf_with_page_sizes(&sizes)).expect("should write the fixture");
+
+    let mut serve = Serve::start(&path);
+    serve.wait_for_event("idle");
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    serve.reply_to(id);
+
+    // Let the grid draw and the refusals land. Snapshots drive frames as well as reading
+    // state, and every message read is counted on the way past.
+    for _ in 0..120 {
+        serve.snapshot();
+    }
+    let state = serve.snapshot();
+    let failed = state
+        .get("failed_pages")
+        .and_then(Value::as_array)
+        .expect("a failed page list");
+    assert_eq!(
+        failed,
+        &vec![Value::from(6)],
+        "the fixture did not produce exactly one unrenderable page, so this proves nothing: \
+         {state}"
+    );
+
+    // Everything after here is about *not* asking again.
+    let settled = serve.failures_seen();
+    assert!(
+        settled > 0 && settled < 10,
+        "expected a handful of refusals, not {settled} — the budget is bounded per rung"
+    );
+    for _ in 0..200 {
+        serve.snapshot();
+    }
+    assert_eq!(
+        serve.failures_seen(),
+        settled,
+        "the grid went back to asking for a page the renderer had refused"
+    );
 
     serve.quit();
 }

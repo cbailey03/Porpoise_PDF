@@ -652,11 +652,48 @@ Two things worth keeping in mind about that module:
 Scrolling is unaffected: the 400-page set still benchmarks at p50 16.66 ms per frame with
 0.14 ms of our own time.
 
-### Still open
+## 6f. The grid had no retry budget (2026-07-30)
 
-The grid submits renders without consulting the retry budget the column uses, so a page that
-cannot be rasterized would be re-requested every frame from the grid alone. Not what was
-reported here, and not fixed with it.
+Flagged while fixing §6e and fixed next. The page column gave up on a page after three
+attempts; the grid had no budget at all, so a page the renderer refuses was re-requested from
+the grid on **every frame it was on screen**.
+
+Measured: 120 frames with the grid open on a document containing one unrenderable page
+produced **119 refusals** without the budget and **1** with it. A worker rasterizing a doomed
+page sixty times a second, for as long as the panel stayed open.
+
+### The fix is one copy, not two correct copies
+
+Adding the missing check to the grid's copy would have fixed the symptom and left the shape
+that produced it — the same shape that produced §6e, one panel applying a policy to a
+resource two panels share. Both call sites now go through `queue::RenderQueue`, whose fields
+are **private**, so `want` is the only way to reach the worker pool. The grid cannot skip the
+policy because it cannot see the pool. That is the same enforcement the command model uses:
+make the wrong thing unrepresentable rather than remembered.
+
+Sharing it also puts the rasterization *scale* in one place, which matters more than it
+looks. A caller derives the scale from a zoom rung and tags the job with that rung; if the two
+ever disagreed the result would be cached under a size it was not drawn at, and that shows up
+as a soft or oversized page rather than as an error.
+
+### A smaller flaw found on the way
+
+Deciding and spending were one step, so a refused submission — a full queue, a poisoned
+lock — burned a retry on an attempt no worker ever looked at. The retry is now spent once a
+worker has actually taken the job. Same three attempts, but all three reach a worker.
+
+### Producing a deterministic failure
+
+Harder than expected, and worth recording: hayro is robust enough that corrupt content
+streams render blank rather than failing, and timeouts are not deterministic. What works is
+**geometry**. A 100 x 4,000,000 pt page comes to 64 x 2,593,679 px even at the tiny zoom
+thumbnails use, past the backend's 65,535 px per-axis limit — and a refused size is not worth
+retrying, so it fails identically every time. `pdf_with_page_sizes` in the testkit exists for
+that; `multi_page_pdf` now delegates to it.
+
+That page also sits outside the column's prefetch window at the top of the document, so only
+the grid ever asks for it — which isolates the path under test rather than testing both at
+once.
 
 ## 7. Open decisions
 

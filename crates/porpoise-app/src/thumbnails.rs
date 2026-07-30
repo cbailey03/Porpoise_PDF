@@ -11,10 +11,19 @@
 //! virtualized for free — only the rows on screen are ever requested, so a 400-page
 //! document costs about twenty tiny renders rather than four hundred.
 //!
-//! It also relies on a page being allowed *two* cached rungs at once: the main view's
-//! and the grid's. That was already true, but only by accident — `PageCache` had a
-//! `retain_bucket` that would have evicted one for the other, unused and with a doc
-//! comment claiming otherwise. Removed rather than left as a trap.
+//! "The same pipeline" has twice turned out to be less true than this comment claimed,
+//! both times because a policy the main view owned was applied to a cache the grid shares:
+//!
+//! - A page must be allowed **two cached rungs at once**, the main view's and the grid's.
+//!   `PageCache::retain_bucket` contradicted that and was deleted; the page-window
+//!   predicate that replaced it had the same effect for any page outside the window, which
+//!   is what made the last few thumbnails flicker. See [`crate::retain`].
+//! - Asking for a render must go through **one** decision, or the grid keeps asking for a
+//!   page the main view has given up on. See [`crate::queue`].
+//!
+//! Both were "reuses the same pipeline" being true of the mechanism and false of the
+//! policy, so the pattern is worth naming: anything shared here needs a shared *decision*,
+//! not just a shared structure.
 //!
 //! # Dragging is a gesture, not a command
 //!
@@ -27,9 +36,9 @@
 
 use eframe::egui;
 use porpoise_doc::{Document, PageOrder};
-use porpoise_render::RenderPool;
 use porpoise_view::{CacheKey, PageCache, PageNumber, ZoomBucket};
 
+use crate::queue::RenderQueue;
 use crate::tiles::FULL_UV;
 
 /// How wide a thumbnail should be, in points of screen space.
@@ -52,8 +61,11 @@ pub(crate) struct Grid<'a> {
     pub(crate) order: &'a PageOrder,
     pub(crate) document: &'a Document,
     pub(crate) cache: &'a mut PageCache<egui::TextureHandle>,
-    pub(crate) pool: &'a RenderPool,
-    pub(crate) in_flight: &'a mut Vec<CacheKey>,
+    /// Where a missing thumbnail is asked for.
+    ///
+    /// The main view's queue, not one of the grid's own — so the two cannot disagree about
+    /// when a page has been given up on. See [`crate::queue`].
+    pub(crate) queue: RenderQueue<'a>,
     /// Display position of the page the main view is showing, highlighted here.
     pub(crate) current: usize,
     /// Physical pixels per screen point, so a thumbnail is rasterized at the size it
@@ -190,7 +202,7 @@ fn cell(
     let key = CacheKey::new(page, bucket);
     let texture = grid.cache.get(key).map(egui::TextureHandle::id);
     if texture.is_none() {
-        request(grid, page, key, bucket);
+        grid.queue.want(key, grid.pixels_per_point);
     }
 
     let (_, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::default(), |ui| {
@@ -224,17 +236,6 @@ fn cell(
     });
 
     dropped.map(|from| *from).filter(|from| *from != position)
-}
-
-/// Asks for a thumbnail, unless one is already queued.
-fn request(grid: &mut Grid<'_>, page: usize, key: CacheKey, bucket: ZoomBucket) {
-    if grid.in_flight.contains(&key) {
-        return;
-    }
-    let scale = bucket.scale() * grid.pixels_per_point;
-    if grid.pool.submit(page, scale, i64::from(bucket.rung())) {
-        grid.in_flight.push(key);
-    }
 }
 
 #[cfg(test)]

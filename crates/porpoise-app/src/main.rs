@@ -15,6 +15,7 @@ mod input;
 mod label;
 mod picker;
 mod protocol;
+mod queue;
 mod retain;
 mod saver;
 mod thumbnails;

@@ -816,6 +816,25 @@ fn marquee(ui: &egui::Ui, viewport: egui::Rect, cells: &[(usize, egui::Rect)]) -
         return None;
     }
 
+    // Some other widget already owns this press: the panel's resize handle, a scroll bar,
+    // the search box selecting its own text. Reading raw pointer state is what lets the
+    // marquee and the cells avoid competing for a hit test, and the price is that nothing
+    // tells this function when a press was claimed before it got here — so it has to ask.
+    //
+    // Without this, dragging the panel's right edge to resize it dragged a selection box
+    // across the grid at the same time. The handle straddles the panel edge, so a press on
+    // it lands a few pixels *inside* the content, where there is no cell — which is exactly
+    // the description of a marquee.
+    //
+    // Asked on every frame rather than only when starting one, because egui does not have
+    // to decide a widget is being dragged as early as this does: a click-and-drag widget
+    // waits for the pointer to pass its own threshold, which can be further than
+    // [`MARQUEE_MINIMUM_DRAG`]. A box that had already begun still has to yield.
+    if ui.ctx().dragged_id().is_some() {
+        forget();
+        return None;
+    }
+
     let (pressed_at, latest, down, released) = ui.input(|i| {
         (
             i.pointer.press_origin(),

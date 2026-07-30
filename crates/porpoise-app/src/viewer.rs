@@ -34,7 +34,7 @@
 //!
 //! | Module | What |
 //! |---|---|
-//! | [`crate::input`] | Key press to [`Command`] — pure |
+//! | [`crate::input`] | Key press or file drop to [`Command`] — pure |
 //! | [`crate::failure`] | Whether a failed render is worth retrying — pure policy |
 //! | [`crate::tiles`] | Rasterized page to egui texture — the GPU boundary |
 //! | [`crate::picker`] | The file dialog, off the frame loop |
@@ -63,7 +63,9 @@ use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
 };
 use crate::failure::Failure;
-use crate::input::{EditKey, command_for_key, edit_for_key, opens_the_picker};
+use crate::input::{
+    DropAction, EditKey, command_for_key, drop_action, edit_for_key, opens_the_picker,
+};
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::saver::Saver;
@@ -821,6 +823,38 @@ impl Viewer {
         }
     }
 
+    /// Turns a file dropped on the window into an `Open` command.
+    ///
+    /// The third producer of `Open`, after the command line and the file dialog, and a
+    /// producer rather than a command for the same reason the dialog is: an agent
+    /// already has `open` with a path. See [`crate::input::DropAction`].
+    fn collect_dropped_files(&mut self, ctx: &egui::Context) {
+        // egui reports a drop for the single frame it happened on, so this fires once
+        // per drop rather than reopening the file every frame.
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+
+        match drop_action(&dropped) {
+            None => {}
+            Some(DropAction::Open { path, ignored }) => {
+                if ignored > 0 {
+                    tracing::info!(ignored, "opened the first PDF of several dropped files");
+                }
+                self.dispatch(ctx, Command::Open { path });
+            }
+            // Set here rather than through `dispatch`, because nothing became a
+            // command — the drop was refused before there was one. It still has to be
+            // visible, or dropping a `.docx` looks like the window ignoring you.
+            Some(DropAction::Refuse { reason }) => self.last_error = Some(reason),
+        }
+    }
+
     // --- Render pipeline ----------------------------------------------------
 
     /// Absorbs finished renders into the cache. Never blocks.
@@ -1214,6 +1248,68 @@ impl Viewer {
         }
     }
 
+    /// Paints what a drop would do, while the files are still in the air.
+    ///
+    /// Drawn from the same [`drop_action`] the drop itself uses, so the window cannot
+    /// invite something it then refuses. It is also the only place that warns about
+    /// losing unsaved page changes: opening a document replaces the one on screen and
+    /// nothing asks first, and here the mouse button is still down.
+    fn draw_drop_hint(&self, ctx: &egui::Context) {
+        // Unlike a drop, hovering is a *level*: egui holds these until the files are
+        // dropped or dragged back out, and both of those wake the frame loop. So one
+        // repaint paints the hint and one clears it.
+        let hovered: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .hovered_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        let Some(action) = drop_action(&hovered) else {
+            return;
+        };
+
+        let unsaved = self
+            .open
+            .as_ref()
+            .is_some_and(|open| !open.order.is_unedited());
+        let colour = match action {
+            DropAction::Open { .. } => egui::Color32::WHITE,
+            DropAction::Refuse { .. } => egui::Color32::from_rgb(240, 150, 150),
+        };
+
+        // Its own foreground layer, so the hint covers the page column, the toolbar and
+        // the thumbnail panel rather than being drawn under whichever came last.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("porpoise-drop-hint"),
+        ));
+        // Dim the whole viewport so nothing shows through at the edges, but centre the
+        // card in the content rect, which excludes any OS status bar or notch.
+        painter.rect_filled(
+            ctx.viewport_rect(),
+            0.0,
+            egui::Color32::from_black_alpha(160),
+        );
+
+        // Laid out first so the card can be sized to the text. Dimming alone is not
+        // enough to read a sentence over a drawing sheet, which is mostly white and
+        // full of lines. Wrapped rather than measured freely, so a long file name
+        // cannot push the card off both edges of the window.
+        let content = ctx.content_rect();
+        let galley = painter.layout(
+            action.hint(unsaved),
+            egui::FontId::proportional(20.0),
+            colour,
+            (content.width() - 96.0).max(120.0),
+        );
+        let padding = egui::vec2(36.0, 22.0);
+        let card = egui::Rect::from_center_size(content.center(), galley.size() + padding);
+        painter.rect_filled(card, 8.0, egui::Color32::from_black_alpha(235));
+        painter.galley(card.center() - galley.size() * 0.5, galley, colour);
+    }
+
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         // Collected rather than dispatched inline, because dispatch needs
         // `&mut self` while `ui` is borrowed. Note every button produces the same
@@ -1570,6 +1666,7 @@ impl eframe::App for Viewer {
         let started = Instant::now();
         self.collect_renders(ctx);
         self.collect_picked_file(ctx);
+        self.collect_dropped_files(ctx);
         self.collect_save();
         self.handle_input(ctx);
         self.serve_control(ctx);
@@ -1603,6 +1700,8 @@ impl eframe::App for Viewer {
                 .show(ui, |ui| self.draw_thumbnails(ui));
         }
         self.draw_pages(ui);
+        // Last, and over everything: a drag can be anywhere on the window.
+        self.draw_drop_hint(ui.ctx());
 
         // Our own cost, as distinct from the frame interval. If this stays well
         // under the frame budget, the pipeline has headroom.

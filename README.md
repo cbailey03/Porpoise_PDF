@@ -17,8 +17,10 @@ Hardened against damaged input: 4,000 deterministic mutations plus every possibl
 of a valid PDF, all of which either open or return an error — none panic, none hang, and rejecting
 damaged input averages 7 µs.
 
-Open a file with `Ctrl+O` or the **Open…** button, or pass a path on the command line. Launching with
-no path opens an empty window rather than refusing to start.
+Open a file by dragging it onto the window, with `Ctrl+O` or the **Open…** button, or by passing a path
+on the command line. Launching with no path opens an empty window rather than refusing to start. While
+a file is held over the window, an overlay says what letting go will do — including a warning if it
+would discard unsaved page changes.
 
 `Ctrl+T` opens a grid of page thumbnails you can drag pages around in. Pages can also be reordered and
 deleted from the toolbar or the keyboard, with undo, then written back with **Save** or to a new file with

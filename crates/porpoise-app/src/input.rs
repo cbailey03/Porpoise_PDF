@@ -5,6 +5,8 @@
 //! *producer* of commands like any other, so the translation is a function rather
 //! than a method reaching into the app.
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 use porpoise_view::{ScrollMode, ViewCommand, ZoomTarget};
 
@@ -62,6 +64,93 @@ pub(crate) fn edit_for_key(key: egui::Key, modifiers: egui::Modifiers) -> Option
 /// [`crate::picker`]. Pure, so the binding is testable without a window.
 pub(crate) fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bool {
     (modifiers.command || modifiers.ctrl) && key == egui::Key::O
+}
+
+/// What dropping these files on the window would do.
+///
+/// Like the file dialog, a drop is a **producer** of [`Command::Open`] rather than a
+/// command of its own — an agent already has `open` with a path, which is strictly more
+/// capable than a gesture. See `docs/goal-3-plan.md` §1.
+///
+/// One decision serves two callers: the hint painted while the drag is still in the air
+/// and the open that happens when the button is released. Computing those separately
+/// would let the window promise one thing and do another, which is worse than having no
+/// hint at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DropAction {
+    /// Open this document, ignoring `ignored` other dropped files.
+    Open {
+        path: PathBuf,
+        /// How many other paths came with it. Zero for the ordinary single drop.
+        ignored: usize,
+    },
+    /// Nothing dropped can be opened. Written for a person to read.
+    Refuse { reason: String },
+}
+
+impl DropAction {
+    /// The sentence to show over the window.
+    ///
+    /// `unsaved_changes` adds a warning to an open, because opening a document replaces
+    /// the one on screen and nothing asks first. While the mouse button is still down
+    /// is the one place that warning costs nothing.
+    pub(crate) fn hint(&self, unsaved_changes: bool) -> String {
+        match self {
+            Self::Open { path, ignored } => {
+                let mut parts = vec![format!("Open {}", file_label(path))];
+                if *ignored > 0 {
+                    parts.push(format!("ignoring {ignored} other file(s)"));
+                }
+                if unsaved_changes {
+                    parts.push("your unsaved page changes will be lost".to_owned());
+                }
+                parts.join(" — ")
+            }
+            Self::Refuse { reason } => reason.clone(),
+        }
+    }
+}
+
+/// Decides what a set of dropped or hovered paths means.
+///
+/// `None` means nothing is there — no drop, or a drop egui gave us no paths for.
+pub(crate) fn drop_action(paths: &[PathBuf]) -> Option<DropAction> {
+    if paths.is_empty() {
+        return None;
+    }
+    // The first PDF, not the first path: dropping a folder of drawings alongside the
+    // one PDF in it should open the PDF rather than refuse the lot.
+    match paths.iter().find(|path| is_pdf(path)) {
+        Some(path) => Some(DropAction::Open {
+            path: path.clone(),
+            ignored: paths.len() - 1,
+        }),
+        None => Some(DropAction::Refuse {
+            reason: match paths {
+                [only] => format!("{} is not a PDF", file_label(only)),
+                many => format!("none of those {} files is a PDF", many.len()),
+            },
+        }),
+    }
+}
+
+/// Whether a path names a PDF, judged by its extension.
+///
+/// Extension only. Reading the first bytes would mean touching the disk while the
+/// pointer is still moving, and guessing wrong here is cheap — the open itself reports
+/// the real parse failure. A directory has no `.pdf` extension, so this is also what
+/// keeps a dropped folder out.
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+/// The name to show for a path: its file name, or the whole path if it has none.
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Translates a key press into a command.
@@ -166,6 +255,144 @@ mod tests {
     fn ctrl_with_another_key_does_not_open_the_dialog() {
         assert!(!opens_the_picker(egui::Key::P, ctrl()));
     }
+
+    // --- File drops ----------------------------------------------------------
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_dropped_pdf_asks_to_open_it() {
+        assert_eq!(
+            drop_action(&paths(&["plans/sheet.pdf"])),
+            Some(DropAction::Open {
+                path: PathBuf::from("plans/sheet.pdf"),
+                ignored: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn an_uppercase_extension_is_still_a_pdf() {
+        // Windows hands back whatever case is on disk, and `.PDF` is common on files
+        // that came off a plotter or an email attachment.
+        for name in ["sheet.PDF", "sheet.Pdf", "sheet.pDf"] {
+            assert!(
+                matches!(drop_action(&paths(&[name])), Some(DropAction::Open { .. })),
+                "{name} was not recognised as a PDF"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_dropped_asks_for_nothing() {
+        assert_eq!(drop_action(&[]), None);
+    }
+
+    #[test]
+    fn a_dropped_file_that_is_not_a_pdf_is_refused_by_name() {
+        // Named, because "nothing happened" is indistinguishable from the window
+        // being broken.
+        let Some(DropAction::Refuse { reason }) = drop_action(&paths(&["notes/minutes.docx"]))
+        else {
+            panic!("a .docx should be refused");
+        };
+        assert!(reason.contains("minutes.docx"), "unhelpful: {reason}");
+        assert!(reason.contains("not a PDF"), "unhelpful: {reason}");
+    }
+
+    #[test]
+    fn a_dropped_folder_is_refused() {
+        // A directory has no `.pdf` extension, which is all that keeps it out — worth
+        // pinning, because opening one would hand a path to `Document::open`.
+        assert!(matches!(
+            drop_action(&paths(&["C:/plans/gdot"])),
+            Some(DropAction::Refuse { .. })
+        ));
+    }
+
+    #[test]
+    fn the_first_pdf_wins_rather_than_the_first_path() {
+        // Dropping a folder's worth of files that happens to contain one PDF should
+        // open the PDF, not refuse everything because a README came first.
+        assert_eq!(
+            drop_action(&paths(&["readme.txt", "sheet.pdf", "logo.png"])),
+            Some(DropAction::Open {
+                path: PathBuf::from("sheet.pdf"),
+                ignored: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn refusing_several_files_says_how_many() {
+        let Some(DropAction::Refuse { reason }) = drop_action(&paths(&["a.txt", "b.png"])) else {
+            panic!("neither is a PDF");
+        };
+        assert!(reason.contains('2'), "unhelpful: {reason}");
+    }
+
+    #[test]
+    fn the_hint_names_the_file_that_would_open() {
+        let action = drop_action(&paths(&["plans/ROLT14.pdf"])).expect("a PDF was dropped");
+        let hint = action.hint(false);
+        assert!(hint.contains("ROLT14.pdf"), "unhelpful: {hint}");
+        // Just the file name: a full path of a hundred characters would run off both
+        // edges of the window.
+        assert!(!hint.contains("plans"), "showed the whole path: {hint}");
+    }
+
+    #[test]
+    fn the_hint_says_when_other_files_will_be_ignored() {
+        let action = drop_action(&paths(&["sheet.pdf", "other.pdf"])).expect("a PDF was dropped");
+        let hint = action.hint(false);
+        assert!(hint.contains("ignoring 1"), "unhelpful: {hint}");
+    }
+
+    #[test]
+    fn the_hint_warns_that_unsaved_page_changes_would_be_lost() {
+        // The only warning there is. Nothing asks before replacing an edited document,
+        // so this sentence is what stands between a reorder and losing it.
+        let action = drop_action(&paths(&["sheet.pdf"])).expect("a PDF was dropped");
+        assert!(!action.hint(false).contains("unsaved"));
+        let warned = action.hint(true);
+        assert!(warned.contains("unsaved"), "unhelpful: {warned}");
+    }
+
+    #[test]
+    fn the_hint_and_the_drop_never_disagree() {
+        // The whole point of one `drop_action` serving both. If the hint were computed
+        // separately, the window could invite a drop it then refuses — a worse outcome
+        // than showing nothing at all.
+        let cases = [
+            vec![],
+            paths(&["sheet.pdf"]),
+            paths(&["notes.txt"]),
+            paths(&["notes.txt", "sheet.pdf"]),
+            paths(&["a.txt", "b.png", "c"]),
+        ];
+        for case in cases {
+            // Nothing there means no hint is drawn, which cannot disagree with anything.
+            let Some(action) = drop_action(&case) else {
+                continue;
+            };
+            let hint = action.hint(false);
+            match &action {
+                DropAction::Open { path, .. } => assert!(
+                    hint.starts_with("Open ") && hint.contains(&file_label(path)),
+                    "{case:?} would open {} but the hint said {hint:?}",
+                    path.display()
+                ),
+                DropAction::Refuse { reason } => assert_eq!(
+                    &hint, reason,
+                    "{case:?} refuses but the hint said something else"
+                ),
+            }
+        }
+    }
+
+    // --- Keys ----------------------------------------------------------------
 
     #[test]
     fn page_down_means_a_page_in_paged_mode_and_a_screenful_in_free_mode() {

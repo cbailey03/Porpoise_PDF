@@ -45,9 +45,9 @@ If we ever do expose it, it has to arrive with programmatic cancellation in the 
 
 ### Explicitly not in Goal 3
 
-- **Drag and drop.** A natural second producer of `open` and genuinely cheap with egui's
+- ~~**Drag and drop.**~~ A natural second producer of `open` and genuinely cheap with egui's
   `dropped_files`, but it is a separate input path with its own edge cases (directories, multiple
-  files, non-PDFs). Not folded in silently.
+  files, non-PDFs). Not folded in silently — added on its own afterwards; see §6.
 - **Recent files.** Wants persistence, which the program has none of yet.
 - **A save dialog.** Nothing to save until editing.
 - **Multiple documents open at once.** `OpenDocument` is deliberately a single `Option`.
@@ -156,3 +156,59 @@ returns before the assignment — so the end-to-end test now pins it rather than
 - Whether cancelling the dialog is distinguishable from an error. It should be a plain no-op with no
   message; `pick_file` returning `None` covers both cancel and failure-to-show, and we treat both as
   "nothing happened".
+
+## 6. Drag and drop
+
+Added after the rest of Goal 3, deliberately on its own rather than folded into the picker work. It is
+the third producer of `Command::Open`, after the command line and the dialog, and a producer for the
+same reason the dialog is: an agent already has `open` with a path, which is strictly more capable
+than a gesture. Nothing new reaches the protocol.
+
+### The edge cases, decided rather than discovered
+
+The reason this was held back was that it has more of them than it looks like:
+
+| Dropped | What happens | Why |
+|---|---|---|
+| One `.pdf` | Opens it | |
+| `.PDF`, `.Pdf` | Opens it | Windows hands back whatever case is on disk |
+| Several files, one a PDF | Opens the first PDF, ignores the rest | One document is open at a time; refusing would just mean trying again |
+| Several PDFs | Opens the first, says how many were ignored | Same, and silence here would look like a bug |
+| A folder | Refused | A directory has no `.pdf` extension, which is all that keeps it out |
+| Anything else | Refused, by name, in the status bar | "Nothing happened" is indistinguishable from a broken window |
+
+PDF-ness is judged by extension only. Reading the first bytes would mean touching the disk while the
+pointer is still moving, and being wrong is cheap — the open itself reports the real parse failure.
+
+### One decision, two callers
+
+While files are held over the window, an overlay says what letting go would do. That hint and the drop
+itself both come from **one** `drop_action`, so the window cannot invite a drop it then refuses. A test
+pins exactly that: for any set of paths, the hint agrees with the action. Computing them separately
+would be worse than having no hint at all, which is why they are not allowed to be two functions.
+
+This is also the one honest place to warn about **losing unsaved page changes**. Opening a document
+replaces the one on screen and nothing asks first (`goal-4-plan.md` §6) — but while the mouse button is
+still down, saying so costs nothing. So a drop onto an edited document reads *"Open other.pdf — your
+unsaved page changes will be lost"*. That is not a fix for the missing confirmation; it narrows it to
+the one path where a warning was free.
+
+### egui's two file-input shapes, which are not the same
+
+Worth writing down, because they behave differently and the difference is invisible in the API:
+
+- `dropped_files` is **drained** each frame (`std::mem::take`). It is an edge, so reading it once
+  opens the file once rather than reopening it every frame.
+- `hovered_files` is **cloned** each frame and cleared only by the drop or by the drag leaving. It is a
+  level, which is what lets one repaint paint the overlay and one repaint remove it.
+
+Both were checked in egui 0.35's `RawInput::take` rather than assumed. Drag-and-drop is enabled because
+winit's Windows default is on and `eframe` only overrides it when asked.
+
+### What cannot be tested
+
+The gesture. There is no way to synthesize an OS file drag from the control channel, so "hold a file
+over the window and let go" has no automated test — the same seam as the thumbnail drag
+(`goal-4-plan.md` §7). Everything either side is covered: `drop_action` has unit tests including the
+hint-agrees-with-the-action property, and `Command::Open` has end-to-end tests. The two lines that
+connect them are verified by hand.

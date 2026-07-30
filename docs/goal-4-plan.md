@@ -197,5 +197,8 @@ remembering if the drop behaviour is ever changed, because nothing will fail if 
 ## 6. Known gaps
 
 - **Nested page trees are refused** (§2). The fix is inherited-attribute push-down.
-- **No warning when closing with unsaved changes.** The snapshot knows, but nothing asks.
+- **No warning when closing or replacing a document with unsaved changes.** The snapshot knows, but
+  nothing asks. One narrow exception: dropping a file onto the window warns in the drop hint, because
+  there the mouse button is still down and it was free (`goal-3-plan.md` §6). Closing the window, and
+  `Ctrl+O`, still discard an edit in silence.
 - **Whole-file rewrite on every save**, so saving a 132 MB document rewrites 132 MB.

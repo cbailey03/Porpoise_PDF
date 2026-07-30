@@ -28,6 +28,15 @@ const UNDO_DEPTH: usize = 64;
 pub struct PageOrder {
     /// Source page indices, in display order.
     order: Vec<usize>,
+    /// The order as it stands in the file. Starts equal to [`Self::order`] and moves
+    /// only when a save reports success.
+    ///
+    /// This is what makes "unsaved changes" mean it, rather than meaning "differs from
+    /// the document as first opened". Without it a saved document goes on claiming
+    /// changes forever — the status bar nags, the Save button stays lit, and anything
+    /// built on top warns when there is nothing left to lose. A warning that fires when
+    /// nothing is at risk is one people learn to click through.
+    saved: Vec<usize>,
     /// Pages in the document as opened. Needed to tell an edited order from a fresh
     /// one even after pages are deleted.
     source_len: usize,
@@ -39,8 +48,10 @@ impl PageOrder {
     /// The unedited order of a document with `page_count` pages.
     #[must_use]
     pub fn identity(page_count: usize) -> Self {
+        let order: Vec<usize> = (0..page_count).collect();
         Self {
-            order: (0..page_count).collect(),
+            saved: order.clone(),
+            order,
             source_len: page_count,
             history: Vec::new(),
         }
@@ -79,12 +90,26 @@ impl PageOrder {
         &self.order
     }
 
-    /// Whether this still matches the document as opened.
+    /// Whether this matches what is on disk.
     ///
-    /// What "unsaved changes" means, and what makes saving over the source a no-op.
+    /// What "unsaved changes" means, and what makes saving over the file a no-op. True
+    /// for a freshly opened document, false after any edit, and true again once a save
+    /// of that exact order has reported success.
     #[must_use]
     pub fn is_unedited(&self) -> bool {
-        self.order.len() == self.source_len && self.order.iter().enumerate().all(|(i, s)| i == *s)
+        self.order == self.saved
+    }
+
+    /// Records that `written` is now what the file contains.
+    ///
+    /// Takes the order that was actually written rather than assuming it is the current
+    /// one. A save runs off the UI thread and takes about a second on a 400-page
+    /// document, so the pages may well have been moved again while it ran — and marking
+    /// *those* moves as saved would tell somebody their work is on disk when it is not.
+    /// Passing the written order through makes that case come out right on its own
+    /// rather than needing to be noticed.
+    pub fn mark_saved(&mut self, written: &[usize]) {
+        self.saved = written.to_vec();
     }
 
     /// Whether there is anything to undo.
@@ -254,6 +279,87 @@ mod tests {
         let mut order = PageOrder::identity(2);
         assert!(!order.undo());
         assert_eq!(order.as_slice(), &[0, 1]);
+    }
+
+    // --- What is on disk -----------------------------------------------------
+
+    #[test]
+    fn saving_makes_the_order_unedited_again() {
+        // The whole point. Before this, a saved document went on claiming unsaved
+        // changes forever: the status bar nagged and the Save button stayed lit even
+        // though the file matched exactly.
+        let mut order = PageOrder::identity(4);
+        order.move_page(0, 3);
+        assert!(!order.is_unedited());
+
+        let written = order.as_slice().to_vec();
+        order.mark_saved(&written);
+        assert!(
+            order.is_unedited(),
+            "still dirty after saving that exact order"
+        );
+    }
+
+    #[test]
+    fn editing_after_a_save_is_unsaved_again() {
+        let mut order = PageOrder::identity(4);
+        order.move_page(0, 3);
+        let written = order.as_slice().to_vec();
+        order.mark_saved(&written);
+
+        order.move_page(1, 2);
+        assert!(!order.is_unedited(), "an edit after a save reported clean");
+    }
+
+    #[test]
+    fn an_edit_made_while_the_save_was_running_is_still_unsaved() {
+        // The race the `written` argument exists for. A save takes about a second on a
+        // 400-page document, so there is a real window in which pages get moved again.
+        // Marking those as saved would tell somebody their work is on disk when only
+        // the earlier version is.
+        let mut order = PageOrder::identity(5);
+        order.move_page(0, 4);
+        let written = order.as_slice().to_vec(); // what the save thread took
+
+        // ... and while it was writing, another move.
+        order.move_page(1, 2);
+        order.mark_saved(&written);
+
+        assert!(
+            !order.is_unedited(),
+            "claimed the later move was written when the save never saw it"
+        );
+
+        // Undoing that later move lands back on exactly what was written.
+        assert!(order.undo());
+        assert!(
+            order.is_unedited(),
+            "back to the written order but reported dirty"
+        );
+    }
+
+    #[test]
+    fn undoing_back_to_the_saved_order_counts_as_unedited() {
+        let mut order = PageOrder::identity(3);
+        order.move_page(0, 2);
+        let written = order.as_slice().to_vec();
+        order.mark_saved(&written);
+        order.remove(1);
+        assert!(!order.is_unedited());
+
+        assert!(order.undo());
+        assert!(
+            order.is_unedited(),
+            "undo back to the file's order reported dirty"
+        );
+    }
+
+    #[test]
+    fn a_fresh_document_matches_its_file() {
+        // Nothing has been written, but nothing has been changed either, so there is
+        // nothing to lose — and saving it over itself would be pointless.
+        assert!(PageOrder::identity(7).is_unedited());
+        assert!(PageOrder::identity(0).is_unedited());
     }
 
     #[test]

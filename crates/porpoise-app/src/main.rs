@@ -5,6 +5,7 @@
 //! section 4.
 
 mod command;
+mod confirm;
 mod control;
 mod devtools;
 mod failure;

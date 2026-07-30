@@ -91,9 +91,13 @@ pub(crate) enum DropAction {
 impl DropAction {
     /// The sentence to show over the window.
     ///
-    /// `unsaved_changes` adds a warning to an open, because opening a document replaces
-    /// the one on screen and nothing asks first. While the mouse button is still down
-    /// is the one place that warning costs nothing.
+    /// `unsaved_changes` says an open will be interrupted by a question, since opening a
+    /// document replaces the one on screen. Worth saying while the mouse button is still
+    /// down, so the drag can be abandoned rather than answered.
+    ///
+    /// This used to read *"will be lost"*, which was true when the drop hint was the
+    /// only warning there was. It is not true any more — [`crate::confirm`] asks first —
+    /// and a warning that overstates what is at stake is one people stop believing.
     pub(crate) fn hint(&self, unsaved_changes: bool) -> String {
         match self {
             Self::Open { path, ignored } => {
@@ -102,7 +106,7 @@ impl DropAction {
                     parts.push(format!("ignoring {ignored} other file(s)"));
                 }
                 if unsaved_changes {
-                    parts.push("your unsaved page changes will be lost".to_owned());
+                    parts.push("you will be asked about your unsaved page changes".to_owned());
                 }
                 parts.join(" — ")
             }
@@ -351,13 +355,15 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_warns_that_unsaved_page_changes_would_be_lost() {
-        // The only warning there is. Nothing asks before replacing an edited document,
-        // so this sentence is what stands between a reorder and losing it.
+    fn the_hint_mentions_unsaved_page_changes() {
+        // So the drag can be abandoned rather than answered. It must not claim they
+        // *will be lost* — `crate::confirm` asks first, and a warning that overstates
+        // the stakes is one people stop believing.
         let action = drop_action(&paths(&["sheet.pdf"])).expect("a PDF was dropped");
         assert!(!action.hint(false).contains("unsaved"));
         let warned = action.hint(true);
         assert!(warned.contains("unsaved"), "unhelpful: {warned}");
+        assert!(!warned.contains("lost"), "overstates the stakes: {warned}");
     }
 
     #[test]

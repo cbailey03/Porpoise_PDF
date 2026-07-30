@@ -190,10 +190,32 @@ impl Serve {
     }
 
     /// Sends `quit` and waits for the process to end.
+    ///
+    /// Fails rather than hanging if it does not, which is what happens when a session
+    /// ends with unsaved page changes: `quit` then asks first and waits for an `answer`.
+    /// A bare `child.wait()` there would block a test run forever with no clue why.
     fn quit(mut self) {
         self.send_raw(r#"{"command":"quit"}"#);
-        let status = self.child.wait().expect("should exit");
-        assert!(status.success(), "exited with {status}");
+        self.expect_exit();
+    }
+
+    /// Waits a bounded time for the process to exit successfully.
+    fn expect_exit(&mut self) {
+        let deadline = std::time::Instant::now() + REPLY_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            match self
+                .child
+                .try_wait()
+                .expect("should be able to poll the child")
+            {
+                Some(status) => {
+                    assert!(status.success(), "exited with {status}");
+                    return;
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        panic!("still running {REPLY_TIMEOUT:?} after being told to quit");
     }
 }
 
@@ -986,4 +1008,330 @@ fn closing_stdin_shuts_the_program_down() {
 
     let status = child.wait().expect("should exit on its own");
     assert!(status.success(), "exited with {status}");
+}
+
+// --- Unsaved page changes ---------------------------------------------------
+//
+// The guard sits in front of dispatch rather than on the X button, and these tests are
+// the reason. A gesture-level check would have left the most safety-critical behaviour
+// in the program as the only one with no automated test, because nothing can press an X.
+// See `crates/porpoise-app/src/confirm.rs`.
+
+/// Reorders a page so the session has something to lose.
+fn make_it_dirty(serve: &mut Serve) {
+    let id = serve.send(
+        "move_page",
+        &[("from", Value::from(1)), ("to", Value::from(3))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "the fixture did not become dirty: {reply}"
+    );
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("unsaved_changes")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn quitting_with_unsaved_changes_asks_before_losing_them() {
+    let Some(_window) = e2e("quitting_with_unsaved_changes_asks_before_losing_them") else {
+        return;
+    };
+
+    let document = fixture("e2e-guard-quit.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    make_it_dirty(&mut serve);
+
+    // 1. Quit is held back rather than carried out.
+    let id = serve.send("quit", &[]);
+    let reply = serve.reply_to(id);
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("needs_answer"),
+        "quit went ahead and lost the reordering: {reply}"
+    );
+
+    // 2. The program is still running and says what it is asking about. Being able to
+    //    read this is what lets a client answer without guessing.
+    let snapshot = serve.snapshot();
+    let asking = snapshot
+        .get("awaiting_answer")
+        .and_then(Value::as_str)
+        .expect("the snapshot should say what is waiting");
+    assert!(asking.contains("quit"), "unhelpful: {asking}");
+    assert_eq!(
+        snapshot.get("idle").and_then(Value::as_bool),
+        Some(false),
+        "reported idle with a question nobody had answered: {snapshot}"
+    );
+
+    // 3. Cancel puts it back the way it was: still open, still dirty, no question.
+    let id = serve.send("answer", &[("choice", Value::from("cancel"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("cancelled")
+    );
+    let snapshot = serve.snapshot();
+    assert_eq!(snapshot.get("awaiting_answer"), None);
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(true),
+        "cancelling threw the changes away: {snapshot}"
+    );
+
+    // 4. Asked again and answered with discard, it really does quit.
+    let id = serve.send("quit", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("needs_answer")
+    );
+    let id = serve.send("answer", &[("choice", Value::from("discard"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("quitting")
+    );
+    serve.expect_exit();
+}
+
+#[test]
+fn opening_another_document_with_unsaved_changes_asks_first() {
+    let Some(_window) = e2e("opening_another_document_with_unsaved_changes_asks_first") else {
+        return;
+    };
+
+    // `open` replaces the document, so it loses an edit exactly as quitting does. Two
+    // commands, one guard — which is the point of guarding dispatch rather than each
+    // producer.
+    let document = fixture("e2e-guard-open-a.pdf");
+    let other = fixture("e2e-guard-open-b.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    make_it_dirty(&mut serve);
+
+    let id = serve.send(
+        "open",
+        &[("path", Value::from(other.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("needs_answer"),
+        "opening another file discarded the reordering without asking"
+    );
+    let snapshot = serve.snapshot();
+    let asking = snapshot
+        .get("awaiting_answer")
+        .and_then(Value::as_str)
+        .expect("should say what is waiting");
+    assert!(
+        asking.contains("e2e-guard-open-b"),
+        "did not say which file: {asking}"
+    );
+    // Still the first document, untouched.
+    assert!(
+        snapshot
+            .get("document")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.contains("e2e-guard-open-a")),
+        "the document was replaced before the question was answered: {snapshot}"
+    );
+
+    // Discard, and the open finally happens — with the edit gone, as asked.
+    let id = serve.send("answer", &[("choice", Value::from("discard"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("opened")
+    );
+    let snapshot = serve.snapshot();
+    assert!(
+        snapshot
+            .get("document")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.contains("e2e-guard-open-b")),
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn answering_save_writes_the_file_before_going_ahead() {
+    let Some(_window) = e2e("answering_save_writes_the_file_before_going_ahead") else {
+        return;
+    };
+
+    // The ordering that is easy to get wrong: a save takes about a second and runs off
+    // the UI thread, so firing both and hoping would close the document before the file
+    // existed. `close` rather than `quit` as the intent, so the session survives to prove
+    // the bytes landed.
+    let document = fixture("e2e-guard-save.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let id = serve.send("delete_page", &[("page", Value::from(2))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+
+    let id = serve.send("close", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("needs_answer")
+    );
+
+    let id = serve.send("answer", &[("choice", Value::from("save"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("saving"),
+        "answering save must not claim the file is written yet"
+    );
+
+    // The write lands first, and only then is the document closed.
+    serve.wait_for_event("saved");
+    serve.wait_for_event("document_closed");
+    let snapshot = serve.snapshot();
+    // `document` is serialized as null when nothing is open rather than being omitted,
+    // so this asks whether there is a path, not whether the key is there.
+    assert!(
+        snapshot.get("document").and_then(Value::as_str).is_none(),
+        "still open: {snapshot}"
+    );
+    assert_eq!(snapshot.get("awaiting_answer"), None);
+
+    // And the file really has the shorter document, so what was saved was the edit
+    // rather than whatever was on disk before.
+    let mut reopened = Serve::start(&document);
+    reopened.wait_for_event("idle");
+    assert_eq!(
+        reopened.view().get("page_count").and_then(Value::as_u64),
+        Some(PAGES as u64 - 1),
+        "the file does not contain the edit that was saved for us"
+    );
+    reopened.quit();
+
+    serve.quit();
+}
+
+#[test]
+fn a_saved_document_stops_claiming_unsaved_changes() {
+    let Some(_window) = e2e("a_saved_document_stops_claiming_unsaved_changes") else {
+        return;
+    };
+
+    // Before this, `unsaved_changes` meant "differs from the document as first opened"
+    // and nothing ever cleared it — so a saved file went on claiming changes forever.
+    // Survivable while it only lit a status bar; not survivable once a warning is built
+    // on it, because a warning that fires when nothing is at risk is one people learn to
+    // click straight through.
+    let document = fixture("e2e-guard-clean.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    make_it_dirty(&mut serve);
+
+    let id = serve.send("save", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("saving")
+    );
+    serve.wait_for_event("saved");
+
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(false),
+        "still claiming unsaved changes after writing them: {snapshot}"
+    );
+
+    // Which means quitting is not questioned at all — and `quit` fails rather than
+    // hanging if it ever is, so this line is the assertion.
+    serve.quit();
+}
+
+#[test]
+fn answering_save_with_nothing_left_to_save_still_goes_ahead() {
+    let Some(_window) = e2e("answering_save_with_nothing_left_to_save_still_goes_ahead") else {
+        return;
+    };
+
+    // Reachable because the question box does not block the control channel: the order
+    // can be put back while it is up. "Save, then continue" with nothing to save is just
+    // "continue" — leaving the question standing would strand it with no answer that
+    // works, since saving an unedited document over itself is refused by design.
+    let document = fixture("e2e-guard-nothing-to-save.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    make_it_dirty(&mut serve);
+
+    let id = serve.send("close", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("needs_answer")
+    );
+
+    // Undo, so the document matches the file again while the question waits.
+    let id = serve.send("undo", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited")
+    );
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("unsaved_changes")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let id = serve.send("answer", &[("choice", Value::from("save"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("closed"),
+        "stranded the question with nothing to save"
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn answering_when_nothing_was_asked_does_nothing() {
+    let Some(_window) = e2e("answering_when_nothing_was_asked_does_nothing") else {
+        return;
+    };
+
+    // A stray `answer` must not be a way to close the document by accident. Worth
+    // pinning because `discard` is the destructive choice and this is the path a
+    // confused client takes.
+    let document = fixture("e2e-guard-stray.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    for choice in ["discard", "save", "cancel"] {
+        let id = serve.send("answer", &[("choice", Value::from(choice))]);
+        let reply = serve.reply_to(id);
+        assert_eq!(
+            reply.get("outcome").and_then(Value::as_str),
+            Some("unchanged"),
+            "a stray {choice} did something: {reply}"
+        );
+    }
+
+    let snapshot = serve.snapshot();
+    assert!(
+        snapshot.get("document").and_then(Value::as_str).is_some(),
+        "a stray answer closed the document: {snapshot}"
+    );
+
+    serve.quit();
 }

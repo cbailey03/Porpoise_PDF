@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use porpoise_view::{PageNumber, ViewCommand};
 
+use crate::confirm::Answer;
+
 /// Anything an operator — a person at the keyboard, or an agent — can ask of the
 /// program.
 ///
@@ -75,7 +77,19 @@ pub(crate) enum Command {
         /// Whether the grid should be showing.
         visible: bool,
     },
+    /// Answer the question raised when something would discard unsaved page changes.
+    ///
+    /// Does nothing when nothing is waiting on an answer. See [`crate::confirm`] for why
+    /// this is a command rather than a click-only button: it is the way *out* of the
+    /// question, and a question an agent cannot answer is one it can be stuck behind.
+    Answer {
+        /// Save first, go ahead anyway, or stay put.
+        choice: Answer,
+    },
     /// Close the window and exit.
+    ///
+    /// Refused with `needs_answer` while there are unsaved page changes, until an
+    /// [`Self::Answer`] settles it.
     Quit,
 }
 
@@ -93,6 +107,7 @@ impl Command {
             Self::Save => "save",
             Self::SaveAs { .. } => "save_as",
             Self::SetThumbnails { .. } => "set_thumbnails",
+            Self::Answer { .. } => "answer",
             Self::Quit => "quit",
         }
     }
@@ -128,6 +143,9 @@ impl Command {
                 path: placeholder(),
             },
             Self::SetThumbnails { visible: true },
+            Self::Answer {
+                choice: Answer::Cancel,
+            },
             Self::Quit,
         ]
     }
@@ -193,6 +211,7 @@ mod tests {
                 | Command::Save
                 | Command::SaveAs { .. }
                 | Command::SetThumbnails { .. }
+                | Command::Answer { .. }
                 | Command::Quit => {}
             }
         }
@@ -201,7 +220,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            10,
+            11,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

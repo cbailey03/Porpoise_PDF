@@ -38,6 +38,7 @@ use porpoise_view::{PageNumber, Rejection, ViewCommand, ViewSnapshot};
 use serde::Serialize;
 
 use crate::command::Command;
+use crate::confirm::Answer;
 
 /// Longest line we will accept, so a client cannot exhaust memory by never
 /// sending a newline.
@@ -239,6 +240,23 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
                     .at(id)
                 })?,
         }),
+        "answer" => RequestBody::Command(Command::Answer {
+            choice: object
+                .get("choice")
+                .and_then(|raw| serde_json::from_value::<Answer>(raw.clone()).ok())
+                .ok_or_else(|| {
+                    DecodeError::BadArguments {
+                        command: name.to_owned(),
+                        // Names the alternatives, because an agent that guessed
+                        // "yes" has no other way to find out what to say.
+                        detail: format!(
+                            "expected \"choice\" to be one of: {}",
+                            Answer::ALL.join(", ")
+                        ),
+                    }
+                    .at(id)
+                })?,
+        }),
         "quit" => RequestBody::Command(Command::Quit),
         other => {
             // A view command is internally tagged on the same `command` field, so
@@ -289,7 +307,18 @@ pub(crate) struct Snapshot {
     /// Whether the page grid is showing.
     pub(crate) thumbnails: bool,
     /// Whether the page order differs from the file on disk.
+    ///
+    /// False again once a save of that exact order reports success — so a document that
+    /// has just been written does not go on claiming changes.
     pub(crate) unsaved_changes: bool,
+    /// What is waiting on an `answer` command, because carrying it out would discard
+    /// unsaved page changes. `None` when nothing is waiting.
+    ///
+    /// The same sentence a person is reading in the question box. A client that gets
+    /// `needs_answer` back from `quit`, `close` or `open` finds out here what it is being
+    /// asked about, then replies with `answer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) awaiting_answer: Option<String>,
     /// Whether there is a page edit to undo.
     pub(crate) can_undo: bool,
     /// Where a save in flight is going, if one is running.
@@ -378,7 +407,8 @@ pub(crate) struct Reply {
     pub(crate) id: Option<u64>,
     /// Whether the request was carried out.
     pub(crate) ok: bool,
-    /// `changed`, `unchanged`, `opened`, `closed`, `quitting`, or `capturing`.
+    /// `changed`, `unchanged`, `opened`, `closed`, `quitting`, `capturing`, `edited`,
+    /// `saving`, `needs_answer`, or `cancelled`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) outcome: Option<&'static str>,
     /// Why it was refused, when `ok` is false.
@@ -572,6 +602,49 @@ mod tests {
         );
         assert_eq!(command(r#"{"command":"close"}"#), Command::Close);
         assert_eq!(command(r#"{"command":"quit"}"#), Command::Quit);
+    }
+
+    #[test]
+    fn an_answer_decodes_each_of_its_three_choices() {
+        for (wire, expected) in [
+            ("save", Answer::Save),
+            ("discard", Answer::Discard),
+            ("cancel", Answer::Cancel),
+        ] {
+            assert_eq!(
+                command(&format!(r#"{{"command":"answer","choice":"{wire}"}}"#)),
+                Command::Answer { choice: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_that_means_nothing_lists_the_ones_that_do() {
+        // An agent that guessed "yes" has no other way to find out what to say, and
+        // this is the command that gets it *out* of a question — a bad error here is
+        // the difference between recovering and being stuck.
+        let error =
+            decode(r#"{"id":2,"command":"answer","choice":"yes"}"#).expect_err("should be refused");
+        assert_eq!(
+            error.id,
+            Some(2),
+            "lost the id, so the client cannot match it"
+        );
+        let message = error.to_string();
+        for choice in Answer::ALL {
+            assert!(message.contains(choice), "{choice} missing from: {message}");
+        }
+    }
+
+    #[test]
+    fn an_answer_with_no_choice_is_refused() {
+        for line in [
+            r#"{"command":"answer"}"#,
+            r#"{"command":"answer","choice":null}"#,
+            r#"{"command":"answer","choice":7}"#,
+        ] {
+            assert!(decode(line).is_err(), "{line} was accepted");
+        }
     }
 
     #[test]

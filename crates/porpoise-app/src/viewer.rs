@@ -58,6 +58,7 @@ use porpoise_view::{
 };
 
 use crate::command::Command;
+use crate::confirm::{self, Answer, Guard, Intent};
 use crate::control::Control;
 use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
@@ -289,6 +290,21 @@ struct Viewer {
     /// Whether the page grid is showing. See [`crate::thumbnails`].
     thumbnails: bool,
 
+    /// A request held back because it would discard unsaved page changes.
+    ///
+    /// See [`crate::confirm`]. `None` whenever nothing is waiting, which is almost
+    /// always.
+    guard: Option<Guard>,
+
+    /// Whether the window has been told to close for real.
+    ///
+    /// Load-bearing, not defensive. `ViewportCommand::Close` comes back round as a
+    /// close *request* on the next frame — egui-winit pushes it onto the same event
+    /// queue the X button feeds — so a close interception with no way to tell "the
+    /// person clicked X" from "we asked to close" re-raises the question forever and the
+    /// window can never be shut. Checked in egui 0.35's source rather than discovered.
+    quitting: bool,
+
     /// Why the last command failed, for the person to read.
     ///
     /// Failures used to go only to `tracing::warn!`, which for a windowed app means
@@ -357,6 +373,8 @@ impl Viewer {
             picker: FilePicker::default(),
             saver: Saver::default(),
             thumbnails: false,
+            guard: None,
+            quitting: false,
             last_error: None,
             frame: 0,
             benchmark,
@@ -430,10 +448,13 @@ impl Viewer {
             failed_pages,
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
-            unsaved_changes: self
-                .open
-                .as_ref()
-                .is_some_and(|open| !open.order.is_unedited()),
+            unsaved_changes: self.unsaved_changes(),
+            awaiting_answer: match &self.guard {
+                Some(Guard::Asking(intent)) => Some(intent.describe()),
+                // A `Saving` guard has already been answered; it is waiting on the disk,
+                // not on anybody, and `saving_to` below is what reports it.
+                Some(Guard::Saving(_)) | None => None,
+            },
             can_undo: self.open.as_ref().is_some_and(|open| open.order.can_undo()),
             saving_to: self
                 .saver
@@ -463,9 +484,22 @@ impl Viewer {
             && self.state.requested_scroll_left_pt().is_none();
         // A save in flight is outstanding work too. Reporting idle during one would
         // let a client read the file before it exists.
+        //
+        // So is a question nobody has answered. The program itself has nothing left to
+        // do, but the thing that was asked for has not happened — and `idle` means
+        // "everything you asked for is done", not "the CPU is quiet". A client that read
+        // idle after `quit` would believe the window had closed.
         no_pending_move
+            && self.guard.is_none()
             && !self.saver.is_busy()
             && self.open.as_ref().is_none_or(OpenDocument::settled)
+    }
+
+    /// Whether the page order differs from the file it came from.
+    fn unsaved_changes(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| !open.order.is_unedited())
     }
 
     // --- Control channel ----------------------------------------------------
@@ -552,6 +586,20 @@ impl Viewer {
     /// every producer — keyboard, toolbar, picker, control channel — reports failure
     /// the same way rather than each remembering to.
     fn dispatch(&mut self, ctx: &egui::Context, command: Command) -> DispatchResult {
+        // In front of `carry_out`, so every producer — the X button, the keyboard, the
+        // toolbar, a file drop, the control channel — is covered by one check rather
+        // than each remembering to make it. See [`crate::confirm`] for why this guards
+        // the command instead of the gesture.
+        if self.unsaved_changes()
+            && !self.quitting
+            && let Some(intent) = confirm::intent_of(&command)
+        {
+            // A newer request replaces an older unanswered one. The alternative is
+            // stacking questions, and nobody wants to answer two.
+            self.guard = Some(Guard::Asking(intent));
+            return DispatchResult::NeedsAnswer;
+        }
+
         let result = self.carry_out(ctx, command);
         match &result {
             DispatchResult::Failed(message) => self.last_error = Some(message.clone()),
@@ -627,32 +675,8 @@ impl Viewer {
                 }
                 DispatchResult::View(outcome)
             }
-            Command::Open { path } => match Document::open(&path) {
-                Ok(document) => {
-                    let bucket = self.view().bucket();
-                    let page_count = document.page_count();
-                    let reported = path.display().to_string();
-                    self.open = Some(OpenDocument::new(path, document, bucket));
-                    // A new document invalidates where we were looking.
-                    self.state = ViewState::new();
-                    self.applied_start_page = false;
-                    self.emit(|| Event::DocumentOpened {
-                        path: reported,
-                        page_count,
-                    });
-                    DispatchResult::Opened
-                }
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "could not open document");
-                    DispatchResult::Failed(error.to_string())
-                }
-            },
-            Command::Close => {
-                self.open = None;
-                self.state = ViewState::new();
-                self.emit(|| Event::DocumentClosed);
-                DispatchResult::Closed
-            }
+            Command::Open { path } => self.open_document(path),
+            Command::Close => self.close_document(),
             Command::MovePage { from, to } => {
                 self.edit(|order| order.move_page(from.index(), to.index()))
             }
@@ -693,9 +717,105 @@ impl Viewer {
                 ));
                 DispatchResult::CaptureStarted
             }
-            Command::Quit => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                DispatchResult::Quitting
+            Command::Answer { choice } => self.answer(ctx, choice),
+            Command::Quit => self.quit(ctx),
+        }
+    }
+
+    // --- The three things that discard a document ---------------------------
+
+    // Split out of `carry_out` so that answering a question can perform one *without*
+    // going back through `dispatch`, which would guard it again and ask forever.
+
+    fn open_document(&mut self, path: PathBuf) -> DispatchResult {
+        match Document::open(&path) {
+            Ok(document) => {
+                let bucket = self.view().bucket();
+                let page_count = document.page_count();
+                let reported = path.display().to_string();
+                self.open = Some(OpenDocument::new(path, document, bucket));
+                // A new document invalidates where we were looking.
+                self.state = ViewState::new();
+                self.applied_start_page = false;
+                self.emit(|| Event::DocumentOpened {
+                    path: reported,
+                    page_count,
+                });
+                DispatchResult::Opened
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not open document");
+                DispatchResult::Failed(error.to_string())
+            }
+        }
+    }
+
+    fn close_document(&mut self) -> DispatchResult {
+        self.open = None;
+        self.state = ViewState::new();
+        self.emit(|| Event::DocumentClosed);
+        DispatchResult::Closed
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) -> DispatchResult {
+        // Set before asking, so the close request this produces is recognised as ours
+        // when it arrives back next frame. Without it the guard re-fires and the window
+        // cannot be closed at all.
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        DispatchResult::Quitting
+    }
+
+    /// Carries out a held-back request, past the guard.
+    fn carry_out_intent(&mut self, ctx: &egui::Context, intent: Intent) -> DispatchResult {
+        match intent {
+            Intent::Quit => self.quit(ctx),
+            Intent::CloseDocument => self.close_document(),
+            Intent::Open(path) => self.open_document(path),
+        }
+    }
+
+    /// Settles a question about unsaved page changes.
+    fn answer(&mut self, ctx: &egui::Context, choice: Answer) -> DispatchResult {
+        let intent = match self.guard.take() {
+            Some(Guard::Asking(intent)) => intent,
+            // A `Saving` guard has already been answered and is waiting on the disk
+            // rather than on anybody. Put it back: losing it here would leave the save
+            // running and the thing it was for forgotten.
+            waiting => {
+                self.guard = waiting;
+                return DispatchResult::Unchanged;
+            }
+        };
+
+        match choice {
+            Answer::Cancel => DispatchResult::Cancelled,
+            Answer::Discard => self.carry_out_intent(ctx, intent),
+            Answer::Save => {
+                let Some(open) = &self.open else {
+                    // Nothing to save, so there is nothing being protected either.
+                    return self.carry_out_intent(ctx, intent);
+                };
+                let destination = open.path.clone();
+                match self.begin_save(destination, Overwrite::Allow) {
+                    DispatchResult::Saving => {
+                        self.guard = Some(Guard::Saving(intent));
+                        DispatchResult::Saving
+                    }
+                    // Nothing left to write — the order got put back while the question
+                    // was up, which an agent can do because the control channel is not
+                    // blocked by the box. "Save, then continue" with nothing to save is
+                    // just "continue"; leaving the question up here would strand it with
+                    // no answer that works.
+                    DispatchResult::Unchanged => self.carry_out_intent(ctx, intent),
+                    // The save could not start. Leave the question up rather than going
+                    // ahead: throwing the changes away because the save failed is the
+                    // opposite of what was asked for.
+                    refused => {
+                        self.guard = Some(Guard::Asking(intent));
+                        refused
+                    }
+                }
             }
         }
     }
@@ -792,8 +912,29 @@ impl Viewer {
         }
     }
 
+    /// Turns the window's close button into a `Quit` command.
+    ///
+    /// So the X, `Alt+F4`, the taskbar's Close, and `quit` from an agent all take one
+    /// path and meet one guard. The alternative — checking for unsaved changes here as
+    /// well as in dispatch — is how two producers end up disagreeing.
+    fn intercept_close(&mut self, ctx: &egui::Context) {
+        // `quitting` is what stops this from firing on the close *we* asked for. See the
+        // field's own note: egui-winit feeds `ViewportCommand::Close` back through the
+        // same queue as the X button.
+        if self.quitting || !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.dispatch(ctx, Command::Quit) == DispatchResult::NeedsAnswer {
+            // eframe decides whether to exit from *this* frame's commands, so the cancel
+            // has to go out now rather than next frame. Only sent when the question is
+            // up: on the way through, `quit` has already asked to close and cancelling
+            // as well would just delay it a frame.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+    }
+
     /// Reports a finished save. Never blocks.
-    fn collect_save(&mut self) {
+    fn collect_save(&mut self, ctx: &egui::Context) {
         let Some(saved) = self.saver.poll() else {
             return;
         };
@@ -801,7 +942,22 @@ impl Viewer {
         match saved.error {
             None => {
                 self.last_error = None;
+                if let Some(open) = &mut self.open {
+                    // The file we are editing is now the one just written, so a Save As
+                    // switches to it — what every editor does, and what stops the status
+                    // bar nagging about a document that has been saved somewhere.
+                    open.path = saved.path;
+                    // The order the *write* saw, not the current one. If pages were
+                    // moved while the save ran, those moves are still unsaved and this
+                    // is what keeps that true.
+                    open.order.mark_saved(&saved.written);
+                }
                 self.emit(|| Event::Saved { path: where_to });
+
+                // A question answered with "save first" was waiting on exactly this.
+                if let Some(Guard::Saving(intent)) = self.guard.take() {
+                    self.carry_out_intent(ctx, intent);
+                }
             }
             Some(error) => {
                 tracing::warn!(path = %saved.path.display(), %error, "could not save");
@@ -809,6 +965,13 @@ impl Viewer {
                 // somebody believing their reordering is on disk.
                 self.last_error = Some(error.clone());
                 self.emit(|| Event::SaveFailed { error });
+
+                // Put the question back rather than going ahead. Quitting now would
+                // throw the changes away *because* the save failed, which is the one
+                // moment they matter most.
+                if let Some(Guard::Saving(intent)) = self.guard.take() {
+                    self.guard = Some(Guard::Asking(intent));
+                }
             }
         }
     }
@@ -1248,6 +1411,61 @@ impl Viewer {
         }
     }
 
+    /// Asks about unsaved page changes, and dispatches the answer.
+    ///
+    /// The three buttons produce the same `answer` command an agent sends, so there is
+    /// no click-only path out of the question — which is what keeps the whole flow
+    /// testable. See [`crate::confirm`].
+    fn draw_question(&mut self, ctx: &egui::Context) {
+        // Read as an owned string so the borrow of `self.guard` ends before dispatch.
+        let Some(Guard::Asking(intent)) = &self.guard else {
+            return;
+        };
+        let what = intent.describe();
+
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("porpoise-unsaved")).show(ctx, |ui| {
+            ui.set_min_width(380.0);
+            ui.heading("Unsaved page changes");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "The pages have been reordered and not written to the file. \
+                 Continuing to {what} will lose those changes."
+            ));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                // Save first, because it is the answer that loses nothing.
+                if ui
+                    .button("Save, then continue")
+                    .on_hover_text("Write the changes over the file, then go ahead")
+                    .clicked()
+                {
+                    choice = Some(Answer::Save);
+                }
+                if ui
+                    .button("Discard changes")
+                    .on_hover_text("Go ahead and lose the reordering")
+                    .clicked()
+                {
+                    choice = Some(Answer::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(Answer::Cancel);
+                }
+            });
+        });
+
+        // Escape, or clicking outside the box. Treated as Cancel because that is the
+        // answer that changes nothing — a dismissal must never be the destructive one.
+        if choice.is_none() && modal.should_close() {
+            choice = Some(Answer::Cancel);
+        }
+
+        if let Some(choice) = choice {
+            self.dispatch(ctx, Command::Answer { choice });
+        }
+    }
+
     /// Paints what a drop would do, while the files are still in the air.
     ///
     /// Drawn from the same [`drop_action`] the drop itself uses, so the window cannot
@@ -1270,10 +1488,7 @@ impl Viewer {
             return;
         };
 
-        let unsaved = self
-            .open
-            .as_ref()
-            .is_some_and(|open| !open.order.is_unedited());
+        let unsaved = self.unsaved_changes();
         let colour = match action {
             DropAction::Open { .. } => egui::Color32::WHITE,
             DropAction::Refuse { .. } => egui::Color32::from_rgb(240, 150, 150),
@@ -1393,10 +1608,7 @@ impl Viewer {
                 issued.push(Command::Undo);
             }
 
-            let edited = self
-                .open
-                .as_ref()
-                .is_some_and(|open| !open.order.is_unedited());
+            let edited = self.unsaved_changes();
             if ui
                 .add_enabled(edited && !self.saver.is_busy(), egui::Button::new("Save"))
                 .on_hover_text("Write the changes over the original (Ctrl+S)")
@@ -1526,11 +1738,7 @@ impl Viewer {
                         |name| name.to_string_lossy().into_owned()
                     )
                 ));
-            } else if self
-                .open
-                .as_ref()
-                .is_some_and(|open| !open.order.is_unedited())
-            {
+            } else if self.unsaved_changes() {
                 ui.separator();
                 ui.colored_label(ui.visuals().warn_fg_color, "unsaved changes");
             }
@@ -1620,6 +1828,10 @@ enum DispatchResult {
     Edited,
     /// A save has *started*. Like a capture, the file does not exist yet.
     Saving,
+    /// Held back because it would discard unsaved page changes. Nothing happened yet.
+    NeedsAnswer,
+    /// A held-back request was abandoned. Nothing happened, deliberately.
+    Cancelled,
     /// The command asked for something that was already true.
     Unchanged,
     Quitting,
@@ -1645,6 +1857,11 @@ impl DispatchResult {
             // that treated this as completion would read a file that is not there yet;
             // it has to wait for the `saved` event or for `idle`.
             Self::Saving => Reply::ok(id, "saving"),
+            // `ok`, because being asked is not an error — but emphatically *not*
+            // carried out. A client reads `awaiting_answer` in the snapshot to find out
+            // what it is being asked, then replies with `answer`.
+            Self::NeedsAnswer => Reply::ok(id, "needs_answer"),
+            Self::Cancelled => Reply::ok(id, "cancelled"),
             Self::Unchanged => Reply::ok(id, "unchanged"),
             Self::Quitting => Reply::ok(id, "quitting"),
             Self::Failed(error) => Reply::failed(id, error),
@@ -1667,7 +1884,10 @@ impl eframe::App for Viewer {
         self.collect_renders(ctx);
         self.collect_picked_file(ctx);
         self.collect_dropped_files(ctx);
-        self.collect_save();
+        self.collect_save(ctx);
+        // Before `handle_input`, so a close request is answered on the frame it arrives:
+        // eframe reads the cancel from this frame's output and exits otherwise.
+        self.intercept_close(ctx);
         self.handle_input(ctx);
         self.serve_control(ctx);
         self.timing.logic_ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -1701,7 +1921,9 @@ impl eframe::App for Viewer {
         }
         self.draw_pages(ui);
         // Last, and over everything: a drag can be anywhere on the window.
-        self.draw_drop_hint(ui.ctx());
+        let ctx = ui.ctx().clone();
+        self.draw_drop_hint(&ctx);
+        self.draw_question(&ctx);
 
         // Our own cost, as distinct from the frame interval. If this stays well
         // under the frame budget, the pipeline has headroom.

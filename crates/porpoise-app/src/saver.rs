@@ -23,6 +23,13 @@ use porpoise_doc::{Overwrite, PageOrder, save_reordered};
 pub(crate) struct Saved {
     /// Where it was written.
     pub(crate) path: PathBuf,
+    /// The page order that went into the file, in display order.
+    ///
+    /// Reported back rather than re-read from the document, because the order can move
+    /// while the write runs — see [`Saver::start`]. This is what
+    /// `PageOrder::mark_saved` needs to get "unsaved changes" right when somebody keeps
+    /// editing during a save.
+    pub(crate) written: Vec<usize>,
     /// What went wrong, if anything.
     pub(crate) error: Option<String>,
 }
@@ -67,6 +74,9 @@ impl Saver {
         let order = order.clone();
         let destination = destination.to_path_buf();
         let reported = destination.clone();
+        // Taken here, on the UI thread, so it is unambiguously the order the write is
+        // about — even if the pages move again a millisecond from now.
+        let written = order.as_slice().to_vec();
 
         std::thread::spawn(move || {
             let error = save_reordered(&source, &order, &destination, overwrite)
@@ -76,6 +86,7 @@ impl Saver {
             // written or already refused; there is nobody left to tell.
             let _ = sender.send(Saved {
                 path: destination,
+                written,
                 error,
             });
         });
@@ -102,6 +113,10 @@ impl Saver {
                 self.pending = None;
                 Some(Saved {
                     path,
+                    // Empty because nothing is known to have reached the file. It is
+                    // never read on a failure, and an order invented here could mark a
+                    // document saved that was not.
+                    written: Vec::new(),
                     error: Some("the save did not report back".to_owned()),
                 })
             }
@@ -159,6 +174,32 @@ mod tests {
         assert_eq!(saved.path, destination);
         assert!(destination.exists());
         assert!(!saver.is_busy(), "still busy after reporting");
+    }
+
+    #[test]
+    fn a_save_reports_the_order_it_wrote() {
+        // Not the order at the time it finished. That is the whole reason this travels
+        // back: the pages can be moved again during the second a big save takes, and
+        // marking those moves as written would be a lie about where somebody's work is.
+        let source = scratch("reported-source.pdf");
+        std::fs::write(&source, multi_page_pdf(3, 200, 100)).expect("write fixture");
+        let destination = scratch("reported-out.pdf");
+
+        let mut saver = Saver::default();
+        let mut order = PageOrder::identity(3);
+        assert!(order.move_page(0, 2));
+        let expected = order.as_slice().to_vec();
+        assert!(saver.start(&source, &order, &destination, Overwrite::Refuse));
+
+        // Kept editing while the write ran, exactly as a person would.
+        assert!(order.move_page(0, 1));
+
+        let saved = wait(&mut saver);
+        assert_eq!(saved.error, None, "save failed: {saved:?}");
+        assert_eq!(
+            saved.written, expected,
+            "reported an order the write never saw"
+        );
     }
 
     #[test]

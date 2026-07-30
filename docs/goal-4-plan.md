@@ -194,11 +194,71 @@ Confirmed by hand: pages land where you expect when you let go. That is the whol
 this one, and it will stay that way unless a way to inject synthetic pointer events arrives — worth
 remembering if the drop behaviour is ever changed, because nothing will fail if it breaks.
 
+## 8. Asking before unsaved changes are lost
+
+Closed the largest gap this goal left. Reorder twenty pages, click the X, and they were gone — no
+prompt, no message. The program *knew*: the status bar said *unsaved changes*. Nothing acted on it.
+
+### First, "unsaved changes" had to mean it
+
+`PageOrder::is_unedited` compared the order against the document **as first opened**, and nothing ever
+moved that baseline. So a saved document went on claiming changes forever: the status bar nagged and the
+Save button stayed lit even though the file matched exactly.
+
+Survivable while it only lit a status bar. Not survivable underneath a warning — **a warning that fires
+when nothing is at risk is one people learn to click straight through**, which would have made the
+feature worse than useless. So `PageOrder` now holds the order as it stands in the file, and
+`mark_saved` moves it when a save reports success.
+
+`mark_saved` takes **the order that was written**, not the current one. A save runs off the UI thread
+and takes about a second on 400 pages, so there is a real window in which pages get moved again;
+marking those as saved would tell somebody their work is on disk when only the earlier version is.
+Passing the written order back from the saver makes that case come out right on its own.
+
+A save also re-points the document at the file just written, so **Save As switches you to the new
+file** — what every editor does, and what stops the nagging after a Save As.
+
+### The guard is on the command, not the gesture
+
+Everywhere else this project keeps dialogs off the command surface, because a box only a person can
+dismiss is a box an agent can get stuck behind (`goal-3-plan.md` §1). The obvious reading here would be
+to raise the question from the X button, from `Ctrl+O` and from a file drop.
+
+That reading is wrong twice over. It repeats the check three times, so a fourth producer arrives
+unguarded. And it would make the **most safety-critical behaviour in the program the only one with no
+automated test**, because nothing can press an X.
+
+So the guard sits in front of dispatch, and an agent gets the same protection a person does — which is
+not a special case, since an agent that reorders pages and then opens another file loses work exactly
+as a person would. The way out is `answer`, a real command with `save`, `discard` and `cancel`. Five
+end-to-end tests cover the flow as a result, including the ordering that is easy to get wrong: answering
+*save* must wait for the file to land before carrying the request out, not fire both and hope.
+
+The X button reaches the same place. A close request is intercepted and turned into `Quit`, so the
+window button, `Alt+F4`, the taskbar and an agent all take one path.
+
+**`ViewportCommand::Close` comes back round as a close request.** egui-winit pushes it onto the same
+event queue the X button feeds, so an interception that cannot tell "somebody clicked X" from "we asked
+to close" re-raises the question forever and the window can never be shut. A `quitting` flag is what
+stops that. Found by reading egui 0.35's source before writing the code rather than by watching a window
+refuse to die.
+
+### What is not guarded
+
+- **The control channel hanging up.** There is nobody left to ask, so the window closes and the edit is
+  lost.
+- **A minimised window.** `intercept_close` runs in the pre-pass, which always runs, but the box is
+  drawn in `ui`, which does not run while minimised. Closing from the taskbar therefore raises a
+  question that is invisible until the window is restored — the same shape as the minimised-window
+  behaviour recorded in `viewer.rs`.
+
+Verified against the real window by posting `WM_CLOSE`, which is exactly what the X sends: with a clean
+document it exits 0 as before, and with a reordered one it stays up reporting `awaiting_answer: "quit"`
+and `idle: false`, then exits on `discard`.
+
 ## 6. Known gaps
 
 - **Nested page trees are refused** (§2). The fix is inherited-attribute push-down.
-- **No warning when closing or replacing a document with unsaved changes.** The snapshot knows, but
-  nothing asks. One narrow exception: dropping a file onto the window warns in the drop hint, because
-  there the mouse button is still down and it was free (`goal-3-plan.md` §6). Closing the window, and
-  `Ctrl+O`, still discard an edit in silence.
 - **Whole-file rewrite on every save**, so saving a 132 MB document rewrites 132 MB.
+- **The window title never changes.** Set once at startup, so it is stale after any `open` — including
+  the one a Save As now implies.

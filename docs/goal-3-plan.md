@@ -187,11 +187,13 @@ itself both come from **one** `drop_action`, so the window cannot invite a drop 
 pins exactly that: for any set of paths, the hint agrees with the action. Computing them separately
 would be worse than having no hint at all, which is why they are not allowed to be two functions.
 
-This is also the one honest place to warn about **losing unsaved page changes**. Opening a document
-replaces the one on screen and nothing asks first (`goal-4-plan.md` §6) — but while the mouse button is
-still down, saying so costs nothing. So a drop onto an edited document reads *"Open other.pdf — your
-unsaved page changes will be lost"*. That is not a fix for the missing confirmation; it narrows it to
-the one path where a warning was free.
+A drop onto an edited document also says so, so the drag can be abandoned rather than answered: *"Open
+other.pdf — you will be asked about your unsaved page changes"*.
+
+That sentence originally read *"your unsaved page changes will be lost"*, which was true when this hint
+was the only warning in the program. It stopped being true when `goal-4-plan.md` §8 added a real
+confirmation, and was updated in the same change — **a warning that overstates what is at stake is one
+people stop believing**, which would have undermined both of them.
 
 ### egui's two file-input shapes, which are not the same
 

@@ -19,8 +19,8 @@ damaged input averages 7 µs.
 
 Open a file by dragging it onto the window, with `Ctrl+O` or the **Open…** button, or by passing a path
 on the command line. Launching with no path opens an empty window rather than refusing to start. While
-a file is held over the window, an overlay says what letting go will do — including a warning if it
-would discard unsaved page changes.
+a file is held over the window, an overlay says what letting go will do — including whether it will stop
+to ask about unsaved page changes.
 
 `Ctrl+T` opens a grid of page thumbnails you can drag pages around in. Pages can also be reordered and
 deleted from the toolbar or the keyboard, with undo, then written back with **Save** or to a new file with
@@ -28,6 +28,11 @@ deleted from the toolbar or the keyboard, with undo, then written back with **Sa
 untouched — it writes beside the file and renames into place. Documents whose page tree is nested are
 refused rather than reordered, because reordering one can silently change what pages inherit; all
 three drawing sets tested here are flat. See `docs/goal-4-plan.md` section 2.
+
+Closing the window, or opening another file, with pages reordered and unsaved **asks first** — save,
+discard, or cancel. The question is guarded at the command rather than at the button, so an agent gets the
+same protection and answers it the same way; that is also what makes the whole flow testable. See
+`docs/goal-4-plan.md` section 8.
 
 Rendering fidelity is validated against real documents and for determinism, not against another
 engine. Comparing output to PDFium is explicitly a non-goal: building this in pure Rust is the
@@ -38,7 +43,7 @@ sections 1 and 6a.
 
 | | |
 |---|---|
-| `Ctrl` `O` | Open a PDF |
+| `Ctrl` `O` | Open a PDF (or drag one onto the window) |
 | `Ctrl` `↑` / `Ctrl` `↓` | Move this page earlier / later |
 | `Ctrl` `T` | Show or hide the page grid |
 | `Ctrl` `Z` | Undo the last page edit |
@@ -134,12 +139,18 @@ Send `{"command":"commands"}` for the full list and `{"command":"snapshot"}` for
 current state. The file argument is optional — send `{"command":"open","path":"…"}`
 instead.
 
-Three things worth knowing:
+Four things worth knowing:
 
 - **Wait for `idle` before capturing or asserting.** It means nothing is queued and
   everything visible is drawn. Acting before it gets you placeholder tiles.
 - **Page numbers start at 1**, here and everywhere else. `{"page":0}` is refused.
-- **Closing stdin exits the program**, the way every other stdio protocol behaves.
+- **`quit`, `close` and `open` can come back `needs_answer`** when pages have been
+  reordered and not saved. Nothing has happened yet; read `awaiting_answer` in the
+  snapshot to see what is being asked, then reply with
+  `{"command":"answer","choice":"save"|"discard"|"cancel"}`. You get the same
+  protection a person does, for the same reason.
+- **Closing stdin exits the program**, the way every other stdio protocol behaves —
+  including with unsaved changes, because by then there is nobody left to ask.
 
 This is off unless you ask for it, and it is stdio only — no port is opened. Be
 clear about what you are granting: the controlling process can open any file you can

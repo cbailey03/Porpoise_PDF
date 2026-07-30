@@ -508,6 +508,76 @@ fn an_empty_window_can_still_be_captured() {
 }
 
 #[test]
+fn idle_is_never_reported_while_a_move_is_still_pending() {
+    let Some(_window) = e2e("idle_is_never_reported_while_a_move_is_still_pending") else {
+        return;
+    };
+
+    // `idle` is the field every client is told to wait on, so it must not be true while
+    // the view still has somewhere to go. It used to count only render work, and a
+    // scroll command records a *request* that the shell carries out while painting — so
+    // for a frame after every command, `idle` was true and the view had not moved.
+    //
+    // A minimised window turns that one-frame window into an indefinite one, because
+    // painting stops entirely. Driving one by hand, `go_to_page 7` replied "changed",
+    // reported `idle: true`, and left `current_page` at 3 until the window came back.
+    //
+    // It reads the *event stream* rather than polling snapshots, and that distinction is
+    // the whole test. On a visible window the bad frame is about 16 ms wide, and a
+    // snapshot round-trip through the pipe is slower than that — so a polling version of
+    // this test passed against the unfixed code, which is how it was found to be
+    // worthless. `view_changed` is emitted inside the same frame that accepted the
+    // command, before the frame's painting consumes the request, so the offending state
+    // appears there and nowhere else.
+    let document = fixture("e2e-idle-honesty.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    for page in [4, 2, 6, 1] {
+        let id = serve.send("go_to_page", &[("page", Value::from(page))]);
+        assert_eq!(
+            serve.reply_to(id).get("ok").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // Every message until this move settles, checking each reported state.
+        loop {
+            let message = serve.next_message();
+            if message.get("event").and_then(Value::as_str) == Some("idle") {
+                break;
+            }
+            let Some(snapshot) = message.get("snapshot") else {
+                continue;
+            };
+            let Some(view) = snapshot.get("view") else {
+                continue;
+            };
+            if snapshot.get("idle").and_then(Value::as_bool) == Some(true) {
+                assert_eq!(
+                    view.get("pending_scroll_pt"),
+                    Some(&Value::Null),
+                    "claimed idle with a move still pending: {view}"
+                );
+                assert_eq!(
+                    view.get("pending_scroll_left_pt"),
+                    Some(&Value::Null),
+                    "claimed idle with a pan still pending: {view}"
+                );
+            }
+        }
+
+        let view = serve.view();
+        assert_eq!(
+            view.get("current_page").and_then(Value::as_u64),
+            Some(page),
+            "settled, but not where we asked to be: {view}"
+        );
+    }
+
+    serve.quit();
+}
+
+#[test]
 fn a_file_that_will_not_open_reports_a_visible_reason() {
     let Some(_window) = e2e("a_file_that_will_not_open_reports_a_visible_reason") else {
         return;

@@ -388,8 +388,24 @@ impl Viewer {
     }
 
     /// Whether every requested page has arrived. Vacuously true with no document.
+    /// Whether nothing is outstanding: no renders, and no move still to be made.
+    ///
+    /// The pending-request half is easy to leave out and matters more than the render
+    /// half. A scroll command records a *request*, and the shell only carries it out
+    /// while painting. Until then the view has not moved — so reporting `idle` with a
+    /// request outstanding tells a client "everything you asked for is done" when the
+    /// thing it asked for has not happened.
+    ///
+    /// On a visible window that window is one frame wide. On a **minimised** one it is
+    /// indefinite: painting stops, so the request is never consumed, and the program
+    /// goes on cheerfully answering commands and reporting idle. Measured by hand —
+    /// `go_to_page 7` on a minimised window replied `changed`, reported `idle: true`,
+    /// and left `current_page` at 3 until the window was restored. Nothing is lost, but
+    /// a client that trusted `idle` would have read the old page and believed it.
     fn settled(&self) -> bool {
-        self.open.as_ref().is_none_or(OpenDocument::settled)
+        let no_pending_move = self.state.requested_scroll_pt().is_none()
+            && self.state.requested_scroll_left_pt().is_none();
+        no_pending_move && self.open.as_ref().is_none_or(OpenDocument::settled)
     }
 
     // --- Control channel ----------------------------------------------------

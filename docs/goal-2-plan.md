@@ -473,6 +473,28 @@ inconvenience.
 `ScrollByViewports` was silently affected too: a "screenful" was a pixel count, so at 2x it advanced
 twice as far as a screen.
 
+## 7f. `idle` was true while the view still had somewhere to go
+
+`idle` is the field §3 calls the most useful thing in the snapshot, and the one every client is told
+to wait on. It was computed from render work alone: no pages queued, no worker busy. It ignored
+whether a scroll or pan request was still outstanding.
+
+A scroll command records a *request*; the shell carries it out while painting. So for one frame after
+every navigation command, `idle` was true and the view had not moved. A client doing the documented
+thing — send, wait for `idle`, read state or capture — could read the old position and believe it.
+Minimising the window widens that frame indefinitely, which is how it was found.
+
+`settled()` now also requires no pending move. Two lines.
+
+The test is worth more attention than the fix. The first version polled snapshots in a loop and
+**passed against the unfixed code**, because a snapshot round-trip through the pipe is slower than
+the 16 ms frame the bug lives in. Rewritten to read the *event stream* instead — `view_changed` is
+emitted inside the same frame that accepted the command, before painting consumes the request — it
+fails on the old code with `pending_scroll_pt: 936.0` sitting next to `idle: true`.
+
+Both versions passed on the fixed code. Only running them against the broken code told them apart,
+which is the argument for doing that whenever a test is written to pin a specific bug.
+
 ## 8. Open decisions
 
 1. **Does an agent get a window at all?** Still open, and now with a concrete cost attached: because
@@ -510,11 +532,20 @@ twice as far as a screen.
 - **A window starved of frames stops answering.** `serve_control` runs inside `logic()`, so the
   control channel only makes progress when a frame does. Found because eight end-to-end tests
   opening eight GPU windows at once starved each other, and whichever test was waiting on a reply
-  timed out after a minute — the tests now take a lock so only one window exists at a time. The open
-  question is whether a *minimised or fully occluded* window hits the same thing in normal use. There
-  is a `ctx.request_repaint()` per frame whenever a control channel is attached, which should keep it
-  alive as long as the platform delivers any frames at all, but that has not been tested against a
-  minimised window on any platform.
+  timed out after a minute — the tests now take a lock so only one window exists at a time.
+
+  **The minimised-window question is now answered, by hand on Windows.** A minimised window keeps
+  running `logic()`: it accepts commands, replies, and its frame counter advances. What stops is
+  *painting* — `ui()` — and painting is where a scroll request is handed to egui. So a command is
+  accepted, queued, and not carried out. `go_to_page 7` replied `changed` and left `current_page` at
+  3 until the window was restored, at which point the queued move landed exactly as asked
+  (`scroll_top_pt` 4824, pending cleared). Nothing is lost, and state stays consistent.
+
+  Two things came out of it. Reporting `idle` no longer ignores a pending move — see §7f, that was a
+  real bug and not only when minimised. And `capture` on a minimised window cannot work at all: it
+  waits for a paint that will not come and fails after 240 frames with "no screenshot arrived",
+  which is true but says nothing about the window being minimised. Left as-is for now; the honest
+  fix is a message that names the cause.
 - **The ~150 ms frame outlier is still unexplained** (`goal-1-plan.md` §6b). It is not our code, and
   it does not block any of this — but an agent that waits on `Idle` and measures timings will see it,
   so it may finally get diagnosed by something other than a human noticing a hitch.

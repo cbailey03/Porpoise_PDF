@@ -227,6 +227,18 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         "save_as" => RequestBody::Command(Command::SaveAs {
             path: path_argument("path")?,
         }),
+        "set_thumbnails" => RequestBody::Command(Command::SetThumbnails {
+            visible: object
+                .get("visible")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    DecodeError::BadArguments {
+                        command: name.to_owned(),
+                        detail: "expected a boolean \"visible\"".to_owned(),
+                    }
+                    .at(id)
+                })?,
+        }),
         "quit" => RequestBody::Command(Command::Quit),
         other => {
             // A view command is internally tagged on the same `command` field, so
@@ -274,6 +286,8 @@ pub(crate) struct Snapshot {
     /// Cleared by the next successful open or close.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_error: Option<String>,
+    /// Whether the page grid is showing.
+    pub(crate) thumbnails: bool,
     /// Whether the page order differs from the file on disk.
     pub(crate) unsaved_changes: bool,
     /// Whether there is a page edit to undo.

@@ -18,8 +18,7 @@ new file.
 - **Editing page contents** — text, annotations, form fields. A much larger problem.
 - **Incremental save** (appending changes rather than rewriting). Faster on huge files, but it makes
   a correct result harder to verify, and correctness matters more here than speed.
-- **A thumbnail grid to drag pages around in.** This is the honest gap: reorganising pages really
-  wants one. See §6.
+- ~~A thumbnail grid to drag pages around in.~~ Added after the rest landed; see §7.
 
 ## 2. Two libraries, one document
 
@@ -160,11 +159,39 @@ over a copy: the window then showed *Traffic Control Plan (Shoulder Work), TCP-3
 the status bar said *unsaved changes* until the save finished, and the saved file reopened with the
 new order.
 
+## 7. The page grid
+
+Moving one page at a time from the toolbar is fine for a small fix and tedious for a real reshuffle,
+so `Ctrl+T` opens a grid of thumbnails you can drag pages around in.
+
+**It reuses the render pipeline rather than adding one.** A thumbnail is a page at a small zoom, so it
+goes through the same worker pool and the same texture cache, keyed at its own rung. Nothing new to
+keep correct, nothing new to budget, and virtualization comes free — `show_rows` only calls back for
+the rows on screen, so a 400-page document costs about twenty tiny renders rather than four hundred.
+Measured on the 10-page GDOT set: 18 cached rasterizations for 10 pages, which is the thumbnails plus
+the main view's pages coexisting exactly as intended.
+
+That coexistence turned out to rest on luck. `PageCache::retain_bucket` dropped every rung of a page
+except one, with a doc comment saying it ran "once the wanted rung has arrived". **Nothing ever called
+it.** Had anything called it, the grid and the main view would have evicted each other's textures
+continuously. Removed, and the test that covered it replaced by one asserting the opposite property —
+that a page may hold several rungs at once — since that is what the grid depends on.
+
+**Dragging is a gesture; the panel is a command.** Dropping page 7 onto slot 2 produces
+`MovePage { from: 7, to: 2 }`, which already existed, so the grid adds a way to *author* an edit and
+no new capability — the same reasoning that keeps the file dialog off the protocol. Whether the panel
+is *showing* is different: it changes what is on screen, and unlike a modal an agent that opens it can
+also close it, so there is no state it can enter and not leave. Hence `set_thumbnails`, reported in
+the snapshot.
+
+**What is not tested:** the drag itself. egui's drag-and-drop cannot be driven from the control
+channel, so "picking up a thumbnail and dropping it two slots over" has no automated test. The seam is
+placed so that everything either side is covered — the grid's arithmetic has unit tests, `MovePage` has
+end-to-end tests, and `set_thumbnails` has one — but the gesture connecting them was verified by
+looking at a capture of the real window and needs a person to confirm it feels right.
+
 ## 6. Known gaps
 
-- **No thumbnail grid.** Moving the current page one position at a time is workable for small
-  changes and tedious for large ones. A grid you can drag pages around in is the real answer and is
-  its own piece of work.
 - **Nested page trees are refused** (§2). The fix is inherited-attribute push-down.
 - **No warning when closing with unsaved changes.** The snapshot knows, but nothing asks.
 - **Whole-file rewrite on every save**, so saving a 132 MB document rewrites 132 MB.

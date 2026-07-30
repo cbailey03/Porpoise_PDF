@@ -160,21 +160,12 @@ impl<T> PageCache<T> {
         self.used_bytes = self.used_bytes.saturating_sub(freed);
     }
 
-    /// Drops every entry for a page whose bucket is not `bucket`.
-    ///
-    /// Used once the wanted rung has arrived, so stale-resolution fallbacks do not
-    /// linger and consume budget.
-    pub fn retain_bucket(&mut self, page: usize, bucket: ZoomBucket) {
-        let mut freed = 0_usize;
-        self.entries.retain(|key, entry| {
-            let kept = key.page != page || key.bucket == bucket;
-            if !kept {
-                freed = freed.saturating_add(entry.bytes);
-            }
-            kept
-        });
-        self.used_bytes = self.used_bytes.saturating_sub(freed);
-    }
+    // `retain_bucket` used to live here: it dropped every rung of a page except one, and its
+    // doc said it was called once the wanted rung arrived. Nothing ever called it, and the
+    // policy it encoded is now actively wrong — the thumbnail grid needs a page to hold two
+    // rungs at once, its own and the main view's. Removed rather than left as a trap with a
+    // comment claiming it was in use. The byte budget and `retain_pages` were doing this job
+    // all along.
 
     /// Removes everything.
     pub fn clear(&mut self) {
@@ -335,18 +326,25 @@ mod tests {
     }
 
     #[test]
-    fn retain_bucket_drops_stale_resolutions_of_one_page() {
+    fn one_page_can_hold_several_rungs_at_once() {
+        // The thumbnail grid depends on this: it draws a page at a tiny rung while the
+        // main view holds the same page at reading size, and neither may evict the
+        // other. This replaces a `retain_bucket` that dropped every rung but one — it
+        // was never called, and the policy it encoded is now the opposite of what is
+        // wanted.
         let mut cache: PageCache<u32> = PageCache::new(10_000);
-        cache.insert(key(0, 0.5), 5, 100);
+        cache.insert(key(0, 0.1), 5, 100);
         cache.insert(key(0, 2.0), 20, 100);
-        cache.insert(key(1, 0.5), 15, 100);
 
-        cache.retain_bucket(0, ZoomBucket::enclosing(2.0));
-
-        assert!(cache.contains(key(0, 2.0)));
-        assert!(!cache.contains(key(0, 0.5)), "stale rung survived");
-        assert!(cache.contains(key(1, 0.5)), "another page was touched");
+        assert!(
+            cache.contains(key(0, 0.1)),
+            "the thumbnail rung was dropped"
+        );
+        assert!(cache.contains(key(0, 2.0)), "the reading rung was dropped");
         assert_eq!(cache.used_bytes(), 200);
+
+        // And the byte budget, not a per-page rule, is what bounds it.
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]

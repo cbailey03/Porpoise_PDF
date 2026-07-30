@@ -584,6 +584,65 @@ fn an_agent_can_reorder_a_document_and_save_it() {
 }
 
 #[test]
+fn the_page_grid_can_be_opened_and_closed_by_command() {
+    let Some(_window) = e2e("the_page_grid_can_be_opened_and_closed_by_command") else {
+        return;
+    };
+
+    // The grid is chrome, not a document edit, so it gets a command rather than being
+    // click-only. Unlike the file dialog there is no argument for leaving it out: it
+    // changes what is on screen, and an agent that opens it can also close it, so it
+    // cannot become a state something gets stuck in.
+    let document = fixture("e2e-grid.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    assert_eq!(
+        serve.snapshot().get("thumbnails").and_then(Value::as_bool),
+        Some(false),
+        "the grid was showing before it was asked for"
+    );
+
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(
+        serve.snapshot().get("thumbnails").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // Asking for what is already true is `unchanged`, not an error — the same
+    // convention every other command follows.
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(false))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(
+        serve.snapshot().get("thumbnails").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    // A missing or non-boolean argument is refused rather than guessed at.
+    let id = serve.send("set_thumbnails", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(false),
+        "set_thumbnails with no argument was accepted"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn saving_an_unedited_document_over_itself_is_refused() {
     let Some(_window) = e2e("saving_an_unedited_document_over_itself_is_refused") else {
         return;

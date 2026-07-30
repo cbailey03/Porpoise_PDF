@@ -34,6 +34,8 @@ pub(crate) enum EditKey {
     Undo,
     /// Write the changes over the original.
     Save,
+    /// Show or hide the page grid.
+    ToggleThumbnails,
 }
 
 /// Which page edit, if any, this key press asks for.
@@ -49,6 +51,7 @@ pub(crate) fn edit_for_key(key: egui::Key, modifiers: egui::Modifiers) -> Option
         egui::Key::ArrowDown => Some(EditKey::MoveLater),
         egui::Key::Z => Some(EditKey::Undo),
         egui::Key::S => Some(EditKey::Save),
+        egui::Key::T => Some(EditKey::ToggleThumbnails),
         _ => None,
     }
 }

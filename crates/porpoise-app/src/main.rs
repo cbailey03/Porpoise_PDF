@@ -12,6 +12,7 @@ mod input;
 mod picker;
 mod protocol;
 mod saver;
+mod thumbnails;
 mod tiles;
 mod viewer;
 

@@ -66,6 +66,15 @@ pub(crate) enum Command {
         /// Where to write it.
         path: PathBuf,
     },
+    /// Show or hide the page grid.
+    ///
+    /// A command rather than a click-only toggle because it changes what is on screen,
+    /// and unlike the file dialog an agent that opens it can also close it — so there is
+    /// no state it can enter and not leave. See `docs/goal-4-plan.md` §7.
+    SetThumbnails {
+        /// Whether the grid should be showing.
+        visible: bool,
+    },
     /// Close the window and exit.
     Quit,
 }
@@ -83,6 +92,7 @@ impl Command {
             Self::Undo => "undo",
             Self::Save => "save",
             Self::SaveAs { .. } => "save_as",
+            Self::SetThumbnails { .. } => "set_thumbnails",
             Self::Quit => "quit",
         }
     }
@@ -117,6 +127,7 @@ impl Command {
             Self::SaveAs {
                 path: placeholder(),
             },
+            Self::SetThumbnails { visible: true },
             Self::Quit,
         ]
     }
@@ -181,6 +192,7 @@ mod tests {
                 | Command::Undo
                 | Command::Save
                 | Command::SaveAs { .. }
+                | Command::SetThumbnails { .. }
                 | Command::Quit => {}
             }
         }
@@ -189,7 +201,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            9,
+            10,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

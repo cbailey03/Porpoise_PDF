@@ -67,6 +67,7 @@ use crate::input::{EditKey, command_for_key, edit_for_key, opens_the_picker};
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::saver::Saver;
+use crate::thumbnails::{self, Grid};
 use crate::tiles::{FULL_UV, to_color_image};
 
 /// Byte budget for cached page textures.
@@ -283,6 +284,9 @@ struct Viewer {
     /// A save in flight, if any. See [`crate::saver`] for why it is not inline.
     saver: Saver,
 
+    /// Whether the page grid is showing. See [`crate::thumbnails`].
+    thumbnails: bool,
+
     /// Why the last command failed, for the person to read.
     ///
     /// Failures used to go only to `tracing::warn!`, which for a windowed app means
@@ -350,6 +354,7 @@ impl Viewer {
             applied_start_page: false,
             picker: FilePicker::default(),
             saver: Saver::default(),
+            thumbnails: false,
             last_error: None,
             frame: 0,
             benchmark,
@@ -422,6 +427,7 @@ impl Viewer {
             renders_in_flight: self.open.as_ref().map_or(0, |open| open.in_flight.len()),
             failed_pages,
             last_error: self.last_error.clone(),
+            thumbnails: self.thumbnails,
             unsaved_changes: self
                 .open
                 .as_ref()
@@ -658,6 +664,13 @@ impl Viewer {
                 self.begin_save(destination, Overwrite::Allow)
             }
             Command::SaveAs { path } => self.begin_save(path, Overwrite::Refuse),
+            Command::SetThumbnails { visible } => {
+                if self.thumbnails == visible {
+                    return DispatchResult::Unchanged;
+                }
+                self.thumbnails = visible;
+                DispatchResult::View(Outcome::Changed)
+            }
             Command::Capture { path } => {
                 // Clear any previous result, so "the slot holds the outcome of the
                 // most recent capture" is true by construction rather than by an
@@ -771,6 +784,9 @@ impl Viewer {
             EditKey::MoveLater => None,
             EditKey::Undo => Some(Command::Undo),
             EditKey::Save => Some(Command::Save),
+            EditKey::ToggleThumbnails => Some(Command::SetThumbnails {
+                visible: !self.thumbnails,
+            }),
         }
     }
 
@@ -1165,6 +1181,39 @@ impl Viewer {
         }
     }
 
+    /// Draws the page grid and dispatches any drag that landed.
+    fn draw_thumbnails(&mut self, ui: &mut egui::Ui) {
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let current = self.view().current_page();
+        let Some(open) = &mut self.open else {
+            ui.label("No document open.");
+            return;
+        };
+
+        let mut grid = Grid {
+            order: &open.order,
+            document: &open.document,
+            cache: &mut open.cache,
+            pool: &open.pool,
+            in_flight: &mut open.in_flight,
+            current,
+            pixels_per_point,
+        };
+        let dropped = thumbnails::draw(ui, &mut grid);
+
+        // Through the normal dispatch, so a drag is indistinguishable from an agent
+        // sending `move_page` — which is the whole point of the command model.
+        if let Some((from, to)) = dropped {
+            let ctx = ui.ctx().clone();
+            if let (Some(from), Some(to)) = (
+                PageNumber::new(from.saturating_add(1)),
+                PageNumber::new(to.saturating_add(1)),
+            ) {
+                self.dispatch(&ctx, Command::MovePage { from, to });
+            }
+        }
+    }
+
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         // Collected rather than dispatched inline, because dispatch needs
         // `&mut self` while `ui` is borrowed. Note every button produces the same
@@ -1183,6 +1232,17 @@ impl Viewer {
                 .clicked()
             {
                 open_picker = true;
+            }
+            ui.separator();
+
+            if ui
+                .selectable_label(self.thumbnails, "Pages")
+                .on_hover_text("Show the page grid, to drag pages around (Ctrl+T)")
+                .clicked()
+            {
+                issued.push(Command::SetThumbnails {
+                    visible: !self.thumbnails,
+                });
             }
             ui.separator();
 
@@ -1535,6 +1595,13 @@ impl eframe::App for Viewer {
         // root `ui` is the central area, so there is no CentralPanel here.
         egui::Panel::top("toolbar").show(ui, |ui| self.draw_toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.draw_status(ui));
+        // Before the pages, so the central area is what is left over.
+        if self.thumbnails {
+            egui::Panel::left("thumbnails")
+                .resizable(true)
+                .default_size(300.0)
+                .show(ui, |ui| self.draw_thumbnails(ui));
+        }
         self.draw_pages(ui);
 
         // Our own cost, as distinct from the frame interval. If this stays well

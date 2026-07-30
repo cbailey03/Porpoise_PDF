@@ -56,11 +56,50 @@ use crate::tiles::FULL_UV;
 /// *which* page you are looking at — and small enough that a row holds several.
 const THUMBNAIL_WIDTH: f32 = 120.0;
 
-/// Space around each thumbnail, for the drop highlight and the page number.
-const CELL_PADDING: f32 = 10.0;
-
 /// Height reserved under each thumbnail for its page number.
+///
+/// Allocated rather than measured, so a row's height is arithmetic this module can state
+/// up front. [`row_height`] explains why that matters.
 const LABEL_HEIGHT: f32 = 16.0;
+
+/// Tallest a thumbnail box may be, as a multiple of its width.
+///
+/// The box fits the tallest page in the document, so a set of landscape drawing sheets
+/// gets short rows and a set of portrait pages gets taller ones — both packed tight. This
+/// caps it, because one freak page in an otherwise ordinary document would otherwise make
+/// every row as tall as that page needs. Anything past the cap is scaled down to fit.
+///
+/// 1.7 clears US Legal at 1.647, which is the tallest ordinary paper size.
+const MAX_THUMBNAIL_ASPECT: f32 = 1.7;
+
+/// egui's default `item_spacing`, used only to pick the panel's *opening* width.
+///
+/// The live column count is measured from the real spacing every frame, so if a style
+/// changes this the cost is an initial width slightly off and nothing worse.
+const ASSUMED_GAP: f32 = 8.0;
+
+/// Room left for the scroll bar when choosing the opening width.
+const SCROLL_BAR_ALLOWANCE: f32 = 16.0;
+
+/// How wide the page grid panel opens: two columns, snug, plus the scroll bar.
+///
+/// Derived from the thumbnail width rather than written down separately, so the panel
+/// cannot end up sized for a number of columns that no longer fit. It used to be a flat
+/// 300, which reserved 140 per column while drawing 128 — leaving a 40 pt strip of dead
+/// panel too narrow to hold a third column.
+pub(crate) const PANEL_WIDTH: f32 = THUMBNAIL_WIDTH * 2.0 + ASSUMED_GAP + SCROLL_BAR_ALLOWANCE;
+
+/// How far the pointer must travel before a drag on empty space is a selection box.
+///
+/// Without this, a *stationary* click counts as a marquee of zero size, and a click that
+/// lands in the gap between two thumbnails throws the selection away. That is a near-miss
+/// punishing you for missing by four pixels, which is the worst kind of bug to hit while
+/// carefully building a selection — so below this distance nothing happens at all.
+///
+/// Note what it does *not* do: a deliberate click on blank space no longer deselects. In a
+/// file browser it would, but here a selection can cost a dozen clicks to build and the
+/// only ways to lose it are now explicit — pick another page, or leave the tab.
+const MARQUEE_MINIMUM_DRAG: f32 = 4.0;
 
 /// What a click in the grid means.
 ///
@@ -191,22 +230,64 @@ pub(crate) fn bucket_for(widest_page_pt: f64, pixels_per_point: f32) -> ZoomBuck
     ZoomBucket::enclosing(wanted)
 }
 
-/// How many thumbnails fit across `available` points of width.
+/// How many thumbnails fit across `available` points of width, `gap` apart.
+///
+/// The gap is passed in rather than assumed, because it has to be the spacing egui will
+/// actually put between them: reserving more per column than gets drawn is what left a
+/// strip of dead panel on the right, too narrow to hold another column.
 ///
 /// At least one, however narrow the panel: a column of clipped thumbnails is more use
 /// than a division by zero.
-pub(crate) fn columns_for(available: f32) -> usize {
-    let cell = THUMBNAIL_WIDTH + CELL_PADDING * 2.0;
-    if !available.is_finite() || available < cell {
+pub(crate) fn columns_for(available: f32, gap: f32) -> usize {
+    let column = THUMBNAIL_WIDTH + gap.max(0.0);
+    if !available.is_finite() || column <= 0.0 || available < THUMBNAIL_WIDTH {
         return 1;
     }
+    // The last column needs no gap after it, so add one back before dividing.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "bounded above by the panel width in points"
     )]
-    let columns = (available / cell) as usize;
+    let columns = ((available + gap.max(0.0)) / column) as usize;
     columns.max(1)
+}
+
+/// The uniform box every thumbnail is drawn inside, in points.
+///
+/// Tall enough for the tallest page in the document and no taller, so a set of landscape
+/// drawing sheets packs into short rows instead of reserving portrait-shaped ones. Capped
+/// by [`MAX_THUMBNAIL_ASPECT`]; a page past the cap is scaled down to fit rather than
+/// stretching every row in the document.
+///
+/// Uniform on purpose. `ScrollArea::show_rows` needs *one* row height for the whole grid,
+/// so a box that varied per page would put the declared height and the drawn height back
+/// out of step — see [`row_height`].
+pub(crate) fn box_height(page_aspects: impl Iterator<Item = f32>) -> f32 {
+    let tallest = page_aspects
+        .filter(|aspect| aspect.is_finite() && *aspect > 0.0)
+        .fold(0.0_f32, f32::max);
+    if tallest <= 0.0 {
+        // No usable geometry — a square box still gives every page a slot, which is what
+        // keeps the grid's positions matching the document's.
+        return THUMBNAIL_WIDTH;
+    }
+    (THUMBNAIL_WIDTH * tallest).min(THUMBNAIL_WIDTH * MAX_THUMBNAIL_ASPECT)
+}
+
+/// How tall one row of the grid is, excluding the spacing egui puts *between* rows.
+///
+/// This is the number `ScrollArea::show_rows` is given, and it has to be the height a row
+/// really occupies. That is not a detail: `show_rows` decides how many rows to draw by
+/// dividing the viewport by this, so declaring more than gets drawn renders too few rows
+/// and leaves the bottom of the panel empty. It was declared as
+/// `THUMBNAIL_WIDTH * 1.4 + LABEL_HEIGHT + 20` — about 204 pt — while a landscape drawing
+/// sheet draws roughly 102, so a panel with room for eight rows showed five.
+///
+/// `gap` is the spacing between the thumbnail and its page number, which is inside the
+/// row; the spacing between rows is added by `show_rows` itself.
+pub(crate) fn row_height(box_height: f32, gap: f32) -> f32 {
+    box_height + gap.max(0.0) + LABEL_HEIGHT
 }
 
 /// How many rows `pages` needs at `columns` across.
@@ -277,9 +358,18 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
         .map(|page| f64::from(page.width_pt))
         .fold(0.0_f64, f64::max);
     let bucket = bucket_for(widest, grid.pixels_per_point);
-    let columns = columns_for(ui.available_width());
+    // Measured, not assumed: both of these have to match what egui will really lay out.
+    // See `columns_for` and `row_height` for what went wrong when they did not.
+    let gap = ui.spacing().item_spacing;
+    let columns = columns_for(ui.available_width(), gap.x);
     let rows = rows_for(pages, columns);
-    let cell_height = THUMBNAIL_WIDTH * 1.4 + LABEL_HEIGHT + CELL_PADDING * 2.0;
+    let box_height = box_height(
+        grid.document
+            .geometry()
+            .iter()
+            .map(|page| page.height_pt / page.width_pt),
+    );
+    let cell_height = row_height(box_height, gap.y);
 
     // `show_rows` only calls back for the rows on screen, which is what keeps a
     // 400-page grid from rasterizing 400 thumbnails — and what makes `showing` a
@@ -306,7 +396,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
                         if position >= pages {
                             break;
                         }
-                        let outcome = cell(ui, grid, position, bucket);
+                        let outcome = cell(ui, grid, position, bucket, box_height);
                         if let Some(dropped) = outcome.dropped {
                             drawn.moved = Some((dropped, position));
                         }
@@ -335,6 +425,11 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
                 }
             }
         });
+
+    // Last, and outside the scroll area, so the card is not clipped by it.
+    if grid.mode == GridMode::Reorganize {
+        paint_drag_ghost(ui.ctx());
+    }
 
     drawn
 }
@@ -393,19 +488,23 @@ fn cell(
     grid: &mut Grid<'_>,
     position: usize,
     bucket: ZoomBucket,
+    box_height: f32,
 ) -> CellOutcome {
     let Some(page) = grid.order.source_of(position) else {
         return CellOutcome::default();
     };
     let geometry = grid.document.geometry().get(page).copied();
-    let size = match geometry {
+    // Every cell takes the same box, so the row height declared to `show_rows` is the
+    // height really drawn. The page is fitted inside it, keeping its own shape.
+    let size = egui::vec2(THUMBNAIL_WIDTH, box_height);
+    let page_size = match geometry {
         Some(page) if page.width_pt > 0.0 && page.height_pt > 0.0 => {
-            let scale = THUMBNAIL_WIDTH / page.width_pt;
-            egui::vec2(THUMBNAIL_WIDTH, page.height_pt * scale)
+            let scale = (THUMBNAIL_WIDTH / page.width_pt).min(box_height / page.height_pt);
+            egui::vec2(page.width_pt * scale, page.height_pt * scale)
         }
         // A degenerate page still needs a slot, or the grid's positions would stop
         // matching the document's.
-        _ => egui::vec2(THUMBNAIL_WIDTH, THUMBNAIL_WIDTH),
+        _ => egui::vec2(THUMBNAIL_WIDTH, box_height),
     };
 
     let key = CacheKey::new(page, bucket);
@@ -419,6 +518,7 @@ fn cell(
     let thumbnail = Thumbnail {
         position,
         size,
+        page_size,
         texture,
         current: position == grid.current,
         selected,
@@ -444,7 +544,11 @@ fn cell(
                 .show(ui, |ui| {
                     paint(ui, &thumbnail, egui::Sense::click_and_drag())
                 })
-                .inner;
+                .inner
+                // The grab hand, which `dnd_drag_source` used to provide and hand-rolling
+                // the drag took away. Its own affordance matters more here than usual:
+                // nothing else about a thumbnail says it can be picked up.
+                .on_hover_cursor(egui::CursorIcon::Grab);
 
             // What travels when the drag starts. A drag from a page that is not picked
             // out takes that page alone — and the click reported alongside makes it the
@@ -459,10 +563,30 @@ fn cell(
                 };
                 egui::DragAndDrop::set_payload(ui.ctx(), Dragged(group));
             }
+            if response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+
+            // Where the group would land, marked on the cell the pointer is over. Without
+            // it a drag is a ghost floating over an unchanged grid, with nothing saying
+            // which slot is about to take it.
+            if let Some(carried) = response.dnd_hover_payload::<Dragged>() {
+                if carried.0.contains(&position) {
+                    // Dropping the group onto itself changes nothing, so it must not
+                    // advertise that it would.
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::NoDrop);
+                } else {
+                    paint_insertion(ui, response.rect);
+                }
+            }
 
             // Read before the click, because a release that completes a drag must not
             // also register as a pick on whatever it landed on.
             let dropped = response.dnd_release_payload::<Dragged>();
+            // A drop onto one of the pages being carried is not a move. Filtered here as
+            // well as in `PageOrder`, so no command is produced at all rather than one
+            // that comes back `unchanged`.
+            let dropped = dropped.filter(|group| !group.0.contains(&position));
             if dropped.is_none() && response.clicked() {
                 let (toggle, range) =
                     ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
@@ -487,12 +611,80 @@ fn cell(
 #[derive(Debug, Clone)]
 struct Dragged(Vec<usize>);
 
+/// Marks the slot a drop would land in, down the leading edge of a cell.
+///
+/// A bar rather than a tint, because a tint is what "selected" already means here and two
+/// meanings for one colour is how a person stops trusting either.
+fn paint_insertion(ui: &egui::Ui, cell: egui::Rect) {
+    let accent = ui.visuals().selection.bg_fill;
+    let bar = egui::Rect::from_min_max(
+        egui::pos2(cell.left() - 3.0, cell.top()),
+        egui::pos2(cell.left(), cell.bottom()),
+    );
+    ui.painter().rect_filled(bar, 1.0, accent);
+}
+
+/// Paints what is being carried, following the pointer.
+///
+/// `dnd_drag_source` used to do this by repainting the cell into a tooltip layer — the
+/// same mechanism that made a nested click never fire, so it is not coming back. A card
+/// saying how many pages are in the air does the job it was doing, and says something the
+/// old ghost could not: that a *group* is moving, not the one page under the cursor.
+fn paint_drag_ghost(ctx: &egui::Context) {
+    let Some(carried) = egui::DragAndDrop::payload::<Dragged>(ctx) else {
+        return;
+    };
+    let Some(pointer) = ctx.pointer_latest_pos() else {
+        return;
+    };
+
+    let count = carried.0.len();
+    let text = if count == 1 {
+        "1 page".to_owned()
+    } else {
+        format!("{count} pages")
+    };
+
+    // Its own foreground layer, so the card is above the panel and the page column rather
+    // than under whichever drew last.
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("porpoise-drag-ghost"),
+    ));
+    let galley =
+        painter.layout_no_wrap(text, egui::FontId::proportional(13.0), egui::Color32::WHITE);
+    // Offset down and right of the cursor, the way a drag cursor's own label sits, so the
+    // card never covers the slot you are aiming at.
+    let card = egui::Rect::from_min_size(
+        pointer + egui::vec2(14.0, 10.0),
+        galley.size() + egui::vec2(16.0, 10.0),
+    );
+    painter.rect_filled(card, 4.0, egui::Color32::from_black_alpha(220));
+    painter.galley(
+        card.center() - galley.size() * 0.5,
+        galley,
+        egui::Color32::WHITE,
+    );
+}
+
 /// A marquee in progress.
 struct Marquee {
     /// The box, in screen coordinates.
     rect: egui::Rect,
     /// Whether the pointer came up this frame, which is when the selection is committed.
     finished: bool,
+}
+
+/// Where the box being dragged started, remembered across frames.
+///
+/// It has to be remembered, and that is not a detail worth rediscovering. egui sets
+/// `press_origin` back to `None` in the same input pass that reports the release — see
+/// `InputState`, which clears it right where it pushes `PointerEvent::Released`. So the
+/// one frame that has to *commit* the selection is exactly the frame that can no longer
+/// say where the drag began. Reading it fresh every frame drew the box perfectly all the
+/// way through the drag and then selected nothing at all when you let go.
+fn marquee_origin() -> egui::Id {
+    egui::Id::new("porpoise-marquee-origin")
 }
 
 /// The selection box being dragged, if one is.
@@ -502,12 +694,16 @@ struct Marquee {
 /// landed on a page. Doing it this way means the cells and the marquee never compete for
 /// the same press, so neither has to win a hit test.
 fn marquee(ui: &egui::Ui, viewport: egui::Rect, cells: &[(usize, egui::Rect)]) -> Option<Marquee> {
+    let id = marquee_origin();
+    let forget = || ui.ctx().data_mut(|data| data.remove_temp::<egui::Pos2>(id));
+
     // A page is in flight, so this drag is a move and not a selection.
     if egui::DragAndDrop::has_any_payload(ui.ctx()) {
+        forget();
         return None;
     }
 
-    let (origin, latest, down, released) = ui.input(|i| {
+    let (pressed_at, latest, down, released) = ui.input(|i| {
         (
             i.pointer.press_origin(),
             i.pointer.latest_pos(),
@@ -515,16 +711,44 @@ fn marquee(ui: &egui::Ui, viewport: egui::Rect, cells: &[(usize, egui::Rect)]) -
             i.pointer.any_released(),
         )
     });
-    if !(down || released) {
+
+    let remembered: Option<egui::Pos2> = ui.ctx().data(|data| data.get_temp(id));
+    let origin = match remembered {
+        // Already tracking one, so the origin comes from memory rather than from the
+        // pointer — which is the whole point.
+        Some(origin) => origin,
+        None => {
+            // Only a fresh press can start one.
+            if !down {
+                return None;
+            }
+            let origin = pressed_at?;
+            if !viewport.contains(origin) {
+                return None;
+            }
+            // The gesture that starts on a page is that page's, not the marquee's.
+            if cells.iter().any(|(_, rect)| rect.contains(origin)) {
+                return None;
+            }
+            ui.ctx().data_mut(|data| data.insert_temp(id, origin));
+            origin
+        }
+    };
+
+    // The pointer left without a release ever being seen — a lost window, say. Nothing to
+    // commit, and the origin must not outlive the gesture.
+    if !down && !released {
+        forget();
         return None;
     }
-    let origin = origin?;
-    let latest = latest?;
-    if !viewport.contains(origin) {
-        return None;
+
+    let latest = latest.unwrap_or(origin);
+    let travelled = (latest - origin).length() >= MARQUEE_MINIMUM_DRAG;
+    if released {
+        forget();
     }
-    // The gesture that starts on a page is that page's, not the marquee's.
-    if cells.iter().any(|(_, rect)| rect.contains(origin)) {
+    // A press that never travelled is not a box. See [`MARQUEE_MINIMUM_DRAG`].
+    if !travelled {
         return None;
     }
 
@@ -578,7 +802,12 @@ fn paint_marquee(
 struct Thumbnail {
     /// Display position, which is what the page number under it counts.
     position: usize,
+    /// The uniform box the cell occupies. Same for every page in the document, which is
+    /// what makes the row height statable — see [`row_height`].
     size: egui::Vec2,
+    /// The page itself inside that box, at its own shape. Smaller than `size` for any
+    /// page that is not the tallest in the document.
+    page_size: egui::Vec2,
     /// `None` until the render lands.
     texture: Option<egui::TextureId>,
     /// Whether this is the page the main view is showing.
@@ -587,15 +816,19 @@ struct Thumbnail {
     selected: bool,
 }
 
-/// Paints a thumbnail and its page number, and returns the image's own response.
+/// Paints a thumbnail and its page number, and returns the response of its box.
 ///
-/// Shared by both modes, so a page reads the same whichever tab is up. Not quite
-/// pixel-identical: `dnd_drop_zone` fills its frame in reorganize mode, which is what
-/// puts a panel of boxes behind the thumbnails there. That is the drop target showing
-/// itself, so it is left alone.
+/// Shared by both modes, so a page reads the same whichever tab is up.
+///
+/// Everything here is allocated at a stated size — the box, and the page number under it —
+/// because [`row_height`] promises `show_rows` a height and this is what has to keep that
+/// promise. Nothing may size itself to its content.
 fn paint(ui: &mut egui::Ui, thumbnail: &Thumbnail, sense: egui::Sense) -> egui::Response {
     ui.vertical(|ui| {
-        let (rect, response) = ui.allocate_exact_size(thumbnail.size, sense);
+        let (box_rect, response) = ui.allocate_exact_size(thumbnail.size, sense);
+        // The page centred in its box, at its own shape. A landscape sheet in a portrait
+        // document sits in the middle of the slot rather than being stretched to fill it.
+        let rect = egui::Rect::from_center_size(box_rect.center(), thumbnail.page_size);
         match thumbnail.texture {
             Some(texture) => {
                 ui.painter()
@@ -636,12 +869,27 @@ fn paint(ui: &mut egui::Ui, thumbnail: &Thumbnail, sense: egui::Sense) -> egui::
         }
         // The page number under each one, because the whole job of the grid is telling
         // you which page you are looking at or about to move.
+        //
+        // Allocated at [`LABEL_HEIGHT`] and painted, rather than `ui.label`, which would
+        // size itself to the font and put the row's real height back out of step with what
+        // `show_rows` was told.
+        let (label_rect, _) = ui.allocate_exact_size(
+            egui::vec2(THUMBNAIL_WIDTH, LABEL_HEIGHT),
+            egui::Sense::hover(),
+        );
         let number = PageNumber::from_index(thumbnail.position);
-        if thumbnail.current {
-            ui.colored_label(ui.visuals().selection.bg_fill, format!("{number}"));
+        let colour = if thumbnail.current {
+            ui.visuals().selection.bg_fill
         } else {
-            ui.label(format!("{number}"));
-        }
+            ui.visuals().text_color()
+        };
+        ui.painter().text(
+            label_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            format!("{number}"),
+            egui::FontId::proportional(12.0),
+            colour,
+        );
         response
     })
     .inner
@@ -651,20 +899,126 @@ fn paint(ui: &mut egui::Ui, thumbnail: &Thumbnail, sense: egui::Sense) -> egui::
 mod tests {
     use super::*;
 
+    /// egui's default spacing, which is what the grid is laid out with.
+    const GAP: f32 = 8.0;
+
     #[test]
     fn a_narrow_panel_still_shows_one_column() {
         // Rather than dividing by zero or showing nothing.
-        assert_eq!(columns_for(0.0), 1);
-        assert_eq!(columns_for(10.0), 1);
-        assert_eq!(columns_for(f32::NAN), 1);
+        assert_eq!(columns_for(0.0, GAP), 1);
+        assert_eq!(columns_for(10.0, GAP), 1);
+        assert_eq!(columns_for(f32::NAN, GAP), 1);
+        // A nonsense gap degrades to no gap rather than to no grid, which is the useful
+        // way round: `f32::max` discards the NaN, so the columns just sit flush.
+        assert_eq!(columns_for(300.0, f32::NAN), 2);
+        assert!(columns_for(300.0, -50.0) >= 1);
     }
 
     #[test]
     fn a_wider_panel_shows_more_columns() {
-        let cell = THUMBNAIL_WIDTH + CELL_PADDING * 2.0;
-        assert_eq!(columns_for(cell), 1);
-        assert_eq!(columns_for(cell * 3.0), 3);
-        assert!(columns_for(cell * 10.0) >= 10);
+        // A column is the thumbnail plus the gap after it, and the last column needs no
+        // gap — so three columns fit in three thumbnails plus two gaps.
+        assert_eq!(columns_for(THUMBNAIL_WIDTH, GAP), 1);
+        assert_eq!(columns_for(THUMBNAIL_WIDTH * 3.0 + GAP * 2.0, GAP), 3);
+        assert!(columns_for((THUMBNAIL_WIDTH + GAP) * 10.0, GAP) >= 10);
+    }
+
+    #[test]
+    fn the_panel_opens_wide_enough_for_two_columns() {
+        // The regression this width exists for: it used to reserve 140 points per column
+        // while drawing 128, leaving a strip of dead panel too narrow for a third column.
+        // A default that fits one column would be worse — half the grid for no reason.
+        let inside = PANEL_WIDTH - SCROLL_BAR_ALLOWANCE;
+        assert_eq!(
+            columns_for(inside, ASSUMED_GAP),
+            2,
+            "the panel opened at {PANEL_WIDTH} which lays out \
+             {} columns, not two",
+            columns_for(inside, ASSUMED_GAP)
+        );
+        // And snug: not so wide that a third column nearly fits.
+        assert!(
+            inside < THUMBNAIL_WIDTH * 3.0,
+            "the panel is wider than two columns need"
+        );
+    }
+
+    #[test]
+    fn a_landscape_document_gets_short_rows() {
+        // The bug this arithmetic exists for. A 28-page landscape drawing set was given
+        // rows of 204 points while each one drew about 102, so `show_rows` divided the
+        // viewport by the wrong number and rendered five rows into a panel with room for
+        // eight — leaving a third of the panel blank below the last page.
+        //
+        // A 34x22 in sheet is 0.647 tall for its width.
+        let landscape = box_height(std::iter::once(22.0 / 34.0));
+        assert!(
+            landscape < THUMBNAIL_WIDTH,
+            "a landscape sheet reserved {landscape} points of height for a 120 wide box"
+        );
+        let row = row_height(landscape, 8.0);
+        assert!(
+            row < 120.0,
+            "a landscape row came to {row} points; the old constant was 204"
+        );
+    }
+
+    #[test]
+    fn a_portrait_document_gets_taller_rows_than_a_landscape_one() {
+        // Both packed tight, which is the point: the box fits the document rather than
+        // some fixed guess about page shape.
+        let portrait = box_height(std::iter::once(11.0 / 8.5));
+        let landscape = box_height(std::iter::once(8.5 / 11.0));
+        assert!(portrait > landscape, "{portrait} should exceed {landscape}");
+        assert!(
+            portrait > THUMBNAIL_WIDTH,
+            "a letter page is taller than wide"
+        );
+    }
+
+    #[test]
+    fn the_box_fits_the_tallest_page_in_a_mixed_document() {
+        // Every row is the same height, so the box has to clear the tallest page or that
+        // page would be cropped.
+        let mixed = box_height([0.65_f32, 1.294, 0.5].into_iter());
+        let tallest = box_height(std::iter::once(1.294_f32));
+        assert!(
+            (mixed - tallest).abs() < 0.01,
+            "mixed {mixed} should match the tallest page {tallest}"
+        );
+    }
+
+    #[test]
+    fn one_freak_page_does_not_stretch_every_row() {
+        // A 10:1 page in an otherwise ordinary document would otherwise make every row
+        // ten thumbnails tall, and the grid would show one page at a time.
+        let freak = box_height([1.294_f32, 10.0].into_iter());
+        assert!(
+            freak <= THUMBNAIL_WIDTH * MAX_THUMBNAIL_ASPECT,
+            "a freak page produced a {freak} point row"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_usable_geometry_still_gets_a_row_height() {
+        // Every page needs a slot whatever its dimensions say, or the grid's positions
+        // would stop matching the document's.
+        for aspects in [vec![], vec![0.0_f32], vec![f32::NAN], vec![-1.0]] {
+            let height = box_height(aspects.into_iter());
+            assert!(height.is_finite() && height > 0.0, "got {height}");
+            let row = row_height(height, 8.0);
+            assert!(row.is_finite() && row > height, "got {row}");
+        }
+    }
+
+    #[test]
+    fn a_row_leaves_room_for_the_page_number() {
+        // `show_rows` is told this number and lays rows out by it, so the label has to be
+        // inside it — a row that forgot the label would overlap the next one.
+        let box_h = box_height(std::iter::once(1.294_f32));
+        assert!(row_height(box_h, 8.0) >= box_h + LABEL_HEIGHT);
+        // A negative gap from a hostile style must not shrink the row below the box.
+        assert!(row_height(box_h, -50.0) >= box_h + LABEL_HEIGHT);
     }
 
     #[test]
@@ -776,6 +1130,25 @@ mod tests {
     fn a_box_covering_everything_takes_every_cell() {
         let box_ = egui::Rect::from_min_max(egui::pos2(-10.0, -10.0), egui::pos2(500.0, 500.0));
         assert_eq!(covered_by(&box_, &row()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_stationary_press_is_too_small_to_be_a_box() {
+        // The regression this constant exists for: a click landing in the gap between two
+        // thumbnails used to build a zero-size marquee, which covered nothing, which threw
+        // the whole selection away. Missing a page by four pixels must not cost the
+        // selection you spent a dozen clicks building.
+        let origin = egui::pos2(100.0, 100.0);
+        for drift in [0.0_f32, 1.0, 2.0] {
+            let moved = origin + egui::vec2(drift, 0.0);
+            assert!(
+                (moved - origin).length() < MARQUEE_MINIMUM_DRAG,
+                "{drift} px counted as a drag"
+            );
+        }
+        // And a real drag still clears the bar comfortably.
+        let dragged = origin + egui::vec2(40.0, 25.0);
+        assert!((dragged - origin).length() >= MARQUEE_MINIMUM_DRAG);
     }
 
     #[test]

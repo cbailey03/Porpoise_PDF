@@ -1882,7 +1882,10 @@ impl eframe::App for Viewer {
         if self.thumbnails {
             egui::Panel::left("thumbnails")
                 .resizable(true)
-                .default_size(300.0)
+                // Derived from the thumbnail width rather than a round number, so the
+                // panel opens sized for the columns it will actually lay out. See
+                // [`thumbnails::PANEL_WIDTH`].
+                .default_size(thumbnails::PANEL_WIDTH)
                 .show(ui, |ui| self.draw_thumbnails(ui));
         }
         self.draw_pages(ui);

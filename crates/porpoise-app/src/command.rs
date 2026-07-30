@@ -80,6 +80,16 @@ pub(crate) enum Command {
         /// The pages to remove, counting from 1.
         pages: Vec<PageNumber>,
     },
+    /// Narrow the page grid to the pages a query names, or show them all again.
+    ///
+    /// The query is the text a person would type: a number, a range like `5-9`, a list
+    /// like `1,4,7`, or a mix. An empty string clears it. Never refused — anything
+    /// unreadable simply matches nothing, because a filter that rejected half-typed input
+    /// would be unusable in a box that filters as you type. See [`crate::search`].
+    SetPageFilter {
+        /// What to show, verbatim.
+        query: String,
+    },
     /// Pick out pages in the grid, replacing whatever was picked before.
     ///
     /// A command rather than click-only for the reason [`Self::SetGridMode`] is: it
@@ -145,6 +155,7 @@ impl Command {
             Self::MovePages { .. } => "move_pages",
             Self::DeletePage { .. } => "delete_page",
             Self::DeletePages { .. } => "delete_pages",
+            Self::SetPageFilter { .. } => "set_page_filter",
             Self::SetSelection { .. } => "set_selection",
             Self::Undo => "undo",
             Self::Save => "save",
@@ -187,6 +198,9 @@ impl Command {
             },
             Self::DeletePages {
                 pages: vec![PageNumber::FIRST],
+            },
+            Self::SetPageFilter {
+                query: String::new(),
             },
             Self::SetSelection {
                 pages: vec![PageNumber::FIRST],
@@ -266,6 +280,7 @@ mod tests {
                 | Command::MovePages { .. }
                 | Command::DeletePage { .. }
                 | Command::DeletePages { .. }
+                | Command::SetPageFilter { .. }
                 | Command::SetSelection { .. }
                 | Command::Undo
                 | Command::Save
@@ -281,7 +296,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            15,
+            16,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

@@ -265,6 +265,22 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         "set_selection" => RequestBody::Command(Command::SetSelection {
             pages: pages_argument("pages")?,
         }),
+        "set_page_filter" => RequestBody::Command(Command::SetPageFilter {
+            // A missing "query" is the empty one, which clears the filter — the same
+            // reading the search box's ✕ has. Only a non-string is an error, because that
+            // is a client sending the wrong shape rather than asking for everything.
+            query: match object.get("query") {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(query)) => query.clone(),
+                Some(_) => {
+                    return Err(DecodeError::BadArguments {
+                        command: name.to_owned(),
+                        detail: "expected a string \"query\"".to_owned(),
+                    }
+                    .at(id));
+                }
+            },
+        }),
         "undo" => RequestBody::Command(Command::Undo),
         "save" => RequestBody::Command(Command::Save),
         "save_as" => RequestBody::Command(Command::SaveAs {
@@ -367,6 +383,15 @@ pub(crate) struct Snapshot {
     /// What clicking a page in the grid does. Reported whether or not the grid is
     /// showing, because it is remembered across closing and reopening the panel.
     pub(crate) grid_mode: GridMode,
+    /// What is typed in the grid's search box. Empty when nothing is.
+    pub(crate) page_filter: String,
+    /// The pages that query resolves to, counting from 1 — `None` when nothing is typed.
+    ///
+    /// Reported as well as the query so a client need not reimplement the parser to know
+    /// what is on screen. `Some([])` is a query that matched nothing, which is a different
+    /// state from no query at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) filtered_pages: Option<Vec<PageNumber>>,
     /// Pages picked out in the grid, counting from 1, ascending.
     ///
     /// Display positions, like every other page number here — so after a reorder these

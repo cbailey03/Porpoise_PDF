@@ -27,6 +27,15 @@ to ask about unsaved page changes.
 pick pages out and drag them into a new order. Two modes rather than one gesture that guesses, so a
 click has exactly one meaning and a misfire while browsing cannot reorder the document.
 
+A search box above the tabs narrows the grid to the pages you name, in either tab: a number,
+a range like `5-9`, a list like `1,4,7`, or any mix. It filters as you type and never
+refuses input — a query it cannot read matches nothing and says so. This searches page
+*numbers*, not page text: a page-number search works on every document, while text search
+finds nothing on a scanned sheet or a CAD export that draws its labels as outlines. While
+the grid is narrowed, pages cannot be dragged — dropping one between two others with pages
+hidden between them has no meaning worth guessing at — but picking them out still works, so
+searching and then deleting is fine.
+
 In **Reorganize** you can work on several pages at once. Click a page to pick it, `Ctrl+click` to add
 or remove one, or `Shift+click` to take everything between it and the last one you picked. Dragging a
 box over empty space selects what it touches — from *empty* space, because a drag that starts on a page

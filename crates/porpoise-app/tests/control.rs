@@ -843,6 +843,115 @@ fn pages_can_be_picked_out_and_moved_as_a_group() {
 }
 
 #[test]
+fn the_page_grid_can_be_narrowed_to_a_few_pages() {
+    let Some(_window) = e2e("the_page_grid_can_be_narrowed_to_a_few_pages") else {
+        return;
+    };
+
+    // The search box narrows the grid, and reports both what was typed and what it
+    // resolved to — so a client need not reimplement the query parser to know what is on
+    // screen. `PAGES` is 6.
+    let document = fixture("e2e-page-filter.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let filtered = |serve: &mut Serve| -> Option<Vec<u64>> {
+        serve
+            .snapshot()
+            .get("filtered_pages")
+            .and_then(Value::as_array)
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
+    };
+
+    assert_eq!(
+        filtered(&mut serve),
+        None,
+        "the grid was narrowed before anything asked"
+    );
+
+    let id = serve.send("set_page_filter", &[("query", Value::from("2-4"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(filtered(&mut serve), Some(vec![2, 3, 4]));
+    assert_eq!(
+        serve.snapshot().get("page_filter").and_then(Value::as_str),
+        Some("2-4"),
+        "the query itself was not reported back"
+    );
+
+    // Lists and ranges mix, and a page past the end is dropped rather than refused.
+    let id = serve.send("set_page_filter", &[("query", Value::from("1,3-4,99"))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(filtered(&mut serve), Some(vec![1, 3, 4]));
+
+    // A query that reads as nothing is still a filter — `Some([])`, not `None`. The panel
+    // says "no pages match" rather than looking broken, and a client can tell the two
+    // apart.
+    let id = serve.send("set_page_filter", &[("query", Value::from("nonsense"))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true),
+        "an unreadable query was refused; it should match nothing instead"
+    );
+    assert_eq!(filtered(&mut serve), Some(Vec::new()));
+
+    // Asking again for the same query changes nothing, same convention as the rest.
+    let id = serve.send("set_page_filter", &[("query", Value::from("nonsense"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+
+    // Narrowing clears the selection, because Delete acts on it and pages behind a query
+    // are pages nobody can see it is about to remove.
+    serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    serve.send("set_grid_mode", &[("mode", Value::from("reorganize"))]);
+    serve.send("set_page_filter", &[("query", Value::from(""))]);
+    serve.send("set_selection", &[("pages", Value::from(vec![1, 2]))]);
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("selection")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
+    serve.send("set_page_filter", &[("query", Value::from("5"))]);
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("selection")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "narrowing kept a selection the query had hidden"
+    );
+
+    // An omitted query is the empty one, which clears the filter — the same reading the
+    // box's ✕ has. Only a non-string is an error.
+    let id = serve.send("set_page_filter", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(filtered(&mut serve), None);
+
+    let id = serve.send("set_page_filter", &[("query", Value::from(7))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(false),
+        "a numeric query was accepted; it should ask for a string"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn leaving_reorganize_mode_forgets_the_selection() {
     let Some(_window) = e2e("leaving_reorganize_mode_forgets_the_selection") else {
         return;

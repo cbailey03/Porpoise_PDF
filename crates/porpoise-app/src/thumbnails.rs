@@ -47,6 +47,7 @@ use porpoise_doc::{Document, PageOrder};
 use porpoise_view::{CacheKey, PageCache, PageNumber, ZoomBucket};
 
 use crate::queue::RenderQueue;
+use crate::search::PageFilter;
 use crate::selection::{Pick, Selection};
 use crate::tiles::FULL_UV;
 
@@ -88,6 +89,23 @@ const SCROLL_BAR_ALLOWANCE: f32 = 16.0;
 /// 300, which reserved 140 per column while drawing 128 — leaving a 40 pt strip of dead
 /// panel too narrow to hold a third column.
 pub(crate) const PANEL_WIDTH: f32 = THUMBNAIL_WIDTH * 2.0 + ASSUMED_GAP + SCROLL_BAR_ALLOWANCE;
+
+/// The narrowest the panel may be dragged: one column and its scroll bar.
+pub(crate) const PANEL_MIN_WIDTH: f32 = THUMBNAIL_WIDTH + SCROLL_BAR_ALLOWANCE;
+
+/// The widest the panel may ever be, dragged or otherwise.
+///
+/// A cap, not a preference. A panel is sized to its *content*, so anything inside it that
+/// asks for "the available width" is asking the panel to grow — and it obliges. The search
+/// box did exactly that and took the whole window, page view included. The box no longer
+/// asks, but this is the stop that means the next thing to try it cannot do the same.
+pub(crate) const PANEL_MAX_WIDTH: f32 =
+    THUMBNAIL_WIDTH * 4.0 + ASSUMED_GAP * 3.0 + SCROLL_BAR_ALLOWANCE;
+
+/// The opening width has to sit inside the range it is clamped to, or the panel would open
+/// somewhere nobody chose. Checked here rather than by a test, because these are constants:
+/// a build that disagrees is one that should not link.
+const _: () = assert!(PANEL_MIN_WIDTH <= PANEL_WIDTH && PANEL_WIDTH <= PANEL_MAX_WIDTH);
 
 /// How far the pointer must travel before a drag on empty space is a selection box.
 ///
@@ -207,6 +225,11 @@ pub(crate) struct Grid<'a> {
     /// Which pages are picked out. Only drawn, and only read, in
     /// [`GridMode::Reorganize`].
     pub(crate) selection: &'a Selection,
+    /// What is typed in the search box, verbatim. The panel owns the text; the pages it
+    /// resolves to are [`Self::filter`].
+    pub(crate) query: &'a str,
+    /// Which pages the grid is showing. See [`crate::search`].
+    pub(crate) filter: &'a PageFilter,
     /// Physical pixels per screen point, so a thumbnail is rasterized at the size it
     /// will actually be drawn.
     pub(crate) pixels_per_point: f32,
@@ -327,6 +350,8 @@ pub(crate) struct Drawn {
     /// A command too, for the reason the panel's own visibility is one: it changes what
     /// is on screen, and anything that can be entered has to be leavable.
     pub(crate) mode: Option<GridMode>,
+    /// The search box's text, when it changed this frame. `Some("")` is a cleared box.
+    pub(crate) query: Option<String>,
     /// Source pages the grid has on screen.
     ///
     /// Reported because the caller decides eviction and the texture cache has two
@@ -337,17 +362,38 @@ pub(crate) struct Drawn {
 
 /// Draws the grid, reporting what it drew.
 pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
-    // Above the scroll area rather than inside it, so the tabs stay put while the grid
-    // scrolls under them — and so the mode is still switchable with no pages to show.
+    // Above the scroll area rather than inside it, so the box and the tabs stay put while
+    // the grid scrolls under them — and so both still work with no pages to show.
     let mut drawn = Drawn {
-        mode: tabs(ui, grid.mode),
+        query: search_box(ui, grid.query),
         ..Drawn::default()
     };
+    drawn.mode = tabs(ui, grid.mode);
+    // Said out loud, because a drag that quietly does nothing reads as a broken drag.
+    if grid.mode == GridMode::Reorganize && grid.filter.is_narrowed() {
+        ui.label(
+            egui::RichText::new("clear the search to drag pages")
+                .small()
+                .color(ui.visuals().warn_fg_color),
+        )
+        .on_hover_text(
+            "With only some pages shown, dropping one between two others \
+             would have no clear meaning. Picking pages out still works.",
+        );
+    }
     ui.separator();
 
     let pages = grid.order.len();
     if pages == 0 {
         ui.label("no pages");
+        return drawn;
+    }
+
+    // Slots, not positions: with a query up the grid draws a subset, and the two stop
+    // being the same number. See [`PageFilter::position_at`].
+    let slots = grid.filter.shown(pages);
+    if slots == 0 {
+        ui.label(format!("no pages match “{}”", grid.query));
         return drawn;
     }
 
@@ -362,7 +408,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     // See `columns_for` and `row_height` for what went wrong when they did not.
     let gap = ui.spacing().item_spacing;
     let columns = columns_for(ui.available_width(), gap.x);
-    let rows = rows_for(pages, columns);
+    let rows = rows_for(slots, columns);
     let box_height = box_height(
         grid.document
             .geometry()
@@ -392,10 +438,13 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
             for row in row_range {
                 ui.horizontal(|ui| {
                     for column in 0..columns {
-                        let position = row * columns + column;
-                        if position >= pages {
+                        let slot = row * columns + column;
+                        // The one crossing from slot to position. Everything reported back
+                        // from here down is a position, so a drag out of a filtered grid
+                        // moves the page that was clicked rather than the slot it sat in.
+                        let Some(position) = grid.filter.position_at(slot, pages) else {
                             break;
-                        }
+                        };
                         let outcome = cell(ui, grid, position, bucket, box_height);
                         if let Some(dropped) = outcome.dropped {
                             drawn.moved = Some((dropped, position));
@@ -432,6 +481,58 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     }
 
     drawn
+}
+
+/// The search box. Returns the text when it changed this frame.
+///
+/// Above the tabs and outside the mode entirely, because narrowing the grid to a handful of
+/// pages is as useful when finding one as when reordering several.
+///
+/// The text is handed back rather than kept here, so the query travels the same route every
+/// other control's output does — see [`Drawn`]. That is also why this takes `&str` and owns
+/// nothing: the panel is told what is in the box and reports what was typed, and the
+/// viewer holds the string.
+fn search_box(ui: &mut egui::Ui, query: &str) -> Option<String> {
+    let mut typed = query.to_owned();
+    let mut changed = None;
+
+    ui.horizontal(|ui| {
+        // Sized from the panel's own intended width, and deliberately *not* from
+        // `ui.available_width()`. A panel is sized to its content, so during that pass
+        // "available" is the whole central area rather than the panel — a field sized from
+        // it asks the panel to be that wide, and the panel obliges. Both `f32::INFINITY`
+        // and `available_width()` swallowed the window this way.
+        //
+        // The cost is that the box does not stretch when the panel is dragged wider. Worth
+        // it: a search box that is 40 pt narrow than it could be is a cosmetic loss, and a
+        // panel that eats the document is not.
+        let clear_button = if query.is_empty() { 0.0 } else { 26.0 };
+        let width = (PANEL_WIDTH - SCROLL_BAR_ALLOWANCE - clear_button).max(40.0);
+        let field = egui::TextEdit::singleline(&mut typed)
+            .hint_text("page, 5-9, 1,4,7")
+            .desired_width(width);
+        if ui
+            .add(field)
+            .on_hover_text(
+                "Show only these pages. A number, a range like 5-9, \
+                 a list like 1,4,7, or any mix.",
+            )
+            .changed()
+        {
+            changed = Some(typed.clone());
+        }
+        // Only when there is something to clear, so the row does not shift as you type.
+        if !query.is_empty()
+            && ui
+                .small_button("✕")
+                .on_hover_text("Show every page again")
+                .clicked()
+        {
+            changed = Some(String::new());
+        }
+    });
+
+    changed
 }
 
 /// The mode tabs. Returns the mode asked for, if it is not the one already showing.
@@ -540,15 +641,27 @@ fn cell(
             }
         }
         GridMode::Reorganize => {
+            // A move is refused while a query is narrowing the grid. Dropping page 3 after
+            // page 50 with 4 to 49 hidden has no meaning anybody could predict, and
+            // guessing one would silently reorder a document by pages nobody could see.
+            // Picking pages out still works, so a search then a delete is fine.
+            let movable = !grid.filter.is_narrowed();
+            let sense = if movable {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            };
             let response = egui::Frame::default()
-                .show(ui, |ui| {
-                    paint(ui, &thumbnail, egui::Sense::click_and_drag())
-                })
+                .show(ui, |ui| paint(ui, &thumbnail, sense))
                 .inner
                 // The grab hand, which `dnd_drag_source` used to provide and hand-rolling
                 // the drag took away. Its own affordance matters more here than usual:
                 // nothing else about a thumbnail says it can be picked up.
-                .on_hover_cursor(egui::CursorIcon::Grab);
+                .on_hover_cursor(if movable {
+                    egui::CursorIcon::Grab
+                } else {
+                    egui::CursorIcon::Default
+                });
 
             // What travels when the drag starts. A drag from a page that is not picked
             // out takes that page alone — and the click reported alongside makes it the
@@ -941,6 +1054,28 @@ mod tests {
             inside < THUMBNAIL_WIDTH * 3.0,
             "the panel is wider than two columns need"
         );
+    }
+
+    #[test]
+    fn the_panel_is_bounded_at_both_ends() {
+        // That the opening width sits inside the range is asserted at compile time, next to
+        // the constants. What is left to check needs arithmetic: the floor has to leave a
+        // column visible, and the search box has to fit the panel it is drawn in — the box
+        // asking for more than it had is what grew the panel over the whole window.
+        assert_eq!(
+            columns_for(PANEL_MIN_WIDTH - SCROLL_BAR_ALLOWANCE, ASSUMED_GAP),
+            1,
+            "the narrowest panel does not fit a column"
+        );
+        // And the search box always fits inside the panel it is drawn in, whether or not
+        // the clear button is there.
+        for clear_button in [0.0, 26.0_f32] {
+            let field = (PANEL_WIDTH - SCROLL_BAR_ALLOWANCE - clear_button).max(40.0);
+            assert!(
+                field + clear_button <= PANEL_WIDTH,
+                "a {field} pt field plus a {clear_button} pt button overflows {PANEL_WIDTH}"
+            );
+        }
     }
 
     #[test]

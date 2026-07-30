@@ -87,6 +87,7 @@ use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::queue::RenderQueue;
 use crate::retain;
 use crate::saver::Saver;
+use crate::search::PageFilter;
 use crate::selection::Selection;
 use crate::thumbnails::{self, Grid, GridMode};
 use crate::tiles::{FULL_UV, to_color_image};
@@ -373,6 +374,13 @@ struct Viewer {
     /// — it holds source pages and follows them on its own.
     selection: Selection,
 
+    /// What is typed in the grid's search box. Empty when nothing is.
+    ///
+    /// The text is the state; the pages it names are re-derived each frame by
+    /// [`PageFilter::parse`], which is cheap and means there is no resolved list to fall
+    /// out of step with the document after an edit.
+    page_filter: String,
+
     /// A request held back because it would discard unsaved page changes.
     ///
     /// See [`crate::confirm`]. `None` whenever nothing is waiting, which is almost
@@ -461,6 +469,7 @@ impl Viewer {
             thumbnails: false,
             grid_mode: GridMode::default(),
             selection: Selection::default(),
+            page_filter: String::new(),
             guard: None,
             quitting: false,
             last_error: None,
@@ -537,6 +546,8 @@ impl Viewer {
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
             grid_mode: self.grid_mode,
+            page_filter: self.page_filter.clone(),
+            filtered_pages: self.filtered_pages(),
             selection: self.selected_pages(),
             unsaved_changes: self.unsaved_changes(),
             awaiting_answer: match &self.guard {
@@ -782,6 +793,18 @@ impl Viewer {
             Command::DeletePages { pages } => {
                 let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
                 self.edit(|order| order.remove_pages(&positions))
+            }
+            Command::SetPageFilter { query } => {
+                if self.page_filter == query {
+                    return DispatchResult::Unchanged;
+                }
+                self.page_filter = query;
+                // For the reason closing the grid clears it: **Delete** acts on the
+                // selection, and pages hidden behind a query are pages nobody can see it
+                // is about to remove. Costs re-picking after a search, which is the
+                // cheaper mistake.
+                self.selection.clear();
+                DispatchResult::View(Outcome::Changed)
             }
             Command::SetSelection { pages } => {
                 let Some(open) = &self.open else {
@@ -1062,6 +1085,33 @@ impl Viewer {
             .map(PageNumber::from_index)
             .collect();
         self.dispatch(ctx, Command::SetSelection { pages });
+    }
+
+    /// Which pages the grid is showing, from what is typed in its search box.
+    ///
+    /// Re-derived rather than stored. Parsing is a walk over a short string, and holding
+    /// the resolved list instead would give a reorder or a delete something else to keep
+    /// in step — which is the shape that has already caused three bugs here.
+    fn page_filter(&self) -> PageFilter {
+        PageFilter::parse(
+            &self.page_filter,
+            self.open.as_ref().map_or(0, |open| open.order.len()),
+        )
+    }
+
+    /// The filtered pages as display page numbers, or `None` when nothing is typed.
+    fn filtered_pages(&self) -> Option<Vec<PageNumber>> {
+        let Some(open) = &self.open else { return None };
+        match self.page_filter() {
+            PageFilter::All => None,
+            PageFilter::Only(positions) => Some(
+                positions
+                    .into_iter()
+                    .filter(|position| *position < open.order.len())
+                    .map(PageNumber::from_index)
+                    .collect(),
+            ),
+        }
     }
 
     /// Selected pages as display page numbers, ascending. Empty with no document.
@@ -1574,6 +1624,8 @@ impl Viewer {
         // All read before `open` is borrowed mutably below.
         let mode = self.grid_mode;
         let selection = self.selection.clone();
+        let filter = self.page_filter();
+        let query = self.page_filter.clone();
         let Some(open) = &mut self.open else {
             ui.label("No document open.");
             return;
@@ -1587,6 +1639,8 @@ impl Viewer {
             current,
             mode,
             selection: &selection,
+            query: &query,
+            filter: &filter,
             pixels_per_point,
         };
         let drawn = thumbnails::draw(ui, &mut grid);
@@ -1634,10 +1688,14 @@ impl Viewer {
             }
         }
 
-        // And the tabs, which are a control like any other.
+        // And the tabs and the search box, which are controls like any other.
         if let Some(mode) = drawn.mode {
             let ctx = ui.ctx().clone();
             self.dispatch(&ctx, Command::SetGridMode { mode });
+        }
+        if let Some(query) = drawn.query {
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, Command::SetPageFilter { query });
         }
     }
 
@@ -1886,6 +1944,13 @@ impl eframe::App for Viewer {
                 // panel opens sized for the columns it will actually lay out. See
                 // [`thumbnails::PANEL_WIDTH`].
                 .default_size(thumbnails::PANEL_WIDTH)
+                // Bounded, because a panel grows to fit its content and one child asking
+                // for the available width is enough to swallow the page view. See
+                // [`thumbnails::PANEL_MAX_WIDTH`].
+                .size_range(egui::Rangef::new(
+                    thumbnails::PANEL_MIN_WIDTH,
+                    thumbnails::PANEL_MAX_WIDTH,
+                ))
                 .show(ui, |ui| self.draw_thumbnails(ui));
         }
         self.draw_pages(ui);

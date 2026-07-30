@@ -111,6 +111,7 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         | Command::MovePages { .. }
         | Command::DeletePage { .. }
         | Command::DeletePages { .. }
+        | Command::SetPageFilter { .. }
         | Command::SetSelection { .. }
         | Command::Undo
         | Command::Save

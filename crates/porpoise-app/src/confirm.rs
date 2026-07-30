@@ -113,6 +113,7 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         | Command::Save
         | Command::SaveAs { .. }
         | Command::SetThumbnails { .. }
+        | Command::SetGridMode { .. }
         | Command::Answer { .. } => None,
     }
 }

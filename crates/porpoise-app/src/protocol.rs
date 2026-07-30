@@ -39,6 +39,7 @@ use serde::Serialize;
 
 use crate::command::Command;
 use crate::confirm::Answer;
+use crate::thumbnails::GridMode;
 
 /// Longest line we will accept, so a client cannot exhaust memory by never
 /// sending a newline.
@@ -240,6 +241,22 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
                     .at(id)
                 })?,
         }),
+        "set_grid_mode" => RequestBody::Command(Command::SetGridMode {
+            mode: object
+                .get("mode")
+                .and_then(|raw| serde_json::from_value::<GridMode>(raw.clone()).ok())
+                .ok_or_else(|| {
+                    DecodeError::BadArguments {
+                        command: name.to_owned(),
+                        // Names the alternatives, for the reason `answer` does below.
+                        detail: format!(
+                            "expected \"mode\" to be one of: {}",
+                            GridMode::every_name()
+                        ),
+                    }
+                    .at(id)
+                })?,
+        }),
         "answer" => RequestBody::Command(Command::Answer {
             choice: object
                 .get("choice")
@@ -306,6 +323,9 @@ pub(crate) struct Snapshot {
     pub(crate) last_error: Option<String>,
     /// Whether the page grid is showing.
     pub(crate) thumbnails: bool,
+    /// What clicking a page in the grid does. Reported whether or not the grid is
+    /// showing, because it is remembered across closing and reopening the panel.
+    pub(crate) grid_mode: GridMode,
     /// Whether the page order differs from the file on disk.
     ///
     /// False again once a save of that exact order reports success — so a document that

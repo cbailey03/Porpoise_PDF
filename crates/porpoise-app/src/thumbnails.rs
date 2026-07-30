@@ -33,6 +33,10 @@
 //! picker authoring an `open`. Whether the panel is showing is a different matter and
 //! does get a command, because it changes what is on screen and an agent that opens it
 //! can also close it. See `docs/goal-4-plan.md` §7.
+//!
+//! Clicking a page to *go* to it is the same idea applied to `GoToPage`. But it cannot
+//! share a widget with the drag, which is why the panel has two modes rather than one
+//! clever gesture — see [`GridMode`].
 
 use eframe::egui;
 use porpoise_doc::{Document, PageOrder};
@@ -53,6 +57,77 @@ const CELL_PADDING: f32 = 10.0;
 /// Height reserved under each thumbnail for its page number.
 const LABEL_HEIGHT: f32 = 16.0;
 
+/// What a click in the grid means.
+///
+/// # Why a mode, and not one gesture that is both
+///
+/// Clicking and dragging the same thumbnail was tried first, and does not work. A
+/// drag source that senses only drags becomes "being dragged" the instant the button
+/// goes down — egui does not wait to see whether the pointer moves, because with no
+/// click to disambiguate there is nothing to wait for. `dnd_drag_source` then paints
+/// its contents into a tooltip layer, which re-parents the widget inside it, so the
+/// click that arrives on release belongs to an id that no longer exists where it was.
+/// It never fires. Sensing *both* on one widget avoids that and buys a different
+/// problem: every reorder would then have to wait for egui to rule out a click first.
+///
+/// So the mode is the answer. In one, a cell is a click target and nothing else; in
+/// the other, a drag source and nothing else. A click has exactly one meaning at a
+/// time, which is the rule the rest of the program already follows — one decision,
+/// one producer. See [`crate::edits`] for the same idea applied to the toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GridMode {
+    /// Click a page to scroll the main view to it. The default, because finding a page
+    /// is what the grid is opened for far more often than reshuffling one.
+    #[default]
+    Navigate,
+    /// Drag a page to move it. Clicking does nothing, so a misfire cannot reorder.
+    Reorganize,
+}
+
+impl GridMode {
+    /// Every mode, for the tab row and the protocol's error message.
+    ///
+    /// Kept exhaustive by `every_mode_is_listed`, which matches on each variant and so
+    /// fails to compile when one is added — the same mechanism
+    /// `Command::shell_commands` uses.
+    pub(crate) const EVERY: [Self; 2] = [Self::Navigate, Self::Reorganize];
+
+    /// This mode's name on the wire.
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::Reorganize => "reorganize",
+        }
+    }
+
+    /// Every wire name, for an error that has to name the alternatives.
+    pub(crate) fn every_name() -> String {
+        Self::EVERY
+            .iter()
+            .map(|mode| mode.wire_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// What the tab says.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Navigate => "Navigation",
+            Self::Reorganize => "Reorganize",
+        }
+    }
+
+    /// What the tab's tooltip says the mode does. Worth spelling out, because the whole
+    /// point of the mode is that the same click does two different things.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Navigate => "Click a page to go to it",
+            Self::Reorganize => "Drag a page to move it; clicking does nothing",
+        }
+    }
+}
+
 /// Everything the grid needs from the open document.
 ///
 /// Passed in rather than reached for, so this module never sees the viewer's state and
@@ -68,6 +143,8 @@ pub(crate) struct Grid<'a> {
     pub(crate) queue: RenderQueue<'a>,
     /// Display position of the page the main view is showing, highlighted here.
     pub(crate) current: usize,
+    /// What a click does. See [`GridMode`].
+    pub(crate) mode: GridMode,
     /// Physical pixels per screen point, so a thumbnail is rasterized at the size it
     /// will actually be drawn.
     pub(crate) pixels_per_point: f32,
@@ -125,6 +202,16 @@ pub(crate) struct Drawn {
     /// Nothing is changed here — the caller turns this into a command, so a drag goes
     /// through the same dispatch as every other edit.
     pub(crate) moved: Option<(usize, usize)>,
+    /// A thumbnail that was clicked, in display position. Only ever set in
+    /// [`GridMode::Navigate`].
+    ///
+    /// Turned into `GoToPage` by the caller, same reasoning as `moved`.
+    pub(crate) navigated: Option<usize>,
+    /// A mode tab that was clicked, if it was not the one already showing.
+    ///
+    /// A command too, for the reason the panel's own visibility is one: it changes what
+    /// is on screen, and anything that can be entered has to be leavable.
+    pub(crate) mode: Option<GridMode>,
     /// Source pages the grid has on screen.
     ///
     /// Reported because the caller decides eviction and the texture cache has two
@@ -135,10 +222,18 @@ pub(crate) struct Drawn {
 
 /// Draws the grid, reporting what it drew.
 pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
+    // Above the scroll area rather than inside it, so the tabs stay put while the grid
+    // scrolls under them — and so the mode is still switchable with no pages to show.
+    let mut drawn = Drawn {
+        mode: tabs(ui, grid.mode),
+        ..Drawn::default()
+    };
+    ui.separator();
+
     let pages = grid.order.len();
     if pages == 0 {
         ui.label("no pages");
-        return Drawn::default();
+        return drawn;
     }
 
     let widest = grid
@@ -151,8 +246,6 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     let columns = columns_for(ui.available_width());
     let rows = rows_for(pages, columns);
     let cell_height = THUMBNAIL_WIDTH * 1.4 + LABEL_HEIGHT + CELL_PADDING * 2.0;
-
-    let mut drawn = Drawn::default();
 
     // `show_rows` only calls back for the rows on screen, which is what keeps a
     // 400-page grid from rasterizing 400 thumbnails — and what makes `showing` a
@@ -167,8 +260,12 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
                         if position >= pages {
                             break;
                         }
-                        if let Some(dropped) = cell(ui, grid, position, bucket) {
+                        let outcome = cell(ui, grid, position, bucket);
+                        if let Some(dropped) = outcome.dropped {
                             drawn.moved = Some((dropped, position));
+                        }
+                        if outcome.clicked {
+                            drawn.navigated = Some(position);
                         }
                         // The source page, because that is what the cache is keyed by.
                         drawn.showing.extend(grid.order.source_of(position));
@@ -180,14 +277,44 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     drawn
 }
 
-/// One thumbnail: a drop target wrapped around a draggable page.
+/// The mode tabs. Returns the mode asked for, if it is not the one already showing.
+fn tabs(ui: &mut egui::Ui, current: GridMode) -> Option<GridMode> {
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        for mode in GridMode::EVERY {
+            if ui
+                .selectable_label(mode == current, mode.label())
+                .on_hover_text(mode.hint())
+                .clicked()
+                && mode != current
+            {
+                chosen = Some(mode);
+            }
+        }
+    });
+    chosen
+}
+
+/// What one cell reported. At most one of these is ever set, because the mode decides
+/// which of them the cell was even able to produce.
+#[derive(Debug, Default, Clone, Copy)]
+struct CellOutcome {
+    /// The position dragged from, if a drop landed here this frame.
+    dropped: Option<usize>,
+    /// Whether this thumbnail was clicked.
+    clicked: bool,
+}
+
+/// One thumbnail, wired up for whichever mode the panel is in.
 fn cell(
     ui: &mut egui::Ui,
     grid: &mut Grid<'_>,
     position: usize,
     bucket: ZoomBucket,
-) -> Option<usize> {
-    let page = grid.order.source_of(position)?;
+) -> CellOutcome {
+    let Some(page) = grid.order.source_of(position) else {
+        return CellOutcome::default();
+    };
     let geometry = grid.document.geometry().get(page).copied();
     let size = match geometry {
         Some(page) if page.width_pt > 0.0 && page.height_pt > 0.0 => {
@@ -205,37 +332,96 @@ fn cell(
         grid.queue.want(key, grid.pixels_per_point);
     }
 
-    let (_, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::default(), |ui| {
-        let id = egui::Id::new(("porpoise-thumbnail", position));
-        ui.dnd_drag_source(id, position, |ui| {
-            ui.vertical(|ui| {
-                let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
-                match texture {
-                    Some(texture) => {
-                        ui.painter()
-                            .image(texture, rect, FULL_UV, egui::Color32::WHITE);
-                    }
-                    None => {
-                        // The same placeholder the main view uses, for the same reason:
-                        // a grey box that becomes a page beats the grid reflowing once
-                        // each thumbnail arrives.
-                        ui.painter()
-                            .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-                    }
-                }
-                // The page number under each one, because the whole job of the grid is
-                // telling you which page you are about to move.
-                let number = PageNumber::from_index(position);
-                if position == grid.current {
-                    ui.colored_label(ui.visuals().selection.bg_fill, format!("{number}"));
-                } else {
-                    ui.label(format!("{number}"));
-                }
-            });
-        });
-    });
+    let thumbnail = Thumbnail {
+        position,
+        size,
+        texture,
+        current: position == grid.current,
+    };
 
-    dropped.map(|from| *from).filter(|from| *from != position)
+    // The one place the mode is read. Everything else about a cell is the same either
+    // way, which is why the modes differ by what wraps `paint` and nothing more.
+    match grid.mode {
+        GridMode::Navigate => CellOutcome {
+            dropped: None,
+            clicked: egui::Frame::default()
+                .show(ui, |ui| paint(ui, &thumbnail, egui::Sense::click()))
+                .inner
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked(),
+        },
+        GridMode::Reorganize => {
+            let (_, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::default(), |ui| {
+                let id = egui::Id::new(("porpoise-thumbnail", position));
+                ui.dnd_drag_source(id, position, |ui| {
+                    // `hover`, not `click`: the drag source above already senses this
+                    // rect for drags, and a second sense here is what did not work.
+                    paint(ui, &thumbnail, egui::Sense::hover());
+                });
+            });
+            CellOutcome {
+                dropped: dropped.map(|from| *from).filter(|from| *from != position),
+                clicked: false,
+            }
+        }
+    }
+}
+
+/// One thumbnail's appearance, separated from how it is interacted with.
+struct Thumbnail {
+    /// Display position, which is what the page number under it counts.
+    position: usize,
+    size: egui::Vec2,
+    /// `None` until the render lands.
+    texture: Option<egui::TextureId>,
+    /// Whether this is the page the main view is showing.
+    current: bool,
+}
+
+/// Paints a thumbnail and its page number, and returns the image's own response.
+///
+/// Shared by both modes, so a page reads the same whichever tab is up. Not quite
+/// pixel-identical: `dnd_drop_zone` fills its frame in reorganize mode, which is what
+/// puts a panel of boxes behind the thumbnails there. That is the drop target showing
+/// itself, so it is left alone.
+fn paint(ui: &mut egui::Ui, thumbnail: &Thumbnail, sense: egui::Sense) -> egui::Response {
+    ui.vertical(|ui| {
+        let (rect, response) = ui.allocate_exact_size(thumbnail.size, sense);
+        match thumbnail.texture {
+            Some(texture) => {
+                ui.painter()
+                    .image(texture, rect, FULL_UV, egui::Color32::WHITE);
+            }
+            None => {
+                // The same placeholder the main view uses, for the same reason: a grey
+                // box that becomes a page beats the grid reflowing once each thumbnail
+                // arrives.
+                ui.painter()
+                    .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+            }
+        }
+        // Outlined as well as numbered in colour, because a coloured number is easy to
+        // miss in a panel of forty thumbnails and finding where you are is what
+        // navigation mode is for.
+        if thumbnail.current {
+            ui.painter().rect_stroke(
+                rect,
+                2.0,
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // The page number under each one, because the whole job of the grid is telling
+        // you which page you are looking at or about to move.
+        let number = PageNumber::from_index(thumbnail.position);
+        if thumbnail.current {
+            ui.colored_label(ui.visuals().selection.bg_fill, format!("{number}"));
+        } else {
+            ui.label(format!("{number}"));
+        }
+        response
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -312,6 +498,63 @@ mod tests {
         for width in [0.0, -5.0, f64::NAN, f64::INFINITY] {
             let scale = bucket_for(width, 1.0).scale();
             assert!(scale.is_finite() && scale > 0.0, "width {width} -> {scale}");
+        }
+    }
+
+    #[test]
+    fn every_mode_is_listed() {
+        // The enforcement, same as `Command::shell_commands`: a variant added without
+        // being put in `EVERY` fails to compile here, and an unlisted mode would be one
+        // with no tab — reachable over the wire and not by hand.
+        for mode in GridMode::EVERY {
+            match mode {
+                GridMode::Navigate | GridMode::Reorganize => {}
+            }
+        }
+        assert_eq!(GridMode::EVERY.len(), 2);
+    }
+
+    #[test]
+    fn the_grid_opens_in_navigation_mode() {
+        // Finding a page is the common reason to open the panel; reshuffling is the rare
+        // one. A wrong default here is a click that silently reorders the document.
+        assert_eq!(GridMode::default(), GridMode::Navigate);
+    }
+
+    #[test]
+    fn every_mode_has_a_distinct_wire_name_and_label() {
+        let mut names: Vec<&str> = GridMode::EVERY.iter().map(|m| m.wire_name()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "two modes share a wire name");
+
+        let mut labels: Vec<&str> = GridMode::EVERY.iter().map(|m| m.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "two tabs read the same");
+    }
+
+    #[test]
+    fn the_error_message_names_every_mode() {
+        // An agent that guessed wrong has no other way to find out what to say.
+        let listed = GridMode::every_name();
+        for mode in GridMode::EVERY {
+            assert!(
+                listed.contains(mode.wire_name()),
+                "{listed:?} does not mention {}",
+                mode.wire_name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_round_trips_through_its_wire_name() {
+        for mode in GridMode::EVERY {
+            let json = serde_json::to_value(mode).expect("a mode serializes");
+            assert_eq!(json, serde_json::Value::from(mode.wire_name()));
+            let back: GridMode = serde_json::from_value(json).expect("and comes back");
+            assert_eq!(back, mode);
         }
     }
 

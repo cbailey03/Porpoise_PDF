@@ -712,6 +712,89 @@ fn the_page_grid_can_be_opened_and_closed_by_command() {
 }
 
 #[test]
+fn the_page_grid_mode_can_be_set_by_command() {
+    let Some(_window) = e2e("the_page_grid_mode_can_be_set_by_command") else {
+        return;
+    };
+
+    // The mode decides what clicking a thumbnail does, so it is state a client has to be
+    // able to read as well as set — otherwise a screenshot of the grid is ambiguous about
+    // what a click in it would have done.
+    let document = fixture("e2e-grid-mode.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    assert_eq!(
+        serve.snapshot().get("grid_mode").and_then(Value::as_str),
+        Some("navigate"),
+        "the grid did not open in navigation mode"
+    );
+
+    let id = serve.send("set_grid_mode", &[("mode", Value::from("reorganize"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(
+        serve.snapshot().get("grid_mode").and_then(Value::as_str),
+        Some("reorganize")
+    );
+
+    // Same convention as every other command: already-true is `unchanged`, not an error.
+    let id = serve.send("set_grid_mode", &[("mode", Value::from("reorganize"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+
+    let id = serve.send("set_grid_mode", &[("mode", Value::from("navigate"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+
+    // An unknown mode is refused, and the refusal has to name the alternatives — an
+    // agent that guessed "reorder" has no other way to find out what to say.
+    let id = serve.send("set_grid_mode", &[("mode", Value::from("reorder"))]);
+    let reply = serve.reply_to(id);
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(false));
+    let error = reply
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        error.contains("navigate") && error.contains("reorganize"),
+        "the refusal did not name the modes: {error}"
+    );
+
+    // And the mode survives the panel closing, so reopening it cannot silently put a
+    // click back to meaning something else.
+    let id = serve.send("set_grid_mode", &[("mode", Value::from("reorganize"))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(false))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        serve.snapshot().get("grid_mode").and_then(Value::as_str),
+        Some("reorganize"),
+        "closing the grid forgot the mode"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn saving_an_unedited_document_over_itself_is_refused() {
     let Some(_window) = e2e("saving_an_unedited_document_over_itself_is_refused") else {
         return;

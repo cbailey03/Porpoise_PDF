@@ -87,7 +87,7 @@ use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::queue::RenderQueue;
 use crate::retain;
 use crate::saver::Saver;
-use crate::thumbnails::{self, Grid};
+use crate::thumbnails::{self, Grid, GridMode};
 use crate::tiles::{FULL_UV, to_color_image};
 
 /// Byte budget for cached page textures.
@@ -360,6 +360,12 @@ struct Viewer {
     /// Whether the page grid is showing. See [`crate::thumbnails`].
     thumbnails: bool,
 
+    /// What clicking a page in the grid does. See [`GridMode`].
+    ///
+    /// Kept here rather than in the panel, so closing the grid and reopening it does not
+    /// silently put a click back to meaning something else.
+    grid_mode: GridMode,
+
     /// A request held back because it would discard unsaved page changes.
     ///
     /// See [`crate::confirm`]. `None` whenever nothing is waiting, which is almost
@@ -446,6 +452,7 @@ impl Viewer {
             picker: FilePicker::default(),
             saver: Saver::default(),
             thumbnails: false,
+            grid_mode: GridMode::default(),
             guard: None,
             quitting: false,
             last_error: None,
@@ -521,6 +528,7 @@ impl Viewer {
             failed_pages,
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
+            grid_mode: self.grid_mode,
             unsaved_changes: self.unsaved_changes(),
             awaiting_answer: match &self.guard {
                 Some(Guard::Asking(intent)) => Some(intent.describe()),
@@ -772,6 +780,13 @@ impl Viewer {
                     return DispatchResult::Unchanged;
                 }
                 self.thumbnails = visible;
+                DispatchResult::View(Outcome::Changed)
+            }
+            Command::SetGridMode { mode } => {
+                if self.grid_mode == mode {
+                    return DispatchResult::Unchanged;
+                }
+                self.grid_mode = mode;
                 DispatchResult::View(Outcome::Changed)
             }
             Command::Capture { path } => {
@@ -1477,13 +1492,15 @@ impl Viewer {
         open.cache.retain_pages(|page| keep.contains(&page));
     }
 
-    /// Draws the page grid and dispatches any drag that landed.
+    /// Draws the page grid and dispatches whatever gesture landed in it.
     fn draw_thumbnails(&mut self, ui: &mut egui::Ui) {
         let pixels_per_point = ui.ctx().pixels_per_point();
         // Kept for the wheel, which is read a step earlier than this.
         // See `wheel_is_for_the_pages`.
         self.thumbnails_rect = ui.available_rect_before_wrap();
         let current = self.view().current_page();
+        // Both read before `open` is borrowed mutably below.
+        let mode = self.grid_mode;
         let Some(open) = &mut self.open else {
             ui.label("No document open.");
             return;
@@ -1495,6 +1512,7 @@ impl Viewer {
             cache: &mut open.cache,
             queue: RenderQueue::new(&open.pool, &mut open.in_flight, &mut open.failures),
             current,
+            mode,
             pixels_per_point,
         };
         let drawn = thumbnails::draw(ui, &mut grid);
@@ -1511,6 +1529,21 @@ impl Viewer {
             ) {
                 self.dispatch(&ctx, Command::MovePage { from, to });
             }
+        }
+
+        // A click in navigation mode: jump the main view there, same as `go_to_page`
+        // from the control channel.
+        if let Some(position) = drawn.navigated {
+            let ctx = ui.ctx().clone();
+            if let Some(page) = PageNumber::new(position.saturating_add(1)) {
+                self.dispatch(&ctx, ViewCommand::GoToPage { page }.into());
+            }
+        }
+
+        // And the tabs, which are a control like any other.
+        if let Some(mode) = drawn.mode {
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, Command::SetGridMode { mode });
         }
     }
 

@@ -114,7 +114,7 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
 
         if ui
             .selectable_label(state.thumbnails, "Pages")
-            .on_hover_text("Show the page grid, to drag pages around (Ctrl+T)")
+            .on_hover_text("Show the page grid, to jump to a page or drag pages around (Ctrl+T)")
             .clicked()
         {
             commands.push(state.edits.toggle_thumbnails.clone());

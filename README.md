@@ -22,10 +22,14 @@ on the command line. Launching with no path opens an empty window rather than re
 a file is held over the window, an overlay says what letting go will do — including whether it will stop
 to ask about unsaved page changes.
 
-`Ctrl+T` opens a grid of page thumbnails you can drag pages around in. Pages can also be reordered and
-deleted from the toolbar or the keyboard, with undo, then written back with **Save** or to a new file with
-`save_as`. Nothing on disk changes until you save, and a save either completes or leaves the original
-untouched — it writes beside the file and renames into place. Documents whose page tree is nested are
+`Ctrl+T` opens a grid of page thumbnails, with two tabs deciding what a click in it means:
+**Navigation** — the default — jumps the main view to the page you click, and **Reorganize** lets you
+drag pages into a new order. Two modes rather than one gesture that guesses, so a click has exactly
+one meaning and a misfire while browsing cannot reorder the document. Pages can also be reordered and
+deleted from the toolbar or the keyboard, with undo, then written back with **Save** or to a new file
+with `save_as`. Nothing on disk changes until you save, and a save either completes or leaves the
+original untouched — it writes beside the file and renames into place. Documents whose page tree is
+nested are
 refused rather than reordered, because reordering one can silently change what pages inherit; all
 three drawing sets tested here are flat. See `docs/goal-4-plan.md` section 2.
 

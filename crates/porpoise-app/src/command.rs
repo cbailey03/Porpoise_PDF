@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use porpoise_view::{PageNumber, ViewCommand};
 
 use crate::confirm::Answer;
+use crate::thumbnails::GridMode;
 
 /// Anything an operator — a person at the keyboard, or an agent — can ask of the
 /// program.
@@ -77,6 +78,15 @@ pub(crate) enum Command {
         /// Whether the grid should be showing.
         visible: bool,
     },
+    /// Choose what clicking a page in the grid does.
+    ///
+    /// A command for the same reason [`Self::SetThumbnails`] is: it changes what is on
+    /// screen, and it decides what a click means — so an agent that reads a snapshot can
+    /// tell what a person is looking at. See [`GridMode`] for why the panel has modes.
+    SetGridMode {
+        /// Navigate, or reorganize.
+        mode: GridMode,
+    },
     /// Answer the question raised when something would discard unsaved page changes.
     ///
     /// Does nothing when nothing is waiting on an answer. See [`crate::confirm`] for why
@@ -107,6 +117,7 @@ impl Command {
             Self::Save => "save",
             Self::SaveAs { .. } => "save_as",
             Self::SetThumbnails { .. } => "set_thumbnails",
+            Self::SetGridMode { .. } => "set_grid_mode",
             Self::Answer { .. } => "answer",
             Self::Quit => "quit",
         }
@@ -143,6 +154,9 @@ impl Command {
                 path: placeholder(),
             },
             Self::SetThumbnails { visible: true },
+            Self::SetGridMode {
+                mode: GridMode::Navigate,
+            },
             Self::Answer {
                 choice: Answer::Cancel,
             },
@@ -211,6 +225,7 @@ mod tests {
                 | Command::Save
                 | Command::SaveAs { .. }
                 | Command::SetThumbnails { .. }
+                | Command::SetGridMode { .. }
                 | Command::Answer { .. }
                 | Command::Quit => {}
             }
@@ -220,7 +235,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            11,
+            12,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

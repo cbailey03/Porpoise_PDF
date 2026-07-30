@@ -38,14 +38,25 @@ use crate::{MAX_SCALE, MIN_SCALE, PageNumber, ScrollLayout, ZoomBucket};
 /// position we asked for.
 const SCROLL_EPSILON_PT: f64 = 0.01;
 
-/// How navigation behaves.
+/// What the window shows: the whole document, or one page.
+///
+/// This is a **kind of view**, not a key binding. It was the latter until someone
+/// pointed out the obvious problem: paged mode changed what `PageDown` meant and
+/// nothing else, so the wheel still rolled straight through the document and the mode
+/// had no visible effect at all. Naming a mode after navigation and then only
+/// implementing navigation is how that happened.
+///
+/// So [`Self::Paged`] now confines the view. One page is on screen, the scrollable
+/// range is that page and nothing else, and scrolling off either end of it turns to
+/// the next page or back to the previous one. See [`View::sole_page`], which is where
+/// almost every consequence of the mode is derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum ScrollMode {
-    /// Continuous scrolling.
+    /// Every page in one continuous scrolling column.
     Free,
-    /// Navigation snaps to page boundaries.
+    /// One page at a time, filling the window.
     Paged,
 }
 
@@ -185,6 +196,19 @@ impl ViewState {
     }
 }
 
+/// Whether the view has anywhere left to scroll, in each direction.
+///
+/// A pair of booleans rather than distances, because the only question anyone asks of
+/// it is whether there is *any* room — and in paged mode "none" is the normal answer,
+/// not an edge case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollRoom {
+    /// Whether the view can move further towards the start of the document.
+    pub above: bool,
+    /// Whether the view can move further towards the end.
+    pub below: bool,
+}
+
 /// A [`ViewState`] plus the layout and viewport needed to interpret it.
 ///
 /// Everything here is derived on demand rather than stored, so it cannot go stale.
@@ -229,11 +253,72 @@ impl View<'_> {
         extent_pt(self.viewport.width(), self.zoom())
     }
 
+    /// The one page a single-page view is showing, or `None` in [`ScrollMode::Free`]
+    /// and when the document has no pages.
+    ///
+    /// This is where paged mode lives. Everything else about the mode — which pages are
+    /// on screen, how far the view can scroll, where the scrolling column starts, which
+    /// page a scroll off the end turns to — is derived from this one answer, so there is
+    /// no second place for the mode to be interpreted differently.
+    ///
+    /// # Why the page containing the top edge is the right question here
+    ///
+    /// In free mode it is the *wrong* question — [`ScrollLayout::current_page`] explains
+    /// at length why, and it cost a regression to learn. But paged mode confines the
+    /// view to the range in [`ScrollLayout::page_scroll_bounds_pt`], which lies entirely
+    /// within one page. So the top edge is inside that page by construction, and the
+    /// simple question has an unambiguous answer.
+    ///
+    /// # Why the *effective* position
+    ///
+    /// Because the shell lays the single page out from this value. Reading where the
+    /// view actually is would draw the page we are leaving on the frame a turn was
+    /// asked for, report an offset inside it, and throw the turn away.
+    #[must_use]
+    pub fn sole_page(&self) -> Option<usize> {
+        match self.state.scroll_mode {
+            ScrollMode::Free => None,
+            ScrollMode::Paged => self.layout.page_at_pt(self.state.effective_scroll_pt()),
+        }
+    }
+
     /// The pages currently on screen.
     #[must_use]
     pub fn visible_pages(&self) -> Range<usize> {
+        if let Some(page) = self.sole_page() {
+            // Exactly one, whatever the geometry. A page shorter than the window leaves
+            // empty space below it rather than showing the top of the next one —
+            // otherwise "paged" would still be showing two pages at a time, which is
+            // the complaint that produced this mode.
+            return page..page.saturating_add(1);
+        }
         self.layout
             .visible_pages(self.state.scroll_top_pt, self.visible_height_pt())
+    }
+
+    /// Where the scrolling column starts, in document points.
+    ///
+    /// Zero in free mode, where the column is the whole document. In paged mode the
+    /// column is one page, so it starts at that page's top — and every offset the shell
+    /// hands to its scroll area is relative to it.
+    #[must_use]
+    pub fn column_top_pt(&self) -> f64 {
+        self.sole_page()
+            .and_then(|page| self.layout.page_top_pt(page))
+            .unwrap_or(0.0)
+    }
+
+    /// How tall the scrolling column is: the whole document, or one page.
+    #[must_use]
+    pub fn column_height_pt(&self) -> f64 {
+        match self.sole_page() {
+            Some(page) => self
+                .layout
+                .page_bottom_pt(page)
+                .zip(self.layout.page_top_pt(page))
+                .map_or(0.0, |(bottom, top)| bottom - top),
+            None => self.layout.content_height_pt(),
+        }
     }
 
     /// The page the view is on, as a zero-based index.
@@ -242,8 +327,10 @@ impl View<'_> {
     /// into the layout and the cache. [`ViewSnapshot::current_page`] is the same
     /// page in the numbering a person reads.
     ///
-    /// Derived from where the view *actually is*, not from a pending request, so
-    /// this always describes what a person can see.
+    /// In free mode this is derived from where the view *actually is*, not from a pending
+    /// request, so it always describes what a person can see. In paged mode it is
+    /// [`Self::sole_page`], which reads the pending request — because in that mode the
+    /// shell has already drawn it.
     ///
     /// # The definition, and two rejected ones
     ///
@@ -261,17 +348,65 @@ impl View<'_> {
     /// viewport's height honest. Then, on any document whose pages are shorter than the
     /// window, the last page became unreachable — see `ScrollLayout::current_page` for the
     /// arithmetic. That was a real regression a person hit before any test did.
+    ///
+    /// Neither rule is needed in paged mode: there is only one page on screen to choose
+    /// between.
     #[must_use]
     pub fn current_page(&self) -> usize {
-        self.layout
-            .current_page(self.state.scroll_top_pt, self.visible_height_pt())
+        self.sole_page()
+            .or_else(|| {
+                self.layout
+                    .current_page(self.state.scroll_top_pt, self.visible_height_pt())
+            })
             .unwrap_or(0)
     }
 
-    /// The furthest the view can scroll before running out of document.
+    /// The closest to the top of the document the view can scroll.
+    ///
+    /// Zero in free mode. In paged mode it is the top of the page on screen, because
+    /// that page is the whole of the scrollable range.
+    #[must_use]
+    pub fn min_scroll_pt(&self) -> f64 {
+        self.scroll_bounds_pt().0
+    }
+
+    /// The furthest the view can scroll before running out of document — or, in paged
+    /// mode, out of page.
     #[must_use]
     pub fn max_scroll_pt(&self) -> f64 {
-        (self.layout.content_height_pt() - self.visible_height_pt()).max(0.0)
+        self.scroll_bounds_pt().1
+    }
+
+    /// Every scroll position the view is allowed to take, as `(lowest, highest)`.
+    ///
+    /// One function so that the two ends cannot disagree about the mode, and so that
+    /// clamping a scroll needs one lookup rather than two.
+    fn scroll_bounds_pt(&self) -> (f64, f64) {
+        match self.sole_page().and_then(|page| {
+            self.layout
+                .page_scroll_bounds_pt(page, self.visible_height_pt())
+        }) {
+            Some(bounds) => bounds,
+            None => (
+                0.0,
+                (self.layout.content_height_pt() - self.visible_height_pt()).max(0.0),
+            ),
+        }
+    }
+
+    /// Whether the view has anywhere left to go, in each direction.
+    ///
+    /// This is what decides whether a wheel gesture scrolls or turns the page: with room
+    /// left inside the page the scroll area does its usual job, and without it the only
+    /// thing scrolling further can mean is the next page.
+    #[must_use]
+    pub fn scroll_room(&self) -> ScrollRoom {
+        let (low_pt, high_pt) = self.scroll_bounds_pt();
+        let at_pt = self.state.effective_scroll_pt();
+        ScrollRoom {
+            above: at_pt > low_pt + SCROLL_EPSILON_PT,
+            below: at_pt < high_pt - SCROLL_EPSILON_PT,
+        }
     }
 
     /// The furthest the view can pan before running out of page.
@@ -316,6 +451,7 @@ impl View<'_> {
             pending_scroll_left_pt: self.state.requested_scroll_left_pt,
             content_height_pt: self.layout.content_height_pt(),
             content_width_pt: self.layout.content_width_pt(),
+            min_scroll_pt: self.min_scroll_pt(),
             max_scroll_pt: self.max_scroll_pt(),
             max_scroll_left_pt: self.max_scroll_left_pt(),
             zoom: self.zoom(),
@@ -363,7 +499,15 @@ pub struct ViewSnapshot {
     pub content_height_pt: f64,
     /// Width of the widest page, in points.
     pub content_width_pt: f64,
-    /// The largest useful value of [`Self::scroll_top_pt`].
+    /// The smallest legal value of [`Self::scroll_top_pt`].
+    ///
+    /// Zero in free mode. In paged mode it is the top of the page on screen, because the
+    /// view cannot leave that page by scrolling — so a client that assumed a floor of
+    /// zero would compute positions the view will refuse.
+    pub min_scroll_pt: f64,
+    /// The largest legal value of [`Self::scroll_top_pt`]. In paged mode this is the
+    /// bottom of the page on screen, not the end of the document; read
+    /// [`Self::content_height_pt`] for that.
     pub max_scroll_pt: f64,
     /// The largest useful value of [`Self::scroll_left_pt`]. Zero when the document
     /// fits the window's width, which is the normal case at fit-width.
@@ -427,18 +571,19 @@ pub fn apply(
             if !points.is_finite() {
                 return Outcome::Rejected(Rejection::NotFinite { argument: "points" });
             }
-            request_scroll(state, layout, viewport, points)
+            match state.scroll_mode {
+                ScrollMode::Free => request_scroll(state, layout, viewport, points),
+                // An absolute address, so the page is wherever it lands -- not the page
+                // we happen to be on. Clamping into the current page would leave most of
+                // the document unaddressable in paged mode.
+                ScrollMode::Paged => paged_scroll_to(state, layout, viewport, points),
+            }
         }
         ViewCommand::ScrollBy { points } => {
             if !points.is_finite() {
                 return Outcome::Rejected(Rejection::NotFinite { argument: "points" });
             }
-            request_scroll(
-                state,
-                layout,
-                viewport,
-                state.effective_scroll_pt() + points,
-            )
+            scroll_by(state, layout, viewport, points)
         }
         ViewCommand::ScrollByViewports { fraction } => {
             if !fraction.is_finite() {
@@ -449,12 +594,7 @@ pub fn apply(
             // A screenful is however much document the window covers, which is a
             // pixel height divided by zoom -- not the pixel height itself.
             let points = state.with(layout, viewport).visible_height_pt() * fraction;
-            request_scroll(
-                state,
-                layout,
-                viewport,
-                state.effective_scroll_pt() + points,
-            )
+            scroll_by(state, layout, viewport, points)
         }
         ViewCommand::PanTo { points } => {
             if !points.is_finite() {
@@ -483,10 +623,111 @@ pub fn apply(
             if state.scroll_mode == mode {
                 return Outcome::Unchanged;
             }
+            // Snap to the top of the page in view, and force the request even when our
+            // own position does not change. Two reasons, both load-bearing:
+            //
+            // The shell's scroll offset is relative to the *column*, and the mode decides
+            // what the column is -- the whole document, or one page. So the offset it is
+            // holding now means somewhere else afterwards, exactly as it does after a
+            // zoom change; see `force_scroll`.
+            //
+            // And a free-mode position can straddle two pages, which paged mode has no
+            // way to represent: it shows one page, and "halfway between two" is not one.
+            // Snapping is what makes the switch land somewhere the mode can describe.
+            let anchor = state.with(layout, viewport).current_page();
             state.scroll_mode = mode;
+            if let Some(top_pt) = layout.page_top_pt(anchor) {
+                let target_pt = match mode {
+                    ScrollMode::Free => clamp_scroll(state, layout, viewport, top_pt),
+                    // Unclamped, for the reason `scroll_to_page` is.
+                    ScrollMode::Paged => top_pt,
+                };
+                state.requested_scroll_pt = Some(target_pt);
+            }
             Outcome::Changed
         }
     }
+}
+
+/// Scrolls by a relative amount, in whichever mode is in force.
+fn scroll_by(
+    state: &mut ViewState,
+    layout: &ScrollLayout,
+    viewport: Viewport,
+    points: f64,
+) -> Outcome {
+    match state.scroll_mode {
+        ScrollMode::Free => request_scroll(
+            state,
+            layout,
+            viewport,
+            state.effective_scroll_pt() + points,
+        ),
+        ScrollMode::Paged => paged_step(state, layout, viewport, points),
+    }
+}
+
+/// Scrolls within the page on screen, or over to the next one.
+///
+/// This is what makes the wheel and the arrow keys turn pages. In a single-page view the
+/// page *is* the scrollable range, so a scroll that runs off the end of it has to mean
+/// something, and the next page is the only thing it can mean.
+///
+/// Backwards lands on the **bottom** of the previous page rather than its top, so that
+/// scrolling down off the end of a page and then straight back up returns you to where
+/// you were. [`ViewCommand::PreviousPage`] is the command that goes to a page's top, and
+/// that difference is deliberate: one is scrolling, the other is navigating.
+fn paged_step(
+    state: &mut ViewState,
+    layout: &ScrollLayout,
+    viewport: Viewport,
+    points: f64,
+) -> Outcome {
+    let view = state.with(layout, viewport);
+    let viewport_height_pt = view.visible_height_pt();
+    let (low_pt, high_pt) = (view.min_scroll_pt(), view.max_scroll_pt());
+    let Some(page) = view.sole_page() else {
+        return Outcome::Rejected(Rejection::NoPages);
+    };
+    let target_pt = state.effective_scroll_pt() + points;
+
+    if target_pt > high_pt + SCROLL_EPSILON_PT {
+        let next = page.saturating_add(1);
+        return if next < layout.page_count() {
+            scroll_to_page(state, layout, viewport, next)
+        } else {
+            // The end of the document. Stop against it rather than reporting a rejection:
+            // a wheel that runs out of document has not done anything wrong.
+            set_scroll(state, high_pt)
+        };
+    }
+    if target_pt < low_pt - SCROLL_EPSILON_PT {
+        let Some(previous) = page.checked_sub(1) else {
+            return set_scroll(state, low_pt);
+        };
+        let previous_bottom_pt = layout
+            .page_scroll_bounds_pt(previous, viewport_height_pt)
+            .map_or(low_pt, |(_, high_pt)| high_pt);
+        return set_scroll(state, previous_bottom_pt);
+    }
+    set_scroll(state, target_pt.clamp(low_pt, high_pt))
+}
+
+/// Scrolls to an absolute position in paged mode, moving to whichever page it is in.
+fn paged_scroll_to(
+    state: &mut ViewState,
+    layout: &ScrollLayout,
+    viewport: Viewport,
+    target_pt: f64,
+) -> Outcome {
+    let viewport_height_pt = state.with(layout, viewport).visible_height_pt();
+    let Some(bounds) = layout
+        .page_at_pt(target_pt.clamp(0.0, layout.content_height_pt()))
+        .and_then(|page| layout.page_scroll_bounds_pt(page, viewport_height_pt))
+    else {
+        return Outcome::Rejected(Rejection::NoPages);
+    };
+    set_scroll(state, target_pt.clamp(bounds.0, bounds.1))
 }
 
 /// Moves `delta` pages from wherever navigation is heading.
@@ -527,13 +768,33 @@ fn scroll_to_page(
     viewport: Viewport,
     index: usize,
 ) -> Outcome {
-    match layout.page_top_pt(index) {
-        Some(top_pt) => request_scroll(state, layout, viewport, top_pt),
-        None => Outcome::Rejected(Rejection::NoSuchPage {
+    let Some(top_pt) = layout.page_top_pt(index) else {
+        return Outcome::Rejected(Rejection::NoSuchPage {
             page: PageNumber::from_index(index),
             page_count: layout.page_count(),
-        }),
+        });
+    };
+    match state.scroll_mode {
+        ScrollMode::Free => request_scroll(state, layout, viewport, top_pt),
+        // Deliberately unclamped. In paged mode the scroll bounds come from the page the
+        // view is on *now*, so clamping here would pull every page turn straight back into
+        // the page it was leaving. A page's top is a legal position by construction --
+        // it is the floor of that page's own range.
+        ScrollMode::Paged => set_scroll(state, top_pt),
     }
+}
+
+/// Records a scroll request verbatim, if it would move the view.
+///
+/// No clamping: every caller has already worked out a position that is legal in the mode
+/// in force, and re-clamping against wherever the view is *now* is what turns a page turn
+/// back into staying put.
+fn set_scroll(state: &mut ViewState, target_pt: f64) -> Outcome {
+    if (target_pt - state.effective_scroll_pt()).abs() < SCROLL_EPSILON_PT {
+        return Outcome::Unchanged;
+    }
+    state.requested_scroll_pt = Some(target_pt);
+    Outcome::Changed
 }
 
 /// Asks the shell to scroll, but only if that would actually move the view.
@@ -1267,6 +1528,376 @@ mod tests {
             ),
             Outcome::Unchanged
         );
+    }
+
+    // --- Paged mode as a kind of view ----------------------------------------
+    //
+    // Paged mode used to change what `PageDown` meant and nothing else, so the wheel
+    // rolled straight through the document and the mode had no visible effect. These
+    // tests are about the mode *confining* the view, which is the part that was missing.
+
+    /// Applies a command against a chosen layout and window, settling it as a frame would.
+    ///
+    /// The paged tests need geometry the shared `run` helper does not have — a window
+    /// taller than a page, and a page taller than the window are opposite conditions and
+    /// both matter here.
+    fn run_and_settle_on(
+        state: &mut ViewState,
+        layout: &ScrollLayout,
+        viewport: Viewport,
+        command: ViewCommand,
+    ) -> Outcome {
+        let outcome = apply(state, layout, viewport, command);
+        if let Some(top) = state.take_requested_scroll_pt() {
+            state.report_scroll_top_pt(top);
+        }
+        if let Some(left) = state.take_requested_scroll_left_pt() {
+            state.report_scroll_left_pt(left);
+        }
+        outcome
+    }
+
+    /// Switches to paged mode and settles, as opening the mode from the toolbar would.
+    fn go_paged(state: &mut ViewState, layout: &ScrollLayout, viewport: Viewport) {
+        run_and_settle_on(
+            state,
+            layout,
+            viewport,
+            ViewCommand::SetScrollMode {
+                mode: ScrollMode::Paged,
+            },
+        );
+    }
+
+    /// One page taller than the window: 792 pt sheets seen through a 396 pt window.
+    ///
+    /// Pages this shape are the only ones with anywhere to scroll *within* a page, so
+    /// they are what separates "scroll the rest of this page" from "turn to the next".
+    fn tall_pages_in_a_short_window() -> (ScrollLayout, Viewport) {
+        (ten_pages(), viewport())
+    }
+
+    #[test]
+    fn paged_mode_shows_one_page_where_free_mode_shows_two() {
+        // The complaint, stated as a test. On a drawing set the window is taller than a
+        // sheet, so free mode always has the next page peeking in below — which is what
+        // made "paged" look like it did nothing.
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        assert_eq!(
+            state.with(&layout, viewport).visible_pages(),
+            0..2,
+            "free mode should show the next page below"
+        );
+
+        go_paged(&mut state, &layout, viewport);
+        assert_eq!(state.with(&layout, viewport).visible_pages(), 0..1);
+        assert_eq!(state.with(&layout, viewport).sole_page(), Some(0));
+    }
+
+    #[test]
+    fn paged_mode_confines_scrolling_to_the_page_on_screen() {
+        // The scrollable range *is* the page. This is what the shell hands to its scroll
+        // area, and it is why the wheel can no longer roll into the next page.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+        run_and_settle_on(&mut state, &layout, viewport, go_to_index(3));
+
+        let view = state.with(&layout, viewport);
+        // Page 3 spans 2376..3168, and a 396 pt window leaves half a page to travel.
+        assert_eq!(view.min_scroll_pt(), 2376.0);
+        assert_eq!(view.max_scroll_pt(), 2772.0);
+        assert_eq!(view.column_top_pt(), 2376.0);
+        assert_eq!(view.column_height_pt(), 792.0);
+    }
+
+    #[test]
+    fn a_page_shorter_than_the_window_has_nowhere_to_scroll() {
+        // So every wheel gesture is a page turn, which is the behaviour a single-page view
+        // is supposed to have.
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        let room = state.with(&layout, viewport).scroll_room();
+        assert!(!room.above && !room.below, "expected no room, got {room:?}");
+    }
+
+    #[test]
+    fn scrolling_off_the_bottom_of_a_page_turns_to_the_next() {
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        // A screenful is what the wheel sends when it turns a page; see `input::PageTurns`.
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollByViewports { fraction: 1.0 },
+        );
+        assert_eq!(state.with(&layout, viewport).current_page(), 1);
+        // At the top of page 1, which starts after one 792 pt sheet and a 12 pt gap.
+        assert_eq!(state.scroll_top_pt(), 804.0);
+    }
+
+    #[test]
+    fn scrolling_within_a_page_taller_than_the_window_stays_on_it() {
+        // The reason a page turn is not simply "any scroll in paged mode": on a page the
+        // window cannot show all of, there is a page to read first.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollBy { points: 200.0 },
+        );
+        assert_eq!(state.scroll_top_pt(), 200.0);
+        assert_eq!(state.with(&layout, viewport).current_page(), 0);
+    }
+
+    #[test]
+    fn scrolling_off_a_tall_page_lands_on_the_top_of_the_next() {
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        // 500 pt is past 396, the furthest a 396 pt window can go down a 792 pt page.
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollBy { points: 500.0 },
+        );
+        assert_eq!(state.scroll_top_pt(), 792.0);
+        assert_eq!(state.with(&layout, viewport).current_page(), 1);
+    }
+
+    #[test]
+    fn scrolling_back_off_a_page_returns_to_where_you_were() {
+        // Down off the end of a page and straight back up is the same position, not the
+        // top of the previous page. This is what makes reading backwards through a
+        // zoomed-in document work, and it is why the backwards case lands on a page's
+        // bottom rather than its top.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+        run_and_settle_on(&mut state, &layout, viewport, go_to_index(4));
+
+        let bottom_of_page_four = 4.0 * 792.0 + 396.0;
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollTo {
+                points: bottom_of_page_four,
+            },
+        );
+        assert_eq!(state.scroll_top_pt(), bottom_of_page_four);
+
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollBy { points: 100.0 },
+        );
+        assert_eq!(
+            state.with(&layout, viewport).current_page(),
+            5,
+            "scrolling on from the bottom of a page should turn it"
+        );
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollBy { points: -100.0 },
+        );
+        assert_eq!(
+            state.scroll_top_pt(),
+            bottom_of_page_four,
+            "scrolling back did not return to where the page was left"
+        );
+    }
+
+    #[test]
+    fn scrolling_past_the_last_page_stops_at_the_end() {
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+        run_and_settle_on(&mut state, &layout, viewport, ViewCommand::LastPage);
+
+        let at_the_end = state.scroll_top_pt();
+        assert_eq!(
+            run_and_settle_on(
+                &mut state,
+                &layout,
+                viewport,
+                ViewCommand::ScrollByViewports { fraction: 1.0 }
+            ),
+            Outcome::Unchanged,
+            "there is no page after the last one"
+        );
+        assert_eq!(state.scroll_top_pt(), at_the_end);
+        assert_eq!(state.with(&layout, viewport).current_page(), 9);
+    }
+
+    #[test]
+    fn scrolling_above_the_first_page_stops_at_the_start() {
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        assert_eq!(
+            run_and_settle_on(
+                &mut state,
+                &layout,
+                viewport,
+                ViewCommand::ScrollByViewports { fraction: -1.0 }
+            ),
+            Outcome::Unchanged
+        );
+        assert_eq!(state.scroll_top_pt(), 0.0);
+        assert_eq!(state.with(&layout, viewport).current_page(), 0);
+    }
+
+    #[test]
+    fn paged_navigation_walks_every_page_to_the_end() {
+        // The same walk `next_page_walks_all_the_way_to_the_end_of_a_short_paged_document`
+        // does in free mode, in the mode named after it.
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        let mut reached = vec![state.with(&layout, viewport).current_page()];
+        for _ in 0..12 {
+            run_and_settle_on(&mut state, &layout, viewport, ViewCommand::NextPage);
+            reached.push(state.with(&layout, viewport).current_page());
+        }
+        assert_eq!(reached.last(), Some(&9), "never arrived: {reached:?}");
+        for index in 0..10 {
+            assert!(
+                reached.contains(&index),
+                "page {index} skipped: {reached:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_to_paged_mode_snaps_to_the_page_in_view() {
+        // A free-mode position can straddle two pages, and paged mode has no way to show
+        // that. Whichever page was mostly on screen is the one that stays.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        // Two thirds of the way down page 2, so most of what is on screen is page 2.
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollTo { points: 2100.0 },
+        );
+        assert_eq!(state.with(&layout, viewport).current_page(), 2);
+
+        go_paged(&mut state, &layout, viewport);
+        assert_eq!(
+            state.scroll_top_pt(),
+            1584.0,
+            "did not snap to page 3's top"
+        );
+        assert_eq!(state.with(&layout, viewport).current_page(), 2);
+    }
+
+    #[test]
+    fn switching_modes_always_asks_the_shell_to_re_derive_its_offset() {
+        // The shell's scroll offset is relative to the column, and the mode decides what
+        // the column is. Suppressing the request because "the position has not changed"
+        // would leave the view wherever a now-meaningless pixel offset lands — the same
+        // trap `force_scroll` exists for.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        assert_eq!(state.scroll_top_pt(), 0.0);
+
+        for mode in [ScrollMode::Paged, ScrollMode::Free] {
+            assert_eq!(
+                apply(
+                    &mut state,
+                    &layout,
+                    viewport,
+                    ViewCommand::SetScrollMode { mode }
+                ),
+                Outcome::Changed
+            );
+            assert_eq!(
+                state.take_requested_scroll_pt(),
+                Some(0.0),
+                "switching to {mode:?} did not ask the shell to re-derive its offset"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absolute_scroll_in_paged_mode_moves_to_the_page_it_names() {
+        // `scroll_to` is an address, so it means the page it lands in — not a position
+        // inside whichever page happens to be showing. Clamping into the current page
+        // would leave most of the document unreachable over the control channel.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollTo { points: 5000.0 },
+        );
+        // 5000 is inside page index 6, which spans 4752..5544, and is a legal position
+        // within that page's own range.
+        assert_eq!(state.scroll_top_pt(), 5000.0);
+        assert_eq!(state.with(&layout, viewport).current_page(), 6);
+    }
+
+    #[test]
+    fn an_absolute_scroll_is_still_clamped_into_the_page_it_lands_in() {
+        let (layout, viewport) = short_pages_in_a_tall_window();
+        let mut state = ViewState::new();
+        go_paged(&mut state, &layout, viewport);
+
+        // Page 4 starts at 3216 and is shorter than the window, so its only legal
+        // position is its own top however far into it the address points.
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollTo { points: 3600.0 },
+        );
+        assert_eq!(state.scroll_top_pt(), 3216.0);
+        assert_eq!(state.with(&layout, viewport).current_page(), 4);
+    }
+
+    #[test]
+    fn free_mode_still_scrolls_through_the_whole_document() {
+        // The guard against confining the wrong mode. Free mode's range is the document,
+        // and a scroll crossing a page boundary stays exactly where it was told.
+        let (layout, viewport) = tall_pages_in_a_short_window();
+        let mut state = ViewState::new();
+
+        let view = state.with(&layout, viewport);
+        assert_eq!(view.min_scroll_pt(), 0.0);
+        assert_eq!(view.max_scroll_pt(), 7920.0 - 396.0);
+        assert_eq!(view.sole_page(), None);
+        assert_eq!(view.column_top_pt(), 0.0);
+        assert_eq!(view.column_height_pt(), 7920.0);
+
+        run_and_settle_on(
+            &mut state,
+            &layout,
+            viewport,
+            ViewCommand::ScrollBy { points: 1000.0 },
+        );
+        assert_eq!(state.scroll_top_pt(), 1000.0);
     }
 
     // --- Derived values ------------------------------------------------------

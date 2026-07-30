@@ -525,6 +525,74 @@ Every `porpoise-view` test used a viewport **half a page tall** — the opposite
 regression needed a window *taller* than a page, and nothing exercised that. There are now nine tests
 that do, three of which were confirmed to fail against the old rule before the fix was kept.
 
+## 6d. Paged mode was a key binding, not a view (2026-07-30)
+
+Reported by the same person, straight after §6c: *"Even when paged is selected, it still scrolls like
+a free scroll."* Correct, and the diagnosis is embarrassing in a useful way — **paged mode changed
+what `PageDown` meant and nothing else.** The scroll area still held the whole document, so the next
+page still showed below the current one and the wheel still rolled through the lot. §6c fixed the
+page *counter* in that mode, which is why the mode looked half-working rather than absent.
+
+Naming a mode after navigation and then only implementing navigation is how that happened.
+
+### What paged mode is now
+
+The user's own framing, adopted directly: **a kind of view in which the window shows one page.**
+Everything follows from `View::sole_page`:
+
+| | Free | Paged |
+|---|---|---|
+| Scrolling column | the whole document | one page |
+| Pages on screen | however many fit | exactly one |
+| Scroll range | `0 .. content - window` | that page's own extent |
+| Which page you are on | half-of-what-it-could-show (§6c) | the page containing the top edge |
+| Wheel off the end | clamps | turns the page |
+
+The column is the load-bearing part. egui owns the live scroll offset and clamps it to the content it
+was given, so handing it **one page's worth of content** is what physically stops the wheel from
+rolling into the next page. There is no fight with the scroll area and no per-frame offset override;
+hand-scrolling inside a page the window cannot show all of still uses egui's own inertia.
+
+"The page containing the top edge" is the rule §6c *rejected* — and it is right here for the reason it
+was wrong there: the view is confined within one page, so the top edge is inside that page by
+construction and the question is no longer ambiguous.
+
+### Two devices, two rules for the wheel
+
+A mouse wheel sends one discrete event per notch and a person spinning it expects a page per notch. A
+trackpad sends a continuous stream, and one swipe should turn one page however many events it
+contains. `input::PageTurns` reads egui's own smoothing test to tell them apart rather than
+inventing a second one.
+
+Two decisions worth recording:
+
+- **The gesture is claimed on its first frame.** A swipe that starts with page left to read spends
+  itself scrolling *that* page and does not also turn one on reaching the bottom. One gesture, one
+  thing.
+- **Scrolling backwards lands on the previous page's *bottom***, not its top, so that going down off
+  the end of a page and straight back up returns you where you were. `PreviousPage` — PageUp — is
+  the command that goes to a page's top. Scrolling and navigating are different verbs.
+
+### The bug the harness found
+
+The wheel is the one input the control channel cannot send, so it was driven with real
+`WM_MOUSEWHEEL` messages posted at the window, with free mode as the control. Free mode scrolled;
+paged mode did nothing.
+
+The gate was *"is the pointer over the pages"* — needed so that scrolling the thumbnail strip does
+not turn pages. But **a wheel event routinely arrives with no pointer position at all**: winit's
+mouse-leave tracking clears egui's `hover_pos` as soon as the cursor is not where it expects, and
+that test then fails closed, silently.
+
+It is now *"is the pointer over the thumbnail strip"*, negated. Same intent, opposite failure mode:
+guessing wrong scrolls the wrong panel for one gesture, instead of leaving paged mode looking exactly
+as broken as it did before. `input::wheel_is_for_the_pages` is a pure function so the no-pointer case
+has a test rather than a comment.
+
+Neither the mode nor the wheel would have been caught by the existing suite: every scroll-mode test
+asserted the mode *field*, which was always correct. The tests now assert what the mode does to the
+view.
+
 ## 7. Open decisions
 
 1. ~~**Our license.**~~ **Decided 2026-07-29: `MIT OR Apache-2.0`**, copyright Christian Bailey,

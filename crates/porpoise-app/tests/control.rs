@@ -235,6 +235,27 @@ fn fixture(name: &str) -> PathBuf {
     path
 }
 
+/// How much document the window covers vertically, in points.
+///
+/// From the window and the zoom, which is the only derivation that holds in both scroll
+/// modes: paged mode confines the scroll range to one page, so subtracting the scroll
+/// limit from the content height measures a page and not a window.
+fn window_height_pt(view: &Value) -> f64 {
+    let pixels = view
+        .get("viewport_height_px")
+        .and_then(Value::as_f64)
+        .expect("a viewport height");
+    let zoom = view.get("zoom").and_then(Value::as_f64).expect("a zoom");
+    pixels / zoom
+}
+
+/// The `view` field of `key`, as an integer.
+fn page_field(view: &Value, key: &str) -> u64 {
+    view.get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("no {key} in {view}"))
+}
+
 fn scratch(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     path.push(name);
@@ -1042,16 +1063,11 @@ fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
         Some(true)
     );
 
-    let view = serve.view();
-    let content = view
-        .get("content_height_pt")
-        .and_then(Value::as_f64)
-        .expect("a content height");
-    let max_scroll = view
-        .get("max_scroll_pt")
-        .and_then(Value::as_f64)
-        .expect("a scroll limit");
-    let viewport_pt = content - max_scroll;
+    // Measured from the window and the zoom rather than from the scroll limit. Paged mode
+    // confines the scroll range to one page, so `content_height - max_scroll` no longer
+    // names the window's height — it did when this test was written, which is why the
+    // derivation is now spelled out.
+    let viewport_pt = window_height_pt(&serve.view());
     assert!(
         viewport_pt > 300.0,
         "the window is not taller than a page, so this cannot reproduce: {viewport_pt} pt"
@@ -1092,6 +1108,141 @@ fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
         Some(PAGES as u64 - 1),
         "going back from the end skipped a page: {view}"
     );
+
+    serve.quit();
+}
+
+#[test]
+fn paged_mode_shows_one_page_where_free_mode_shows_two() {
+    let Some(_window) = e2e("paged_mode_shows_one_page_where_free_mode_shows_two") else {
+        return;
+    };
+
+    // The complaint that produced the mode: "even when paged is selected, it still scrolls
+    // like a free scroll". Paged mode changed what PageDown meant and nothing else, so the
+    // next page still showed below the current one and the wheel rolled straight past it.
+    let document = fixture("e2e-paged-single.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    // Zoom until the window is taller than a 300 pt page, so free mode has two pages on
+    // screen and there is something for paged mode to be different from.
+    let id = serve.send(
+        "set_zoom",
+        &[("target", serde_json::json!({ "fixed": 2.3 }))],
+    );
+    serve.reply_to(id);
+    let view = serve.view();
+    assert!(
+        window_height_pt(&view) > 300.0,
+        "the window is not taller than a page: {view}"
+    );
+    assert!(
+        page_field(&view, "last_visible_page") > page_field(&view, "first_visible_page"),
+        "free mode should have two pages on screen here: {view}"
+    );
+
+    let id = serve.send("set_scroll_mode", &[("mode", Value::from("paged"))]);
+    serve.reply_to(id);
+    let view = serve.view();
+    assert_eq!(
+        (
+            page_field(&view, "first_visible_page"),
+            page_field(&view, "last_visible_page")
+        ),
+        (1, 1),
+        "paged mode is still showing more than one page: {view}"
+    );
+    // And there is nowhere to scroll, because the page is the whole scrollable range.
+    assert_eq!(
+        view.get("min_scroll_pt").and_then(Value::as_f64),
+        view.get("max_scroll_pt").and_then(Value::as_f64),
+        "paged mode left somewhere to scroll on a page that fits: {view}"
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn scrolling_in_paged_mode_turns_the_page() {
+    let Some(_window) = e2e("scrolling_in_paged_mode_turns_the_page") else {
+        return;
+    };
+
+    // What the wheel and the arrow keys do, over the wire. Scrolling off the end of the
+    // page is the only gesture a single-page view has left, so it has to mean the next
+    // page — and the same command an agent sends is the one the wheel produces.
+    let document = fixture("e2e-paged-scroll.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    let id = serve.send("set_scroll_mode", &[("mode", Value::from("paged"))]);
+    serve.reply_to(id);
+
+    // At fit-width these 200 pt sheets zoom to about 5x, which makes the window cover
+    // barely half of one — so this is the case with page left to read before there is
+    // anything to turn to, and scrolling has to do both jobs in the right order.
+    let view = serve.view();
+    let window = window_height_pt(&view);
+    assert!(
+        window < 300.0,
+        "the window is not shorter than a page, so this tests the wrong case: {view}"
+    );
+
+    let mut screenfuls = 0;
+    let mut inside_the_page = Vec::new();
+    while page_field(&serve.view(), "current_page") == 1 {
+        inside_the_page.push(serve.view().get("scroll_top_pt").cloned());
+        let id = serve.send("scroll_by_viewports", &[("fraction", Value::from(1.0))]);
+        serve.reply_to(id);
+        screenfuls += 1;
+        assert!(screenfuls < 10, "never left page 1: {:?}", inside_the_page);
+    }
+    assert!(
+        screenfuls > 1,
+        "the page turned before the rest of it had been shown: {inside_the_page:?}"
+    );
+    let view = serve.view();
+    assert_eq!(page_field(&view, "current_page"), 2);
+    // The fixture's pages are 300 pt with 12 pt gaps, so page 2 starts at 312 — the top of
+    // the page, not a screenful past wherever the last one ended.
+    assert_eq!(
+        view.get("scroll_top_pt").and_then(Value::as_f64),
+        Some(312.0)
+    );
+
+    // Back off the top of page 2 returns to the bottom of page 1, so that reading
+    // backwards retraces the way it came rather than jumping to a page's top.
+    let id = serve.send("scroll_by_viewports", &[("fraction", Value::from(-1.0))]);
+    serve.reply_to(id);
+    let view = serve.view();
+    assert_eq!(
+        page_field(&view, "current_page"),
+        1,
+        "scrolling back did not turn the page: {view}"
+    );
+    // Within a tolerance, because the position makes a round trip through the shell's
+    // pixel offset, which is an `f32`. A point is 1/72 inch and this lands within a
+    // hundredth of one; `SCROLL_EPSILON_PT` exists for the same reason.
+    let landed = view.get("scroll_top_pt").and_then(Value::as_f64);
+    let bottom = view.get("max_scroll_pt").and_then(Value::as_f64);
+    assert!(
+        landed
+            .zip(bottom)
+            .is_some_and(|(landed, bottom)| (landed - bottom).abs() < 0.01),
+        "did not land on the bottom of the previous page: {view}"
+    );
+
+    // And off the top of the first page stops rather than wrapping.
+    let id = serve.send("first_page", &[]);
+    serve.reply_to(id);
+    let id = serve.send("scroll_by_viewports", &[("fraction", Value::from(-1.0))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+    let view = serve.view();
+    assert_eq!(page_field(&view, "current_page"), 1);
+    assert_eq!(view.get("scroll_top_pt").and_then(Value::as_f64), Some(0.0));
 
     serve.quit();
 }

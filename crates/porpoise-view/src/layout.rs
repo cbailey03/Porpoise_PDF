@@ -253,6 +253,34 @@ impl ScrollLayout {
         )
     }
 
+    /// The scroll positions from which a viewport of `viewport_height_pt` shows page
+    /// `index` and nothing else, as `(lowest, highest)`.
+    ///
+    /// The floor is the page's top edge. The ceiling is as far down as the view can go
+    /// with the page's bottom edge still at the bottom of the window — which is the
+    /// *same* as the floor whenever the page is shorter than the window, because then
+    /// there is nowhere to go without showing the next page.
+    ///
+    /// This is the whole scrollable range of a single-page view: see
+    /// [`crate::View::sole_page`].
+    #[must_use]
+    pub fn page_scroll_bounds_pt(
+        &self,
+        index: usize,
+        viewport_height_pt: f64,
+    ) -> Option<(f64, f64)> {
+        let top_pt = self.page_top_pt(index)?;
+        let bottom_pt = self.page_bottom_pt(index)?;
+        // A degenerate viewport gives a range of one point rather than one that runs
+        // backwards, which every caller would then have to check for.
+        let height_pt = if viewport_height_pt.is_finite() && viewport_height_pt > 0.0 {
+            viewport_height_pt
+        } else {
+            0.0
+        };
+        Some((top_pt, (bottom_pt - height_pt).max(top_pt)))
+    }
+
     /// The page containing `y_pt`, saturating to the first or last page when
     /// `y_pt` falls outside the content or into an inter-page gap.
     ///
@@ -514,6 +542,56 @@ mod tests {
         assert_eq!(layout.page_at_pt(500.0), Some(0));
         assert_eq!(layout.page_at_pt(900.0), Some(1));
         assert_eq!(layout.page_at_pt(99_999.0), Some(1));
+    }
+
+    // --- The scrollable range of one page ------------------------------------
+
+    #[test]
+    fn a_page_taller_than_the_window_can_be_scrolled_through() {
+        // Two letter pages, 10 pt apart: page 1 spans 802..1594.
+        let layout = ScrollLayout::vertical(&[letter(), letter()], 10.0);
+        // A 300 pt window against a 792 pt page leaves 492 pt to travel.
+        assert_eq!(
+            layout.page_scroll_bounds_pt(1, 300.0),
+            Some((802.0, 1294.0))
+        );
+    }
+
+    #[test]
+    fn a_page_shorter_than_the_window_has_nowhere_to_go() {
+        // The normal case at fit-page, and the one that makes a single-page view feel
+        // like a single-page view: there is exactly one position, so the wheel has
+        // nothing to do but turn the page.
+        let layout = ScrollLayout::vertical(&[letter(), letter()], 10.0);
+        assert_eq!(layout.page_scroll_bounds_pt(1, 900.0), Some((802.0, 802.0)));
+    }
+
+    #[test]
+    fn a_page_exactly_the_height_of_the_window_has_nowhere_to_go() {
+        let layout = ScrollLayout::vertical(&[letter(), letter()], 10.0);
+        assert_eq!(layout.page_scroll_bounds_pt(0, 792.0), Some((0.0, 0.0)));
+    }
+
+    #[test]
+    fn scroll_bounds_never_run_backwards_on_a_degenerate_window() {
+        let layout = ScrollLayout::vertical(&[letter()], 0.0);
+        for height in [0.0, -100.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                layout.page_scroll_bounds_pt(0, height),
+                Some((0.0, 792.0)),
+                "a {height} pt window produced a range that is not a range"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_past_the_end_has_no_scroll_bounds() {
+        let layout = ScrollLayout::vertical(&[letter()], 0.0);
+        assert_eq!(layout.page_scroll_bounds_pt(1, 300.0), None);
+        assert_eq!(
+            ScrollLayout::vertical(&[], 0.0).page_scroll_bounds_pt(0, 300.0),
+            None
+        );
     }
 
     #[test]

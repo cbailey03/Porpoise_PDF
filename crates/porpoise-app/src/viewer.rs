@@ -65,7 +65,7 @@ use porpoise_doc::{Document, Overwrite, PageGeometry, PageOrder};
 use porpoise_render::{HayroRenderer, RenderPool, RenderedPage};
 use porpoise_view::{
     CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PAGE_GAP_PT, PageCache, PageNumber, ScrollLayout,
-    View, ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
+    ScrollMode, View, ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
 };
 
 use crate::chrome;
@@ -78,7 +78,8 @@ use crate::devtools::{
 use crate::edits::{Edits, Situation};
 use crate::failure::Failure;
 use crate::input::{
-    DropAction, EditKey, command_for_key, drop_action, edit_for_key, opens_the_picker,
+    DropAction, EditKey, PageTurns, Wheel, command_for_key, drop_action, edit_for_key,
+    opens_the_picker, wheel_is_for_the_pages,
 };
 use crate::label::file_label;
 use crate::picker::FilePicker;
@@ -323,6 +324,17 @@ struct Viewer {
     state: ViewState,
     /// Measured from the window each frame; environment, not state.
     viewport: Viewport,
+    /// Where the thumbnail strip was drawn last frame, in window coordinates.
+    ///
+    /// So that a wheel gesture over the strip scrolls the strip instead of turning the
+    /// page. Last frame's rectangle, because the wheel is read before this frame's panels
+    /// are laid out — a panel that moved in between could mis-route one gesture, which is
+    /// why this is a plain rectangle test and not a claim about the current layout.
+    ///
+    /// The strip rather than the pages, deliberately: see [`wheel_is_for_the_pages`].
+    thumbnails_rect: egui::Rect,
+    /// One page turn per wheel gesture, in paged mode. See [`PageTurns`].
+    page_turns: PageTurns,
 
     timing: FrameTiming,
 
@@ -412,6 +424,8 @@ impl Viewer {
             open,
             state,
             viewport: Viewport::new(0.0, 0.0),
+            thumbnails_rect: egui::Rect::NOTHING,
+            page_turns: PageTurns::default(),
             timing: FrameTiming {
                 ui_ms: 0.0,
                 logic_ms: 0.0,
@@ -878,7 +892,8 @@ impl Viewer {
     fn handle_input(&mut self, ctx: &egui::Context) {
         // Collect first, then act: the closure borrows egui's input state, and
         // dispatch needs `&mut self`.
-        let (pressed, zoom_delta) = ctx.input(|input| {
+        let strip = self.thumbnails.then_some(self.thumbnails_rect);
+        let (pressed, zoom_delta, wheel, wheel_is_ours) = ctx.input(|input| {
             let pressed: Vec<(egui::Key, egui::Modifiers)> = input
                 .events
                 .iter()
@@ -895,8 +910,23 @@ impl Viewer {
             // `zoom_delta` already means ctrl+wheel or a pinch gesture, per
             // platform convention, and is 1.0 when neither happened. Better than
             // detecting ctrl+scroll by hand, which would miss trackpad pinches.
-            (pressed, input.zoom_delta())
+            (
+                pressed,
+                input.zoom_delta(),
+                Wheel::read(input),
+                wheel_is_for_the_pages(input.pointer.hover_pos(), strip),
+            )
         });
+
+        // The wheel only becomes a command in paged mode, where the view is confined to
+        // one page and rolling off the end of it has to mean the next page. In free mode
+        // the scroll area handles it, offset and all.
+        if self.state.scroll_mode() == ScrollMode::Paged && wheel_is_ours {
+            let room = self.view().scroll_room();
+            if let Some(command) = self.page_turns.turn(wheel, room) {
+                self.dispatch(ctx, command.into());
+            }
+        }
 
         if (zoom_delta - 1.0).abs() > 0.001 {
             // A pinch is not a command of its own — it is a zoom with a computed
@@ -1301,13 +1331,19 @@ impl Viewer {
         let zoom = self.view().zoom();
         let bucket = self.view().bucket();
 
+        // The scrolling column is the whole document in free mode and a single page in
+        // paged mode, and that one difference is what makes paged mode a mode: egui owns
+        // the live offset and clamps it to the content, so handing it one page's worth of
+        // content is what stops the wheel from rolling into the next one. Every offset
+        // below is therefore relative to `column_top_pt`, not to the document.
+        let column_top_pt = self.view().column_top_pt();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "content extents are page dimensions; f32 is what egui works in"
         )]
         let content_size = egui::vec2(
             self.layout().content_width_pt() as f32 * zoom,
-            self.layout().content_height_pt() as f32 * zoom,
+            self.view().column_height_pt() as f32 * zoom,
         );
 
         // Both axes, because zooming past fit-width makes the document wider than the
@@ -1325,7 +1361,8 @@ impl Viewer {
             reason = "scroll offsets are bounded by content extents"
         )]
         if let Some(top_pt) = self.state.take_requested_scroll_pt() {
-            scroll_area = scroll_area.vertical_scroll_offset(top_pt as f32 * zoom);
+            scroll_area =
+                scroll_area.vertical_scroll_offset((top_pt - column_top_pt) as f32 * zoom);
         }
         #[expect(
             clippy::cast_possible_truncation,
@@ -1336,27 +1373,30 @@ impl Viewer {
         }
 
         scroll_area.show_viewport(ui, |ui, viewport| {
-            // Claim the full width even when the document is narrower, so the pages
-            // centre in the window rather than hugging the left edge with the
-            // scrollbar stranded out to the right of them.
-            let column_width = content_size.x.max(ui.available_width());
-            let (content_rect, _response) = ui.allocate_exact_size(
-                egui::vec2(column_width, content_size.y),
-                egui::Sense::hover(),
+            // Claim the full window even when the content is smaller, so pages centre in
+            // it rather than hugging the top-left corner with the scrollbar stranded out
+            // to the right of them. Vertically that only ever happens in paged mode, where
+            // a page shorter than the window is the normal case — and where a page pinned
+            // to the top with grey below it reads as a layout fault rather than a mode.
+            let column = egui::vec2(
+                content_size.x.max(ui.available_width()),
+                content_size.y.max(ui.available_height()),
             );
+            let (content_rect, _response) = ui.allocate_exact_size(column, egui::Sense::hover());
+            // Half the slack on each side. The page's own top-left corner is therefore not
+            // at the column's, so both reports below subtract it — otherwise scrolling and
+            // panning would each appear to start partway along.
+            let gutter = ((column - content_size) * 0.5).max(egui::Vec2::ZERO);
 
             // `viewport` is in content coordinates, so dividing by zoom converts
-            // the scroll window back into PDF points. This is the reconciliation
-            // point: egui tells us where it actually is.
+            // the scroll window back into PDF points, and adding the column's own top
+            // converts it back into the document. This is the reconciliation point: egui
+            // tells us where it actually is.
+            self.state.report_scroll_top_pt(
+                column_top_pt + f64::from((viewport.min.y - gutter.y).max(0.0) / zoom),
+            );
             self.state
-                .report_scroll_top_pt(f64::from(viewport.min.y / zoom));
-            // The content column is at least as wide as the window, so when the
-            // document is narrower than the window the padding sits on both sides and
-            // the page's own left edge is not at x = 0. Report the offset relative to
-            // the page, not to the column, or panning would appear to start halfway.
-            let gutter = (column_width - content_size.x).max(0.0) * 0.5;
-            self.state
-                .report_scroll_left_pt(f64::from((viewport.min.x - gutter).max(0.0) / zoom));
+                .report_scroll_left_pt(f64::from((viewport.min.x - gutter.x).max(0.0) / zoom));
 
             self.request_missing(pixels_per_point);
 
@@ -1374,7 +1414,8 @@ impl Viewer {
                     // so the layout is asked in positions and the geometry, cache and
                     // renderer in source pages.
                     let page = open.order.source_of(position)?;
-                    let top_pt = open.layout.page_top_pt(position)?;
+                    // Relative to the column, which in paged mode starts at this page.
+                    let top_pt = open.layout.page_top_pt(position)? - column_top_pt;
                     let geometry = open.document.geometry().get(page).copied()?;
 
                     #[expect(
@@ -1387,9 +1428,9 @@ impl Viewer {
                         // wide ones does not sit flush left. The column is at least
                         // as wide as the window, so this also centres the whole
                         // document when it is narrower than the window.
-                        let x = (column_width - size.x) * 0.5;
+                        let x = (column.x - size.x) * 0.5;
                         egui::Rect::from_min_size(
-                            content_rect.min + egui::vec2(x, top_pt as f32 * zoom),
+                            content_rect.min + egui::vec2(x, gutter.y + top_pt as f32 * zoom),
                             size,
                         )
                     };
@@ -1427,6 +1468,9 @@ impl Viewer {
     /// Draws the page grid and dispatches any drag that landed.
     fn draw_thumbnails(&mut self, ui: &mut egui::Ui) {
         let pixels_per_point = ui.ctx().pixels_per_point();
+        // Kept for the wheel, which is read a step earlier than this.
+        // See `wheel_is_for_the_pages`.
+        self.thumbnails_rect = ui.available_rect_before_wrap();
         let current = self.view().current_page();
         let Some(open) = &mut self.open else {
             ui.label("No document open.");

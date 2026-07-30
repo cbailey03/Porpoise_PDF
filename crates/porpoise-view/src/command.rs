@@ -22,6 +22,16 @@
 //! [`ViewCommand::ScrollByViewports`]. Mode-dependence belongs to input
 //! translation, not to the command, or an agent could never be sure what
 //! `NextPage` would do.
+//!
+//! # Where the mode *does* reach a command
+//!
+//! One exception, and it is not one: the scrolling commands mean different things in
+//! [`crate::ScrollMode::Paged`], where running off the end of the page on screen turns to the
+//! next page. That is not a gesture leaking into a command — it is the same command
+//! against a different **scrollable range**, because paged mode confines the view to one
+//! page. `ScrollBy(48)` still means "move 48 points down"; there is simply less document to
+//! move through, and the mode decides what happens at the edge. `ScrollTo` addresses a
+//! point in the document in both modes.
 
 use crate::{PageNumber, ScrollMode};
 

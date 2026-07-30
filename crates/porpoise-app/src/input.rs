@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use porpoise_view::{ScrollMode, ViewCommand, ZoomTarget};
+use porpoise_view::{ScrollMode, ScrollRoom, ViewCommand, ZoomTarget};
 
 use crate::command::Command;
 use crate::label::file_label;
@@ -215,6 +215,159 @@ pub(crate) fn command_for_key(
         _ => return None,
     };
     Some(command.into())
+}
+
+/// How far a wheel gesture scrolls when it turns a page, in screenfuls.
+///
+/// One screenful is more than enough to cross an edge the view is already sitting on,
+/// and an edge is the only place a turn is ever emitted from — so the distance decides
+/// nothing. It is a screenful because that is the honest name for "as much as the window
+/// can show", and because [`porpoise_view::ViewCommand::ScrollByViewports`] already
+/// means exactly that.
+const TURN_SCREENFULS: f64 = 1.0;
+
+/// One frame of wheel input, in the terms a single-page view needs.
+///
+/// Two kinds of device, and the difference matters here in a way it does not in free
+/// mode. A **mouse wheel** sends one event per notch, and a person spinning it expects a
+/// page per notch. A **trackpad** sends a continuous stream, and one swipe should turn
+/// one page however many events it is made of.
+///
+/// The test for which is which is the one egui itself uses to decide whether the input
+/// needs smoothing: small movements measured in points come from a trackpad, everything
+/// else is a notch. Reused rather than reinvented, so the two cannot disagree about the
+/// device in front of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Wheel {
+    /// Movement from discrete notches this frame. Positive moves further into the
+    /// document — the opposite sign to egui's delta, which says how the *content* moves.
+    pub(crate) notched: f32,
+    /// Movement from a continuous gesture this frame, same sign.
+    pub(crate) glided: f32,
+    /// Whether a scroll is still in progress, including egui's own smoothing tail and a
+    /// trackpad's kinetic one. This is what tells one gesture from the next.
+    pub(crate) gliding: bool,
+}
+
+impl Wheel {
+    /// Reads this frame's wheel events.
+    ///
+    /// The raw events, not [`egui::InputState::smooth_scroll_delta`]: egui spreads one
+    /// notch over half a dozen frames to make hand-scrolling feel right, and a page turn
+    /// per frame of that would fly through the document six pages at a time.
+    pub(crate) fn read(input: &egui::InputState) -> Self {
+        let mut wheel = Self {
+            gliding: input.is_scrolling(),
+            ..Self::default()
+        };
+        for event in &input.events {
+            let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            // Ctrl or cmd plus wheel is a zoom, and egui has already folded it into
+            // `zoom_delta` for `handle_input` to act on. Counted here as well it would
+            // zoom *and* turn the page.
+            //
+            // Shift plus wheel is horizontal scrolling by platform convention, and a
+            // single-page view has nowhere sideways to turn.
+            if modifiers.command || modifiers.ctrl || modifiers.shift {
+                continue;
+            }
+            let movement = -delta.y;
+            if matches!(unit, egui::MouseWheelUnit::Point) && delta.length() < 8.0 {
+                wheel.glided += movement;
+            } else {
+                wheel.notched += movement;
+            }
+        }
+        wheel
+    }
+}
+
+/// Whether a wheel gesture belongs to the pages rather than to the thumbnail strip.
+///
+/// `strip` is where the thumbnail strip is, or `None` when it is not showing.
+///
+/// Deliberately *not* "is the pointer over the pages", which is the obvious way round and
+/// is wrong. A wheel event can arrive with no pointer position at all: winit's mouse-leave
+/// tracking clears egui's `hover_pos` the moment the cursor is not where it expects, and
+/// that was measured rather than imagined — under a pointer-over-the-pages test, page turns
+/// silently stopped happening.
+///
+/// The strip is the only other scrolling area, so anything not over it belongs to the
+/// pages. Written this way round because the two failure modes are not symmetric: guessing
+/// "the pages" wrongly scrolls the wrong panel for one gesture, while guessing "not the
+/// pages" wrongly leaves paged mode looking exactly as broken as it did before it confined
+/// anything.
+pub(crate) fn wheel_is_for_the_pages(
+    pointer: Option<egui::Pos2>,
+    strip: Option<egui::Rect>,
+) -> bool {
+    match (pointer, strip) {
+        (Some(at), Some(strip)) => !strip.contains(at),
+        _ => true,
+    }
+}
+
+/// Turns wheel gestures into page turns at the edges of a page.
+///
+/// Only meaningful in [`ScrollMode::Paged`]: it is the piece that makes the wheel obey a
+/// single-page view instead of rolling straight through the document.
+#[derive(Debug, Default)]
+pub(crate) struct PageTurns {
+    /// Whether the gesture in progress has already had its turn.
+    ///
+    /// Not spent by a notch, which is a gesture of its own by definition.
+    spent: bool,
+}
+
+impl PageTurns {
+    /// What this frame's wheel should do, or `None` to leave it to the scroll area.
+    ///
+    /// Returning `None` is the common case and the important one: with room left inside
+    /// the page, egui scrolls it with its own inertia and smoothing, which is what makes
+    /// hand-scrolling feel right and is not worth reimplementing.
+    pub(crate) fn turn(&mut self, wheel: Wheel, room: ScrollRoom) -> Option<ViewCommand> {
+        // A continuous gesture stays spent until the movement stops. Without this one
+        // trackpad swipe -- dozens of events over dozens of frames -- turns dozens of
+        // pages.
+        if !wheel.gliding {
+            self.spent = false;
+        }
+
+        let movement = if wheel.notched != 0.0 {
+            wheel.notched
+        } else if wheel.glided != 0.0 && !self.spent {
+            // Claimed whether or not it turns a page, so that a swipe which starts by
+            // scrolling *within* the page does not also turn one when it reaches the
+            // bottom. One gesture does one thing.
+            self.spent = true;
+            wheel.glided
+        } else {
+            return None;
+        };
+        if !movement.is_finite() {
+            return None;
+        }
+
+        // Room left inside the page: turning here would skip whatever is below the fold.
+        if movement > 0.0 && room.below || movement < 0.0 && room.above {
+            return None;
+        }
+        Some(ViewCommand::ScrollByViewports {
+            fraction: if movement > 0.0 {
+                TURN_SCREENFULS
+            } else {
+                -TURN_SCREENFULS
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +714,269 @@ mod tests {
                     command.name()
                 );
             }
+        }
+    }
+
+    // --- Turning pages with the wheel ----------------------------------------
+
+    /// A page with nowhere left to scroll — the normal case at fit-page, and the one
+    /// where every gesture is a page turn.
+    fn stuck() -> ScrollRoom {
+        ScrollRoom {
+            above: false,
+            below: false,
+        }
+    }
+
+    /// A page taller than the window, scrolled to somewhere in the middle.
+    fn room_both_ways() -> ScrollRoom {
+        ScrollRoom {
+            above: true,
+            below: true,
+        }
+    }
+
+    /// One mouse-wheel notch. Positive moves further into the document.
+    fn notch(movement: f32) -> Wheel {
+        Wheel {
+            notched: movement,
+            glided: 0.0,
+            // A notch is discrete: egui reports the scroll as still in progress while it
+            // smooths the notch out, and that must not hold the next notch back.
+            gliding: true,
+        }
+    }
+
+    /// One frame of a trackpad swipe.
+    fn glide(movement: f32) -> Wheel {
+        Wheel {
+            notched: 0.0,
+            glided: movement,
+            gliding: true,
+        }
+    }
+
+    fn forward() -> Option<ViewCommand> {
+        Some(ViewCommand::ScrollByViewports {
+            fraction: TURN_SCREENFULS,
+        })
+    }
+
+    fn back() -> Option<ViewCommand> {
+        Some(ViewCommand::ScrollByViewports {
+            fraction: -TURN_SCREENFULS,
+        })
+    }
+
+    #[test]
+    fn a_notch_at_the_bottom_of_a_page_turns_to_the_next() {
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(notch(30.0), stuck()), forward());
+    }
+
+    #[test]
+    fn a_notch_at_the_top_of_a_page_turns_back() {
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(notch(-30.0), stuck()), back());
+    }
+
+    #[test]
+    fn every_notch_turns_a_page() {
+        // The reason notches and swipes are told apart at all. A person spinning a wheel
+        // expects a page per notch, and `is_scrolling` stays true across a spin — so a
+        // rule based on the gesture alone would turn one page and then sit there.
+        let mut turns = PageTurns::default();
+        for spin in 0..5 {
+            assert_eq!(
+                turns.turn(notch(30.0), stuck()),
+                forward(),
+                "notch {spin} of a spin did not turn a page"
+            );
+        }
+    }
+
+    #[test]
+    fn a_notch_with_room_left_in_the_page_is_left_to_the_scroll_area() {
+        // The common case on a page taller than the window: egui scrolls it with its own
+        // inertia, which is what makes hand-scrolling feel right.
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(notch(30.0), room_both_ways()), None);
+        assert_eq!(turns.turn(notch(-30.0), room_both_ways()), None);
+    }
+
+    #[test]
+    fn room_is_read_per_direction() {
+        // At the bottom of a tall page: scrolling on turns the page, scrolling back does
+        // not, because there is still page above.
+        let room = ScrollRoom {
+            above: true,
+            below: false,
+        };
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(notch(30.0), room), forward());
+        assert_eq!(turns.turn(notch(-30.0), room), None);
+    }
+
+    #[test]
+    fn one_swipe_turns_one_page() {
+        // A trackpad swipe is dozens of events over dozens of frames. Without the latch
+        // it would turn dozens of pages.
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(glide(20.0), stuck()), forward());
+        for frame in 0..30 {
+            assert_eq!(
+                turns.turn(glide(20.0), stuck()),
+                None,
+                "frame {frame} of one swipe turned a second page"
+            );
+        }
+    }
+
+    #[test]
+    fn the_next_swipe_turns_again() {
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(glide(20.0), stuck()), forward());
+        assert_eq!(turns.turn(glide(20.0), stuck()), None);
+        // Movement stopped: the gesture is over, kinetic tail and all.
+        assert_eq!(turns.turn(Wheel::default(), stuck()), None);
+        assert_eq!(turns.turn(glide(20.0), stuck()), forward());
+    }
+
+    #[test]
+    fn a_swipe_that_starts_by_scrolling_does_not_also_turn_a_page() {
+        // One gesture does one thing. A swipe that begins with page left to scroll spends
+        // itself on that page rather than carrying on into the next one when it hits the
+        // bottom — otherwise a long swipe would scroll *and* turn, which reads as the
+        // document jumping.
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(glide(20.0), room_both_ways()), None);
+        for frame in 0..10 {
+            assert_eq!(
+                turns.turn(glide(20.0), stuck()),
+                None,
+                "frame {frame} of a scrolling swipe turned a page"
+            );
+        }
+    }
+
+    #[test]
+    fn no_movement_does_nothing() {
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(Wheel::default(), stuck()), None);
+    }
+
+    #[test]
+    fn a_non_finite_delta_does_not_turn_a_page() {
+        let mut turns = PageTurns::default();
+        assert_eq!(turns.turn(notch(f32::NAN), stuck()), None);
+        assert_eq!(turns.turn(notch(f32::INFINITY), stuck()), None);
+    }
+
+    // --- Which panel a gesture belongs to ------------------------------------
+
+    fn strip() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 22.0), egui::vec2(300.0, 700.0))
+    }
+
+    #[test]
+    fn a_gesture_over_the_thumbnail_strip_is_not_a_page_turn() {
+        assert!(!wheel_is_for_the_pages(
+            Some(egui::pos2(150.0, 400.0)),
+            Some(strip())
+        ));
+    }
+
+    #[test]
+    fn a_gesture_beside_the_strip_is_a_page_turn() {
+        assert!(wheel_is_for_the_pages(
+            Some(egui::pos2(600.0, 400.0)),
+            Some(strip())
+        ));
+    }
+
+    #[test]
+    fn a_gesture_with_no_pointer_at_all_still_turns_the_page() {
+        // The one that had to be measured. winit clears egui's hover position as soon as the
+        // cursor is not where it expects, so a wheel event routinely arrives with no pointer
+        // — and under the obvious test, "is the pointer over the pages", every page turn
+        // silently stopped happening.
+        assert!(wheel_is_for_the_pages(None, Some(strip())));
+    }
+
+    #[test]
+    fn with_the_strip_hidden_every_gesture_is_a_page_turn() {
+        assert!(wheel_is_for_the_pages(Some(egui::pos2(150.0, 400.0)), None));
+        assert!(wheel_is_for_the_pages(None, None));
+    }
+
+    // --- Reading the wheel off a frame ---------------------------------------
+
+    fn wheel_event(unit: egui::MouseWheelUnit, delta: egui::Vec2) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn read(events: Vec<egui::Event>) -> Wheel {
+        // `InputState` has private fields, so a default and one public field is the only
+        // way to build one from outside egui.
+        let mut input = egui::InputState::default();
+        input.events = events;
+        Wheel::read(&input)
+    }
+
+    #[test]
+    fn a_wheel_notch_reads_as_movement_into_the_document() {
+        // egui's delta says how the *content* moves; a scroll position says how the *view*
+        // moves. Getting this backwards would turn pages the wrong way, which is why the
+        // sign is pinned down rather than assumed.
+        let wheel = read(vec![wheel_event(
+            egui::MouseWheelUnit::Line,
+            egui::vec2(0.0, -1.0),
+        )]);
+        assert!(wheel.notched > 0.0, "scrolling down read as {wheel:?}");
+        assert_eq!(wheel.glided, 0.0);
+    }
+
+    #[test]
+    fn a_small_trackpad_movement_reads_as_a_glide() {
+        let wheel = read(vec![wheel_event(
+            egui::MouseWheelUnit::Point,
+            egui::vec2(0.0, -3.0),
+        )]);
+        assert!(wheel.glided > 0.0, "a trackpad swipe read as {wheel:?}");
+        assert_eq!(wheel.notched, 0.0);
+    }
+
+    #[test]
+    fn a_large_movement_in_points_is_a_notch_not_a_glide() {
+        // Some mice report in points. egui treats a large movement as a notch for the
+        // purpose of smoothing, and this reuses that test so the two agree about the
+        // device rather than each guessing.
+        let wheel = read(vec![wheel_event(
+            egui::MouseWheelUnit::Point,
+            egui::vec2(0.0, -50.0),
+        )]);
+        assert!(wheel.notched > 0.0, "a large point delta read as {wheel:?}");
+        assert_eq!(wheel.glided, 0.0);
+    }
+
+    #[test]
+    fn ctrl_and_shift_wheel_are_not_page_turns() {
+        // Ctrl+wheel is a zoom, which `handle_input` acts on through `zoom_delta`. Counted
+        // here as well it would zoom *and* turn the page. Shift+wheel is horizontal
+        // scrolling, and a single-page view has nowhere sideways to turn.
+        for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT] {
+            let wheel = read(vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers,
+            }]);
+            assert_eq!(wheel, Wheel::default(), "{modifiers:?} read as {wheel:?}");
         }
     }
 }

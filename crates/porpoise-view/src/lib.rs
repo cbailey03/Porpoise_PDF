@@ -62,6 +62,6 @@ pub use fit::{FitMode, MAX_SCALE, MIN_SCALE, fit_scale};
 pub use layout::{PAGE_GAP_PT, ScrollLayout};
 pub use page::PageNumber;
 pub use request::request_order;
-pub use state::{ScrollMode, View, ViewSnapshot, ViewState, apply};
+pub use state::{ScrollMode, ScrollRoom, View, ViewSnapshot, ViewState, apply};
 pub use viewport::Viewport;
 pub use zoom::ZoomBucket;

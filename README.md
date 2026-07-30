@@ -34,6 +34,11 @@ discard, or cancel. The question is guarded at the command rather than at the bu
 same protection and answers it the same way; that is also what makes the whole flow testable. See
 `docs/goal-4-plan.md` section 8.
 
+**Paged** in the toolbar is a kind of view, not a key binding: the window shows one page, the scroll
+range is that page, and scrolling off either end turns to the next page or back to the previous one.
+A page taller than the window still scrolls within itself first. **Free** is one continuous column of
+every page. See `docs/goal-1-plan.md` section 6d.
+
 Rendering fidelity is validated against real documents and for determinism, not against another
 engine. Comparing output to PDFium is explicitly a non-goal: building this in pure Rust is the
 objective, so the C++ engine we declined is not the yardstick. See `docs/goal-1-plan.md`
@@ -51,7 +56,7 @@ sections 1 and 6a.
 | `PageDown` / `Space` | Next page, or next screenful in free mode |
 | `PageUp` / `Shift+Space` | Previous |
 | `Home` / `End` | First / last page |
-| `↑` / `↓` | Small scroll step |
+| `↑` / `↓` | Small scroll step, or the next page in paged mode |
 | `←` / `→` | Pan sideways, once zoomed in past the window's width |
 | `Ctrl` + wheel, or pinch | Zoom |
 | `Ctrl` `+` / `Ctrl` `-` | Zoom by one step |

@@ -105,16 +105,28 @@ pub(crate) fn rows_for(pages: usize, columns: usize) -> usize {
     pages.div_ceil(columns)
 }
 
-/// Draws the grid, returning a move if one was dropped this frame.
-///
-/// The returned pair is `(from, to)` in display positions. Nothing is changed here — the
-/// caller turns it into a command, so a drag goes through the same dispatch as every
-/// other edit.
-pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Option<(usize, usize)> {
+/// What the grid did this frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Drawn {
+    /// A move, if one was dropped: `(from, to)` in display positions.
+    ///
+    /// Nothing is changed here — the caller turns this into a command, so a drag goes
+    /// through the same dispatch as every other edit.
+    pub(crate) moved: Option<(usize, usize)>,
+    /// Source pages the grid has on screen.
+    ///
+    /// Reported because the caller decides eviction and the texture cache has two
+    /// consumers; see [`crate::retain`], which exists because this was not reported and
+    /// the grid's own thumbnails were being evicted out from under it.
+    pub(crate) showing: Vec<usize>,
+}
+
+/// Draws the grid, reporting what it drew.
+pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     let pages = grid.order.len();
     if pages == 0 {
         ui.label("no pages");
-        return None;
+        return Drawn::default();
     }
 
     let widest = grid
@@ -128,10 +140,11 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Option<(usize, usi
     let rows = rows_for(pages, columns);
     let cell_height = THUMBNAIL_WIDTH * 1.4 + LABEL_HEIGHT + CELL_PADDING * 2.0;
 
-    let mut moved = None;
+    let mut drawn = Drawn::default();
 
     // `show_rows` only calls back for the rows on screen, which is what keeps a
-    // 400-page grid from rasterizing 400 thumbnails.
+    // 400-page grid from rasterizing 400 thumbnails — and what makes `showing` a
+    // viewport-sized list rather than a document-sized one.
     egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show_rows(ui, cell_height, rows, |ui, row_range| {
@@ -143,14 +156,16 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Option<(usize, usi
                             break;
                         }
                         if let Some(dropped) = cell(ui, grid, position, bucket) {
-                            moved = Some((dropped, position));
+                            drawn.moved = Some((dropped, position));
                         }
+                        // The source page, because that is what the cache is keyed by.
+                        drawn.showing.extend(grid.order.source_of(position));
                     }
                 });
             }
         });
 
-    moved
+    drawn
 }
 
 /// One thumbnail: a drop target wrapped around a draggable page.

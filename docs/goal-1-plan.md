@@ -593,6 +593,71 @@ Neither the mode nor the wheel would have been caught by the existing suite: eve
 asserted the mode *field*, which was always correct. The tests now assert what the mode does to the
 view.
 
+## 6e. The page grid and the page column were fighting over textures (2026-07-30)
+
+Reported immediately after §6d, with a screenshot: *"pages 10, 11, 12 actually flicker."* The
+last three thumbnails of a twelve-page document strobed between the page and a grey box.
+
+### It is arithmetic, not a race
+
+Eviction lived inside the page column: keep the textures for the visible display positions
+plus `RETAIN_PAGES` = 8 either side, drop everything else. The **thumbnail grid uses the
+same cache** — deliberately, so there is one pipeline and one memory budget rather than two
+— and the grid shows the whole of a short document.
+
+So on any document longer than the retain window: the grid asks for a thumbnail, the render
+lands, the column evicts it because that page is far from the viewport, and the grid asks
+again. Every frame, forever.
+
+Which pages flicker is fully determined. In paged mode the column shows one page, so the
+window is positions 0..9, which are source pages 1..9. Pages 10, 11 and 12 are exactly the
+ones the grid can see and the column cannot — the three in the screenshot.
+
+**Pre-existing, and surfaced by §6d.** Free mode showed two pages, so the window was
+positions 0..10 and only pages 11 and 12 fell outside. Paged mode narrowed the visible range
+by one page and moved the boundary with it. The measurement below reproduces it on a
+ten-page document too, where the single page outside the window was flickering all along
+without being noticed.
+
+### Measured before and after
+
+Ten-page drawing set, paged mode, grid open, forty consecutive snapshots after warm-up:
+
+| | Textures cached | Renders in flight |
+|---|---|---|
+| Before | oscillating 16 ↔ 17 | never reached 0 |
+| After | 17, constant | 0 |
+
+*A settled viewer does no work* turned out to be the whole test, and it is now an end-to-end
+one — confirmed to fail against the old policy before the fix was kept. All three real
+drawing sets settle, including the 400-page one, and closing the grid gives its thumbnails
+back rather than holding them forever.
+
+### The fix
+
+Eviction is a whole-frame decision with two consumers, so it now runs once per frame after
+both panels have drawn, over the **union** of what each is showing. The grid reports the
+source pages it drew — it is virtualized, so that is the rows on screen, not the document —
+and `retain::pages_to_keep` merges them with the column's window.
+
+Two things worth keeping in mind about that module:
+
+- Positions and pages are different after any reorder, and the cache is keyed by page. That
+  was already handled and the comment explaining why moved with the code.
+- Keeping a *page* keeps every *rung* of it, which is what lets one page be held at reading
+  size and thumbnail size at once. `PageCache::retain_bucket` was deleted earlier for
+  contradicting that; the page-window predicate had the same effect for anything outside the
+  window and nobody noticed, because the trap was in the caller rather than in the cache.
+
+Scrolling is unaffected: the 400-page set still benchmarks at p50 16.66 ms per frame with
+0.14 ms of our own time.
+
+### Still open
+
+The grid submits renders without consulting the retry budget the column uses, so a page that
+cannot be rasterized would be re-requested every frame from the grid alone. Not what was
+reported here, and not fixed with it.
+
 ## 7. Open decisions
 
 1. ~~**Our license.**~~ **Decided 2026-07-29: `MIT OR Apache-2.0`**, copyright Christian Bailey,

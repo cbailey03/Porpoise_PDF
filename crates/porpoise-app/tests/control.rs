@@ -229,9 +229,14 @@ impl Drop for Serve {
 
 /// Writes the fixture into cargo's target directory.
 fn fixture(name: &str) -> PathBuf {
+    fixture_of(name, PAGES)
+}
+
+/// A fixture of a chosen length, for the tests that care how long a document is.
+fn fixture_of(name: &str, pages: usize) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     path.push(name);
-    std::fs::write(&path, multi_page_pdf(PAGES, 200, 300)).expect("should write the fixture");
+    std::fs::write(&path, multi_page_pdf(pages, 200, 300)).expect("should write the fixture");
     path
 }
 
@@ -1243,6 +1248,67 @@ fn scrolling_in_paged_mode_turns_the_page() {
     let view = serve.view();
     assert_eq!(page_field(&view, "current_page"), 1);
     assert_eq!(view.get("scroll_top_pt").and_then(Value::as_f64), Some(0.0));
+
+    serve.quit();
+}
+
+#[test]
+fn the_page_grid_does_not_fight_the_page_column_over_textures() {
+    let Some(_window) = e2e("the_page_grid_does_not_fight_the_page_column_over_textures") else {
+        return;
+    };
+
+    // Reported as "pages 10, 11 and 12 flicker". The texture cache has two consumers, and
+    // eviction ran inside the page column with only its own window to go on — so the grid
+    // asked for a thumbnail, the render landed, the column evicted it for being far from the
+    // viewport, and the grid asked again. Forever.
+    //
+    // A settled viewer does no work. That is the whole assertion, and it is why this needed
+    // a document longer than the column's retain margin: on a short one the window covers
+    // everything and there is nothing to fight over.
+    let document = fixture_of("e2e-grid-thrash.pdf", 20);
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    // Paged mode narrows the column's window to one page, which is what made three pages
+    // rather than one fall outside it.
+    let id = serve.send("set_scroll_mode", &[("mode", Value::from("paged"))]);
+    serve.reply_to(id);
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    serve.reply_to(id);
+
+    // Let the first renders land. With the bug present this never comes true, so the bound
+    // is the failure rather than a timeout hidden inside a helper.
+    let mut settled = None;
+    for _ in 0..400 {
+        let state = serve.snapshot();
+        if state.get("renders_in_flight").and_then(Value::as_u64) == Some(0) {
+            settled = Some(state);
+            break;
+        }
+    }
+    let settled = settled.expect("the render pipeline never went quiet with the grid open");
+    assert_eq!(
+        settled.get("failed_pages").and_then(Value::as_array),
+        Some(&vec![]),
+        "a failed render would look like quiet without being it: {settled}"
+    );
+    let cached = settled.get("pages_cached").and_then(Value::as_u64);
+
+    // And it stays quiet. One reading proves nothing about a flicker; the count holding
+    // still while no work is submitted does.
+    for read in 0..40 {
+        let state = serve.snapshot();
+        assert_eq!(
+            state.get("renders_in_flight").and_then(Value::as_u64),
+            Some(0),
+            "read {read}: the viewer went back to work with nothing on screen changing: {state}"
+        );
+        assert_eq!(
+            state.get("pages_cached").and_then(Value::as_u64),
+            cached,
+            "read {read}: a texture was evicted and re-made while both panels wanted it: {state}"
+        );
+    }
 
     serve.quit();
 }

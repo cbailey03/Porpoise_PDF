@@ -84,6 +84,7 @@ use crate::input::{
 use crate::label::file_label;
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
+use crate::retain;
 use crate::saver::Saver;
 use crate::thumbnails::{self, Grid};
 use crate::tiles::{FULL_UV, to_color_image};
@@ -335,6 +336,13 @@ struct Viewer {
     thumbnails_rect: egui::Rect,
     /// One page turn per wheel gesture, in paged mode. See [`PageTurns`].
     page_turns: PageTurns,
+    /// Source pages the thumbnail grid drew this frame, for [`Self::retain_textures`].
+    ///
+    /// Emptied as it is used, so a frame that does not draw the grid cannot leave a stale
+    /// list keeping textures alive. Unlike [`Self::thumbnails_rect`], which is read *before*
+    /// the grid draws and is therefore last frame's, this is written and read within one
+    /// frame.
+    grid_pages: Vec<usize>,
 
     timing: FrameTiming,
 
@@ -426,6 +434,7 @@ impl Viewer {
             viewport: Viewport::new(0.0, 0.0),
             thumbnails_rect: egui::Rect::NOTHING,
             page_turns: PageTurns::default(),
+            grid_pages: Vec::new(),
             timing: FrameTiming {
                 ui_ms: 0.0,
                 logic_ms: 0.0,
@@ -1443,26 +1452,31 @@ impl Viewer {
             for (page, rect, texture) in tiles {
                 Self::paint_page(open, ui.painter(), page, bucket, rect, texture);
             }
-
-            // Keep memory proportional to the viewport rather than the document.
-            //
-            // The window is a range of display *positions*, and the cache is keyed by
-            // *source* page — so the positions have to be resolved before comparing.
-            // Comparing the two directly evicts textures for pages that are on screen
-            // and keeps ones that are not, which after a reorder shows up as pages
-            // flashing grey while scrolling near an edit.
-            let low = visible.start.saturating_sub(RETAIN_PAGES);
-            let high = visible.end.saturating_add(RETAIN_PAGES);
-            let keep: Vec<usize> = (low..high)
-                .filter_map(|position| open.order.source_of(position))
-                .collect();
-            open.cache.retain_pages(|page| keep.contains(&page));
         });
 
         // Keep frames coming while anything is still being drawn.
         if self.open.as_ref().is_some_and(|open| !open.settled()) {
             ctx.request_repaint();
         }
+    }
+
+    /// Drops page textures that neither panel is showing any more.
+    ///
+    /// Once per frame and *after* both panels have drawn, because the cache has two
+    /// consumers and this needs both their working sets. It used to run inside the page
+    /// column with only that column's window to go on, which meant the column evicted the
+    /// grid's thumbnails as fast as the grid could ask for them. See [`crate::retain`],
+    /// which owns the policy and records the arithmetic.
+    fn retain_textures(&mut self) {
+        let visible = self.view().visible_pages();
+        // Taken rather than read: a frame in which the grid did not draw — because the
+        // panel is closed — must not go on keeping alive whatever it last showed.
+        let grid = std::mem::take(&mut self.grid_pages);
+        let Some(open) = &mut self.open else { return };
+        let keep = retain::pages_to_keep(&visible, RETAIN_PAGES, grid, |position| {
+            open.order.source_of(position)
+        });
+        open.cache.retain_pages(|page| keep.contains(&page));
     }
 
     /// Draws the page grid and dispatches any drag that landed.
@@ -1486,11 +1500,13 @@ impl Viewer {
             current,
             pixels_per_point,
         };
-        let dropped = thumbnails::draw(ui, &mut grid);
+        let drawn = thumbnails::draw(ui, &mut grid);
+        // Kept for `retain_textures`, which runs once both panels have had their say.
+        self.grid_pages = drawn.showing;
 
         // Through the normal dispatch, so a drag is indistinguishable from an agent
         // sending `move_page` — which is the whole point of the command model.
-        if let Some((from, to)) = dropped {
+        if let Some((from, to)) = drawn.moved {
             let ctx = ui.ctx().clone();
             if let (Some(from), Some(to)) = (
                 PageNumber::new(from.saturating_add(1)),
@@ -1745,6 +1761,8 @@ impl eframe::App for Viewer {
                 .show(ui, |ui| self.draw_thumbnails(ui));
         }
         self.draw_pages(ui);
+        // After both panels, because it needs to know what each of them is showing.
+        self.retain_textures();
         // Last, and over everything: a drag can be anywhere on the window.
         let ctx = ui.ctx().clone();
         self.draw_drop_hint(&ctx);

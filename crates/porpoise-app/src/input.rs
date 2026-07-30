@@ -11,6 +11,7 @@ use eframe::egui;
 use porpoise_view::{ScrollMode, ViewCommand, ZoomTarget};
 
 use crate::command::Command;
+use crate::label::file_label;
 
 /// Fraction of the viewport a page-down moves in free-scroll mode.
 ///
@@ -147,14 +148,6 @@ pub(crate) fn drop_action(paths: &[PathBuf]) -> Option<DropAction> {
 fn is_pdf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
-}
-
-/// The name to show for a path: its file name, or the whole path if it has none.
-fn file_label(path: &Path) -> String {
-    path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    )
 }
 
 /// Translates a key press into a command.

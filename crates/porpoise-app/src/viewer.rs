@@ -32,17 +32,28 @@
 //! pieces that do not need any of that state were pulled out, which is why they have
 //! unit tests and this does not:
 //!
-//! | Module | What |
-//! |---|---|
-//! | [`crate::input`] | Key press or file drop to [`Command`] — pure |
-//! | [`crate::failure`] | Whether a failed render is worth retrying — pure policy |
-//! | [`crate::tiles`] | Rasterized page to egui texture — the GPU boundary |
-//! | [`crate::picker`] | The file dialog, off the frame loop |
-//! | [`crate::devtools`] | Frame timing and window capture |
+//! | Module | What | Tested |
+//! |---|---|---|
+//! | [`crate::input`] | Key press or file drop to [`Command`] — pure | ✅ |
+//! | [`crate::edits`] | Which page edits are possible right now — pure | ✅ |
+//! | [`crate::confirm`] | Which commands would discard unsaved work — pure | ✅ |
+//! | [`crate::failure`] | Whether a failed render is worth retrying — pure policy | ✅ |
+//! | [`crate::label`] | How a path is shown in limited space — pure | ✅ |
+//! | [`crate::tiles`] | Rasterized page to egui texture — the GPU boundary | ✅ |
+//! | [`crate::picker`] | The file dialog, off the frame loop | ✅ |
+//! | [`crate::saver`] | Writing the document out, off the frame loop | ✅ |
+//! | [`crate::thumbnails`] | The page grid's arithmetic | ✅ |
+//! | [`crate::chrome`] | Toolbar, status bar and the two overlays — painting only | ❌ |
+//! | [`crate::devtools`] | Frame timing and window capture | ✅ |
 //!
-//! What remains has no unit tests, and that is deliberate rather than an oversight:
-//! everything left needs a live `egui::Context`, a GPU adapter, or both. It is
-//! covered by `tests/control.rs`, which drives the real binary over a real pipe.
+//! [`crate::chrome`] is the one extraction that gained no tests, and that is honest
+//! rather than an oversight: it needs a live `egui::Context` exactly as this module does.
+//! It was moved for navigability. The part of the toolbar that *was* worth testing — which
+//! buttons should be live — went to [`crate::edits`] instead, and has tests.
+//!
+//! What remains here has no unit tests either, for the same reason: everything left needs
+//! a live context, a GPU adapter, or both. It is covered by `tests/control.rs`, which
+//! drives the real binary over a real pipe.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -54,19 +65,22 @@ use porpoise_doc::{Document, Overwrite, PageGeometry, PageOrder};
 use porpoise_render::{HayroRenderer, RenderPool, RenderedPage};
 use porpoise_view::{
     CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PAGE_GAP_PT, PageCache, PageNumber, ScrollLayout,
-    ScrollMode, View, ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
+    View, ViewCommand, ViewState, Viewport, ZoomBucket, ZoomTarget, request_order,
 };
 
+use crate::chrome;
 use crate::command::Command;
 use crate::confirm::{self, Answer, Guard, Intent};
 use crate::control::Control;
 use crate::devtools::{
     FrameTiming, ScreenshotOutcome, ScreenshotRequest, Screenshotter, ScrollBenchmark,
 };
+use crate::edits::{Edits, Situation};
 use crate::failure::Failure;
 use crate::input::{
     DropAction, EditKey, command_for_key, drop_action, edit_for_key, opens_the_picker,
 };
+use crate::label::file_label;
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::saver::Saver;
@@ -138,6 +152,44 @@ struct OpenDocument {
     failures: HashMap<CacheKey, Failure>,
     /// The rung work was last submitted for, to notice when zoom moves.
     submitted_bucket: ZoomBucket,
+}
+
+/// Refusal for a command that needs a document when none is open.
+///
+/// One string rather than three copies of it, so the three commands that can hit this
+/// cannot start explaining it differently.
+const NOTHING_OPEN: &str = "nothing is open";
+
+/// Paths from a file drop that has landed.
+///
+/// An **edge**: egui drains these each frame, so reading it once opens the file once
+/// rather than reopening it every frame for as long as the window lives.
+fn dropped_paths(ctx: &egui::Context) -> Vec<PathBuf> {
+    ctx.input(|input| {
+        input
+            .raw
+            .dropped_files
+            .iter()
+            .filter_map(|file| file.path.clone())
+            .collect()
+    })
+}
+
+/// Paths from a drag still in the air over the window.
+///
+/// A **level**, unlike [`dropped_paths`]: egui keeps these until the drop lands or the
+/// drag leaves, and both of those wake the frame loop. So one repaint paints the hint and
+/// one clears it. Both behaviours were checked in egui 0.35's `RawInput::take` rather than
+/// assumed, because the API gives no hint that the two fields differ.
+fn hovered_paths(ctx: &egui::Context) -> Vec<PathBuf> {
+    ctx.input(|input| {
+        input
+            .raw
+            .hovered_files
+            .iter()
+            .filter_map(|file| file.path.clone())
+            .collect()
+    })
 }
 
 /// Page sizes in display order, for laying out the scrolling column.
@@ -233,10 +285,7 @@ pub(crate) fn run(options: ViewerOptions) -> Result<(), Box<dyn std::error::Erro
     let outcome: ScreenshotOutcome = Arc::new(Mutex::new(None));
 
     let title = match &options.document {
-        Some((path, _)) => path.file_name().map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ),
+        Some((path, _)) => file_label(path),
         None => "no document".to_owned(),
     };
 
@@ -620,7 +669,7 @@ impl Viewer {
     /// view and the document drift apart.
     fn edit(&mut self, change: impl FnOnce(&mut PageOrder) -> bool) -> DispatchResult {
         let Some(open) = &mut self.open else {
-            return DispatchResult::Failed("nothing is open".to_owned());
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
         };
         if !change(&mut open.order) {
             return DispatchResult::Unchanged;
@@ -644,17 +693,21 @@ impl Viewer {
     /// Starts writing the document out, off the UI thread.
     fn begin_save(&mut self, destination: PathBuf, overwrite: Overwrite) -> DispatchResult {
         let Some(open) = &self.open else {
-            return DispatchResult::Failed("nothing is open".to_owned());
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
         };
-        if self.saver.is_busy() {
-            return DispatchResult::Failed("a save is already running".to_owned());
-        }
         // Saving an unedited document over itself would rewrite the file for no gain —
         // and not even byte-identically, since the writer makes its own choices about
         // object encoding. See `docs/goal-4-plan.md` §5a.
+        //
+        // Deliberately ahead of the busy check below, so "there is nothing to write" wins
+        // over "a save is already running" when both are true. It is the more accurate of
+        // the two, and it is the one that does not put an error in the status bar.
         if open.order.is_unedited() && destination == open.path {
             return DispatchResult::Unchanged;
         }
+        // `Saver::start` refuses only when a save is already running, so this is the one
+        // place that condition is tested. It used to be checked here *and* above, with
+        // the same message written out twice.
         if self
             .saver
             .start(&open.path, &open.order, &destination, overwrite)
@@ -684,7 +737,7 @@ impl Viewer {
             Command::Undo => self.edit(PageOrder::undo),
             Command::Save => {
                 let Some(open) = &self.open else {
-                    return DispatchResult::Failed("nothing is open".to_owned());
+                    return DispatchResult::Failed(NOTHING_OPEN.to_owned());
                 };
                 let destination = open.path.clone();
                 self.begin_save(destination, Overwrite::Allow)
@@ -884,31 +937,35 @@ impl Viewer {
         }
     }
 
+    /// Which page edits are possible right now.
+    ///
+    /// The single answer the keyboard and the toolbar both read. See [`crate::edits`] for
+    /// what went wrong while they each worked it out for themselves.
+    fn edits(&self) -> Edits {
+        Edits::available(Situation {
+            current: PageNumber::from_index(self.view().current_page()),
+            pages: self.open.as_ref().map_or(0, |open| open.order.len()),
+            can_undo: self.open.as_ref().is_some_and(|open| open.order.can_undo()),
+            unsaved_changes: self.unsaved_changes(),
+            saving: self.saver.is_busy(),
+            thumbnails: self.thumbnails,
+        })
+    }
+
     /// Turns a page-edit key press into a command against the page on screen.
     ///
-    /// `None` when the edit does not apply — the first page cannot move earlier, and
-    /// nothing can be edited with no document open. Returning `None` rather than
-    /// dispatching a command that would be refused keeps the control channel's
-    /// `unchanged` replies meaning "you asked for something already true" rather than
-    /// "a key did nothing".
+    /// `None` when the edit does not apply. Dispatching a command that would be refused
+    /// instead would make the control channel's `unchanged` replies mean "a key did
+    /// nothing" as well as "you asked for something already true".
     fn command_for_edit(&self, edit: EditKey) -> Option<Command> {
-        let open = self.open.as_ref()?;
-        let here = PageNumber::from_index(self.view().current_page());
+        let edits = self.edits();
         match edit {
-            EditKey::MoveEarlier => Some(Command::MovePage {
-                from: here,
-                to: PageNumber::new(here.get().checked_sub(1)?)?,
-            }),
-            EditKey::MoveLater if here.get() < open.order.len() => Some(Command::MovePage {
-                from: here,
-                to: PageNumber::new(here.get() + 1)?,
-            }),
-            EditKey::MoveLater => None,
-            EditKey::Undo => Some(Command::Undo),
-            EditKey::Save => Some(Command::Save),
-            EditKey::ToggleThumbnails => Some(Command::SetThumbnails {
-                visible: !self.thumbnails,
-            }),
+            EditKey::MoveEarlier => edits.move_earlier,
+            EditKey::MoveLater => edits.move_later,
+            EditKey::Undo => edits.undo,
+            // Now `None` while a save is running, which is what the button always did.
+            EditKey::Save => edits.save,
+            EditKey::ToggleThumbnails => Some(edits.toggle_thumbnails),
         }
     }
 
@@ -992,18 +1049,7 @@ impl Viewer {
     /// producer rather than a command for the same reason the dialog is: an agent
     /// already has `open` with a path. See [`crate::input::DropAction`].
     fn collect_dropped_files(&mut self, ctx: &egui::Context) {
-        // egui reports a drop for the single frame it happened on, so this fires once
-        // per drop rather than reopening the file every frame.
-        let dropped: Vec<PathBuf> = ctx.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .filter_map(|file| file.path.clone())
-                .collect()
-        });
-
-        match drop_action(&dropped) {
+        match drop_action(&dropped_paths(ctx)) {
             None => {}
             Some(DropAction::Open { path, ignored }) => {
                 if ignored > 0 {
@@ -1413,9 +1459,9 @@ impl Viewer {
 
     /// Asks about unsaved page changes, and dispatches the answer.
     ///
-    /// The three buttons produce the same `answer` command an agent sends, so there is
-    /// no click-only path out of the question — which is what keeps the whole flow
-    /// testable. See [`crate::confirm`].
+    /// The three buttons produce the same `answer` command an agent sends, so there is no
+    /// click-only path out of the question — which is what keeps the whole flow testable.
+    /// See [`crate::confirm`].
     fn draw_question(&mut self, ctx: &egui::Context) {
         // Read as an owned string so the borrow of `self.guard` ends before dispatch.
         let Some(Guard::Asking(intent)) = &self.guard else {
@@ -1423,45 +1469,7 @@ impl Viewer {
         };
         let what = intent.describe();
 
-        let mut choice = None;
-        let modal = egui::Modal::new(egui::Id::new("porpoise-unsaved")).show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            ui.heading("Unsaved page changes");
-            ui.add_space(6.0);
-            ui.label(format!(
-                "The pages have been reordered and not written to the file. \
-                 Continuing to {what} will lose those changes."
-            ));
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                // Save first, because it is the answer that loses nothing.
-                if ui
-                    .button("Save, then continue")
-                    .on_hover_text("Write the changes over the file, then go ahead")
-                    .clicked()
-                {
-                    choice = Some(Answer::Save);
-                }
-                if ui
-                    .button("Discard changes")
-                    .on_hover_text("Go ahead and lose the reordering")
-                    .clicked()
-                {
-                    choice = Some(Answer::Discard);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(Answer::Cancel);
-                }
-            });
-        });
-
-        // Escape, or clicking outside the box. Treated as Cancel because that is the
-        // answer that changes nothing — a dismissal must never be the destructive one.
-        if choice.is_none() && modal.should_close() {
-            choice = Some(Answer::Cancel);
-        }
-
-        if let Some(choice) = choice {
+        if let Some(choice) = chrome::question(ctx, &what) {
             self.dispatch(ctx, Command::Answer { choice });
         }
     }
@@ -1469,287 +1477,60 @@ impl Viewer {
     /// Paints what a drop would do, while the files are still in the air.
     ///
     /// Drawn from the same [`drop_action`] the drop itself uses, so the window cannot
-    /// invite something it then refuses. It is also the only place that warns about
-    /// losing unsaved page changes: opening a document replaces the one on screen and
-    /// nothing asks first, and here the mouse button is still down.
+    /// invite something it then refuses.
     fn draw_drop_hint(&self, ctx: &egui::Context) {
-        // Unlike a drop, hovering is a *level*: egui holds these until the files are
-        // dropped or dragged back out, and both of those wake the frame loop. So one
-        // repaint paints the hint and one clears it.
-        let hovered: Vec<PathBuf> = ctx.input(|input| {
-            input
-                .raw
-                .hovered_files
-                .iter()
-                .filter_map(|file| file.path.clone())
-                .collect()
-        });
-        let Some(action) = drop_action(&hovered) else {
+        let Some(action) = drop_action(&hovered_paths(ctx)) else {
             return;
         };
-
-        let unsaved = self.unsaved_changes();
-        let colour = match action {
-            DropAction::Open { .. } => egui::Color32::WHITE,
-            DropAction::Refuse { .. } => egui::Color32::from_rgb(240, 150, 150),
-        };
-
-        // Its own foreground layer, so the hint covers the page column, the toolbar and
-        // the thumbnail panel rather than being drawn under whichever came last.
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("porpoise-drop-hint"),
-        ));
-        // Dim the whole viewport so nothing shows through at the edges, but centre the
-        // card in the content rect, which excludes any OS status bar or notch.
-        painter.rect_filled(
-            ctx.viewport_rect(),
-            0.0,
-            egui::Color32::from_black_alpha(160),
-        );
-
-        // Laid out first so the card can be sized to the text. Dimming alone is not
-        // enough to read a sentence over a drawing sheet, which is mostly white and
-        // full of lines. Wrapped rather than measured freely, so a long file name
-        // cannot push the card off both edges of the window.
-        let content = ctx.content_rect();
-        let galley = painter.layout(
-            action.hint(unsaved),
-            egui::FontId::proportional(20.0),
-            colour,
-            (content.width() - 96.0).max(120.0),
-        );
-        let padding = egui::vec2(36.0, 22.0);
-        let card = egui::Rect::from_center_size(content.center(), galley.size() + padding);
-        painter.rect_filled(card, 8.0, egui::Color32::from_black_alpha(235));
-        painter.galley(card.center() - galley.size() * 0.5, galley, colour);
+        chrome::drop_hint(ctx, &action, self.unsaved_changes());
     }
 
+    /// Draws the toolbar and dispatches whatever was clicked.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        // Collected rather than dispatched inline, because dispatch needs
-        // `&mut self` while `ui` is borrowed. Note every button produces the same
-        // command an agent would send — there is no click-only path.
-        let mut issued: Vec<Command> = Vec::new();
-        let zoom_target = self.state.zoom_target();
-        let paged = self.state.scroll_mode() == ScrollMode::Paged;
-        // Not pushed onto `issued`: the dialog is not a command. Collected the same
-        // way only because `ui` holds the borrow.
-        let mut open_picker = false;
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.picker.is_open(), egui::Button::new("Open…"))
-                .on_hover_text("Open a PDF (Ctrl+O)")
-                .clicked()
-            {
-                open_picker = true;
-            }
-            ui.separator();
-
-            if ui
-                .selectable_label(self.thumbnails, "Pages")
-                .on_hover_text("Show the page grid, to drag pages around (Ctrl+T)")
-                .clicked()
-            {
-                issued.push(Command::SetThumbnails {
-                    visible: !self.thumbnails,
-                });
-            }
-            ui.separator();
-
-            if ui.button("⏮").on_hover_text("First page (Home)").clicked() {
-                issued.push(ViewCommand::FirstPage.into());
-            }
-            if ui.button("⏭").on_hover_text("Last page (End)").clicked() {
-                issued.push(ViewCommand::LastPage.into());
-            }
-            ui.separator();
-
-            // Page editing. Every one of these produces the same command an agent
-            // would send, so there is nothing here a script cannot do.
-            let here = PageNumber::from_index(self.view().current_page());
-            let pages = self.open.as_ref().map_or(0, |open| open.order.len());
-            let can_edit = pages > 0;
-
-            if ui
-                .add_enabled(can_edit && here.get() > 1, egui::Button::new("Up"))
-                // Words, not arrow glyphs. U+2191/U+2193 are missing from egui's
-                // bundled fonts and rendered as empty boxes -- caught by looking at a
-                // capture of the real toolbar rather than by any test.
-                .on_hover_text("Move this page earlier (Ctrl+Up)")
-                .clicked()
-                && let Some(to) = PageNumber::new(here.get() - 1)
-            {
-                issued.push(Command::MovePage { from: here, to });
-            }
-            if ui
-                .add_enabled(can_edit && here.get() < pages, egui::Button::new("Down"))
-                .on_hover_text("Move this page later (Ctrl+Down)")
-                .clicked()
-                && let Some(to) = PageNumber::new(here.get() + 1)
-            {
-                issued.push(Command::MovePage { from: here, to });
-            }
-            if ui
-                .add_enabled(pages > 1, egui::Button::new("Delete"))
-                .on_hover_text("Delete this page")
-                .clicked()
-            {
-                issued.push(Command::DeletePage { page: here });
-            }
-            if ui
-                .add_enabled(
-                    self.open.as_ref().is_some_and(|open| open.order.can_undo()),
-                    egui::Button::new("Undo"),
-                )
-                .on_hover_text("Undo the last page edit (Ctrl+Z)")
-                .clicked()
-            {
-                issued.push(Command::Undo);
-            }
-
-            let edited = self.unsaved_changes();
-            if ui
-                .add_enabled(edited && !self.saver.is_busy(), egui::Button::new("Save"))
-                .on_hover_text("Write the changes over the original (Ctrl+S)")
-                .clicked()
-            {
-                issued.push(Command::Save);
-            }
-            ui.separator();
-
-            if ui.button("−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
-                issued.push(ViewCommand::StepZoom { rungs: -1 }.into());
-            }
-            if ui.button("+").on_hover_text("Zoom in (Ctrl++)").clicked() {
-                issued.push(ViewCommand::StepZoom { rungs: 1 }.into());
-            }
-
-            if ui
-                .selectable_label(zoom_target == ZoomTarget::FitWidth, "Width")
-                .on_hover_text("Fit width (Ctrl+0)")
-                .clicked()
-            {
-                issued.push(
-                    ViewCommand::SetZoom {
-                        target: ZoomTarget::FitWidth,
-                    }
-                    .into(),
-                );
-            }
-            if ui
-                .selectable_label(zoom_target == ZoomTarget::FitPage, "Page")
-                .on_hover_text("Fit page (Ctrl+2)")
-                .clicked()
-            {
-                issued.push(
-                    ViewCommand::SetZoom {
-                        target: ZoomTarget::FitPage,
-                    }
-                    .into(),
-                );
-            }
-            ui.separator();
-
-            // Paged versus free changes what PageDown and Space mean.
-            if ui
-                .selectable_label(paged, "Paged")
-                .on_hover_text("Page-by-page instead of continuous scrolling")
-                .clicked()
-            {
-                let mode = if paged {
-                    ScrollMode::Free
-                } else {
-                    ScrollMode::Paged
-                };
-                issued.push(ViewCommand::SetScrollMode { mode }.into());
-            }
-        });
+        let edits = self.edits();
+        let clicked = chrome::toolbar(
+            ui,
+            &chrome::Toolbar {
+                edits: &edits,
+                zoom_target: self.state.zoom_target(),
+                scroll_mode: self.state.scroll_mode(),
+                thumbnails: self.thumbnails,
+                picker_open: self.picker.is_open(),
+            },
+        );
 
         let ctx = ui.ctx().clone();
-        if open_picker {
+        if clicked.open_picker {
             self.picker.open();
         }
-        for command in issued {
+        for command in clicked.commands {
             self.dispatch(&ctx, command);
         }
     }
 
     fn draw_status(&self, ui: &mut egui::Ui) {
         let view = self.view();
-        ui.horizontal(|ui| {
-            match &self.open {
-                Some(open) => {
-                    ui.label(format!(
-                        "page {} of {}",
-                        PageNumber::from_index(view.current_page()),
-                        open.layout.page_count()
-                    ));
-                    ui.separator();
-                    ui.label(format!(
-                        "{:.0}% {}",
-                        view.zoom() * 100.0,
-                        self.state.zoom_target().label()
-                    ));
-                    ui.separator();
-                    ui.label(self.state.scroll_mode().label());
-                    ui.separator();
-                    // Proof of virtualization: both stay small however long the
-                    // document.
-                    ui.label(format!(
-                        "{} cached, {:.1} MB",
-                        open.cache.len(),
-                        open.cache.used_bytes() as f64 / (1024.0 * 1024.0)
-                    ));
-                    ui.separator();
-                    ui.label(format!(
-                        "{} workers, {} in flight",
-                        open.pool.worker_count(),
-                        open.in_flight.len()
-                    ));
-                    ui.separator();
-                    ui.label(format!(
-                        "ui {:.1} ms, frame {:.1} ms",
-                        self.timing.ui_ms, self.timing.frame_ms
-                    ));
-                    // Counts only what we have given up on, matching the error
-                    // tiles. A page still being retried is not a failure yet.
-                    let abandoned = open.abandoned();
-                    if abandoned > 0 {
-                        ui.separator();
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!("{abandoned} failed"),
-                        );
-                    }
-                }
-                None => {
-                    ui.label("no document — Ctrl+O to open one");
-                }
-            }
-
-            // Editing state, before the error, so a save failure reads next to it.
-            if let Some(destination) = self.saver.destination() {
-                ui.separator();
-                ui.label(format!(
-                    "saving to {}…",
-                    destination.file_name().map_or_else(
-                        || destination.display().to_string(),
-                        |name| name.to_string_lossy().into_owned()
-                    )
-                ));
-            } else if self.unsaved_changes() {
-                ui.separator();
-                ui.colored_label(ui.visuals().warn_fg_color, "unsaved changes");
-            }
-
-            // Last, and on every path: a failure with no document open is exactly the
-            // case the picker creates, so it must not live inside the `Some` arm.
-            if let Some(error) = &self.last_error {
-                ui.separator();
-                ui.colored_label(ui.visuals().error_fg_color, error);
-            }
-        });
+        chrome::status(
+            ui,
+            &chrome::Status {
+                document: self.open.as_ref().map(|open| chrome::StatusDocument {
+                    current_page: PageNumber::from_index(view.current_page()).get(),
+                    page_count: open.layout.page_count(),
+                    zoom: view.zoom(),
+                    zoom_target: self.state.zoom_target(),
+                    scroll_mode: self.state.scroll_mode(),
+                    pages_cached: open.cache.len(),
+                    cache_bytes: open.cache.used_bytes(),
+                    workers: open.pool.worker_count(),
+                    renders_in_flight: open.in_flight.len(),
+                    timing: self.timing,
+                    abandoned: open.abandoned(),
+                }),
+                saving_to: self.saver.destination(),
+                unsaved_changes: self.unsaved_changes(),
+                last_error: self.last_error.as_deref(),
+            },
+        );
     }
 
     // --- Development aids ---------------------------------------------------

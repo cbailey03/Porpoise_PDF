@@ -4,12 +4,15 @@
 //! and `render` rasterizes one page to a PNG. See `docs/goal-1-plan.md`,
 //! section 4.
 
+mod chrome;
 mod command;
 mod confirm;
 mod control;
 mod devtools;
+mod edits;
 mod failure;
 mod input;
+mod label;
 mod picker;
 mod protocol;
 mod saver;

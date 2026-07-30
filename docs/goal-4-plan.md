@@ -256,6 +256,52 @@ Verified against the real window by posting `WM_CLOSE`, which is exactly what th
 document it exits 0 as before, and with a reordered one it stays up reporting `awaiting_answer: "quit"`
 and `idle: false`, then exits on `discard`.
 
+## 9. Structural review
+
+Four checks after the work above landed: does everything go through a command, is the folder structure
+right, is anything too big, and is anything written twice.
+
+**Commands: yes, and this goal closed the last hole.** Checked by mapping every write to viewer state
+rather than by reading around. `state` and `open` are written in two functions, both reachable only from
+`carry_out`; `porpoise_view::apply` has exactly two call sites, both inside dispatch; the page order moves
+only through `edit`. Twelve producers all funnel through `dispatch`. Before §8, the X button sent
+`ViewportCommand::Close` directly — the last input path that changed the program without a command.
+
+Two exceptions remain on purpose: the file dialog (`goal-3-plan.md` §1), and dragging the scrollbar, where
+egui owns the live offset and the view *reports* it back. The capability exists as `scroll_to`; only the
+gesture skips dispatch.
+
+There are now **three** exhaustive matches over `Command` — naming it, advertising it, and deciding whether
+it discards unsaved work. That triplication is deliberate: each answers a different question and each fails
+to compile when a command is added. Enforced repetition is not the kind DRY is about.
+
+**Folders: nothing to change.** Dependencies run one way, tests live in the crate they test.
+
+**One file was too big.** `viewer.rs` held 1300 lines of code and no tests, while every other large file in
+the workspace is mostly tests. Two seams were clean — the toolbar and status bar, and the two overlays —
+and both moved to `chrome.rs`, taking it to about 1000.
+
+Worth stating plainly: **that bought navigability, not coverage.** Those functions need a live
+`egui::Context` either way, so none of them gained a test by moving. Further splitting was considered and
+declined — the render pipeline and `draw_pages` are genuinely coupled to the frame loop, and cutting them
+apart to satisfy a line count would make the code harder to follow, not easier.
+
+**The repetition that mattered was a behaviour difference.** The keyboard and the toolbar each worked out
+which page edits were possible, and they had already drifted: `Ctrl+S` produced a `Save` unconditionally
+while the Save button was disabled during a save. So pressing the key twice on a large document put *"a
+save is already running"* in the status bar, which the button could never do. Measured on the 400-page set,
+the second `save` comes back `ok:false`.
+
+Cosmetic in itself — the message clears when the save lands — but two answers to one question is how they
+drift further. Both now read `edits::Edits::available`, which takes plain values and is therefore the first
+part of the toolbar's behaviour with unit tests at all. Nine of them.
+
+Three smaller ones fixed: the filename-or-whole-path fallback written three times (now `label.rs`), two
+near-identical blocks reading paths out of egui's file input, and `begin_save` asking "already saving?"
+twice with the same message. That last one needed a decision rather than a deletion — with a save running
+*and* nothing to write, "nothing to write" now wins, because it is the more accurate of the two and the one
+that does not put an error on screen.
+
 ## 6. Known gaps
 
 - **Nested page trees are refused** (§2). The fix is inherited-attribute push-down.

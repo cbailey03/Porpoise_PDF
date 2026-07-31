@@ -110,21 +110,21 @@ pub(crate) const PANEL_MAX_WIDTH: f32 =
 /// a build that disagrees is one that should not link.
 const _: () = assert!(PANEL_MIN_WIDTH <= PANEL_WIDTH && PANEL_WIDTH <= PANEL_MAX_WIDTH);
 
-/// Room between the two viewports in [`GridMode::Merge`].
-const MERGE_DIVIDER_GAP: f32 = 12.0;
-
 /// The narrowest the panel may be while the merge tab is open: two one-column
 /// viewports side by side, each with its own scroll bar, plus the gap between them.
 ///
 /// Derived from [`PANEL_MIN_WIDTH`] rather than written down separately, for the same
 /// reason that one is derived from [`THUMBNAIL_WIDTH`] — a panel sized for a number of
 /// columns that no longer fit is exactly the bug that constant was introduced to
-/// avoid.
-pub(crate) const PANEL_MERGE_MIN_WIDTH: f32 = PANEL_MIN_WIDTH * 2.0 + MERGE_DIVIDER_GAP;
+/// avoid. The gap between the two viewports is [`ASSUMED_GAP`], not a separate
+/// number: `ui.columns(2, ..)` — see [`draw_merge`] — spaces them by egui's
+/// `item_spacing.x`, the same value `ASSUMED_GAP` already names, and budgeting for
+/// a different one here would size the panel for a gap nothing actually draws.
+pub(crate) const PANEL_MERGE_MIN_WIDTH: f32 = PANEL_MIN_WIDTH * 2.0 + ASSUMED_GAP;
 
 /// The widest the panel may be while the merge tab is open — [`PANEL_MAX_WIDTH`]
 /// doubled, since it now has to fit two viewports rather than one.
-pub(crate) const PANEL_MERGE_MAX_WIDTH: f32 = PANEL_MAX_WIDTH * 2.0 + MERGE_DIVIDER_GAP;
+pub(crate) const PANEL_MERGE_MAX_WIDTH: f32 = PANEL_MAX_WIDTH * 2.0 + ASSUMED_GAP;
 
 const _: () = assert!(PANEL_MERGE_MIN_WIDTH <= PANEL_MERGE_MAX_WIDTH);
 const _: () = assert!(PANEL_MERGE_MIN_WIDTH >= PANEL_MIN_WIDTH * 2.0);
@@ -325,11 +325,49 @@ fn geometry_of(documents: &[Arc<Document>], source: Source) -> Option<PageGeomet
 fn shown_geometry<'a>(
     order: &'a PageOrder,
     documents: &'a [Arc<Document>],
-) -> impl Iterator<Item = PageGeometry> + 'a {
+) -> impl Iterator<Item = PageGeometry> + Clone + 'a {
     (0..order.len()).filter_map(move |position| {
         let source = order.source_of(position)?;
         geometry_of(documents, source)
     })
+}
+
+/// The bucket, column and row counts, and page/row heights a grid of `slots`
+/// pages lays out at — shared by [`draw_single_grid`] and [`draw_staged_grid`],
+/// which differ only in where their page geometry comes from.
+struct LayoutMetrics {
+    bucket: ZoomBucket,
+    columns: usize,
+    rows: usize,
+    box_height: f32,
+    cell_height: f32,
+}
+
+fn layout_metrics(
+    ui: &egui::Ui,
+    pixels_per_point: f32,
+    slots: usize,
+    geometries: impl Iterator<Item = PageGeometry> + Clone,
+) -> LayoutMetrics {
+    let widest = geometries
+        .clone()
+        .map(|page| f64::from(page.width_pt))
+        .fold(0.0_f64, f64::max);
+    let bucket = bucket_for(widest, pixels_per_point);
+    // Measured, not assumed: both of these have to match what egui will really lay
+    // out. See `columns_for` and `row_height` for what went wrong when they did not.
+    let gap = ui.spacing().item_spacing;
+    let columns = columns_for(ui.available_width(), gap.x);
+    let rows = rows_for(slots, columns);
+    let box_height = box_height(geometries.map(|page| page.height_pt / page.width_pt));
+    let cell_height = row_height(box_height, gap.y);
+    LayoutMetrics {
+        bucket,
+        columns,
+        rows,
+        box_height,
+        cell_height,
+    }
 }
 
 pub(crate) fn bucket_for(widest_page_pt: f64, pixels_per_point: f32) -> ZoomBucket {
@@ -533,19 +571,18 @@ fn draw_single_grid(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn, s
         return;
     }
 
-    let widest = shown_geometry(grid.order, grid.documents)
-        .map(|page| f64::from(page.width_pt))
-        .fold(0.0_f64, f64::max);
-    let bucket = bucket_for(widest, grid.pixels_per_point);
-    // Measured, not assumed: both of these have to match what egui will really lay out.
-    // See `columns_for` and `row_height` for what went wrong when they did not.
-    let gap = ui.spacing().item_spacing;
-    let columns = columns_for(ui.available_width(), gap.x);
-    let rows = rows_for(slots, columns);
-    let box_height = box_height(
-        shown_geometry(grid.order, grid.documents).map(|page| page.height_pt / page.width_pt),
+    let LayoutMetrics {
+        bucket,
+        columns,
+        rows,
+        box_height,
+        cell_height,
+    } = layout_metrics(
+        ui,
+        grid.pixels_per_point,
+        slots,
+        shown_geometry(grid.order, grid.documents),
     );
-    let cell_height = row_height(box_height, gap.y);
 
     // `show_rows` only calls back for the rows on screen, which is what keeps a
     // 400-page grid from rasterizing 400 thumbnails — and what makes `showing` a
@@ -755,22 +792,18 @@ fn draw_staged_grid(
 
     // Sized from every page, not just the shown ones, so filtering does not make the
     // grid's rows jump around — the same choice `draw_single_grid` makes.
-    let widest = staged
-        .geometries
-        .iter()
-        .map(|page| f64::from(page.width_pt))
-        .fold(0.0_f64, f64::max);
-    let bucket = bucket_for(widest, pixels_per_point);
-    let gap = ui.spacing().item_spacing;
-    let columns = columns_for(ui.available_width(), gap.x);
-    let rows = rows_for(slots, columns);
-    let box_height = box_height(
-        staged
-            .geometries
-            .iter()
-            .map(|page| page.height_pt / page.width_pt),
+    let LayoutMetrics {
+        bucket,
+        columns,
+        rows,
+        box_height,
+        cell_height,
+    } = layout_metrics(
+        ui,
+        pixels_per_point,
+        slots,
+        staged.geometries.iter().copied(),
     );
-    let cell_height = row_height(box_height, gap.y);
 
     egui::ScrollArea::vertical()
         .id_salt("porpoise-grid-staging")
@@ -832,7 +865,10 @@ fn draw_staged_grid(
 /// One thumbnail in the staging viewport: pickable, and draggable out as an
 /// [`Inserted`] payload. Never a drop target and never the page the main view is
 /// showing, so it needs none of `cell`'s per-mode branching.
-#[expect(clippy::too_many_arguments, reason = "mirrors cell's own parameter list, split across two structs it cannot borrow at once — see draw_merge")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors cell's own parameter list, split across two structs it cannot borrow at once — see draw_merge"
+)]
 fn staged_cell(
     ui: &mut egui::Ui,
     staged: &StagedInfo<'_>,
@@ -874,7 +910,9 @@ fn staged_cell(
     };
 
     let response = egui::Frame::default()
-        .show(ui, |ui| paint(ui, &thumbnail, egui::Sense::click_and_drag()))
+        .show(ui, |ui| {
+            paint(ui, &thumbnail, egui::Sense::click_and_drag())
+        })
         .inner
         .on_hover_cursor(egui::CursorIcon::Grab);
 
@@ -1064,8 +1102,10 @@ fn cell(
         grid.queue.want(key, grid.pixels_per_point);
     }
 
-    let selected =
-        grid.mode == GridMode::Reorganize && grid.selection.contains_position(grid.order.as_slice(), position);
+    let selected = grid.mode == GridMode::Reorganize
+        && grid
+            .selection
+            .contains_position(grid.order.as_slice(), position);
     let thumbnail = Thumbnail {
         position,
         size,
@@ -1255,7 +1295,9 @@ fn paint_insertion(ui: &egui::Ui, cell: egui::Rect) {
 fn paint_drag_ghost(ctx: &egui::Context) {
     let count = egui::DragAndDrop::payload::<Dragged>(ctx)
         .map(|dragged| dragged.0.len())
-        .or_else(|| egui::DragAndDrop::payload::<Inserted>(ctx).map(|inserted| inserted.pages.len()));
+        .or_else(|| {
+            egui::DragAndDrop::payload::<Inserted>(ctx).map(|inserted| inserted.pages.len())
+        });
     let Some(count) = count else {
         return;
     };
@@ -1560,11 +1602,20 @@ mod tests {
         // another on the same drag. No window needed — `DragAndDrop`'s payload is
         // plain `Context` state.
         let ctx = egui::Context::default();
-        egui::DragAndDrop::set_payload(&ctx, Inserted { document: 1, pages: vec![0, 2] });
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            Inserted {
+                document: 1,
+                pages: vec![0, 2],
+            },
+        );
 
         let inserted = egui::DragAndDrop::payload::<Inserted>(&ctx);
         assert_eq!(inserted.as_deref().map(|i| i.document), Some(1));
-        assert_eq!(inserted.as_deref().map(|i| i.pages.clone()), Some(vec![0, 2]));
+        assert_eq!(
+            inserted.as_deref().map(|i| i.pages.clone()),
+            Some(vec![0, 2])
+        );
         assert!(
             egui::DragAndDrop::payload::<Dragged>(&ctx).is_none(),
             "a Dragged payload was found where only an Inserted one was set"
@@ -1657,7 +1708,10 @@ mod tests {
         // in one frame, and `Context` memory is keyed by `Id` alone, so without this
         // a box started in the main viewport could be reported as finishing in the
         // staging one, or vice versa.
-        assert_ne!(marquee_origin("porpoise-grid-main"), marquee_origin("porpoise-grid-staging"));
+        assert_ne!(
+            marquee_origin("porpoise-grid-main"),
+            marquee_origin("porpoise-grid-staging")
+        );
     }
 
     #[test]
@@ -1667,9 +1721,18 @@ mod tests {
         // that a `Selection` built against that exact shape behaves the way
         // `StagedInfo::selection` needs it to, independent of any window.
         let geometries = [
-            PageGeometry { width_pt: 200.0, height_pt: 100.0 },
-            PageGeometry { width_pt: 200.0, height_pt: 100.0 },
-            PageGeometry { width_pt: 200.0, height_pt: 100.0 },
+            PageGeometry {
+                width_pt: 200.0,
+                height_pt: 100.0,
+            },
+            PageGeometry {
+                width_pt: 200.0,
+                height_pt: 100.0,
+            },
+            PageGeometry {
+                width_pt: 200.0,
+                height_pt: 100.0,
+            },
         ];
         let shown: Vec<Source> = (0..geometries.len())
             .map(|page| Source { document: 1, page })

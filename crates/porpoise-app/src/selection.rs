@@ -88,7 +88,10 @@ impl Selection {
     /// deleted, or a staged page that has since been un-staged, is not selected any
     /// more — it is only remembered in case of an undo.
     pub(crate) fn count(&self, shown: &[Source]) -> usize {
-        shown.iter().filter(|source| self.chosen.contains(source)).count()
+        shown
+            .iter()
+            .filter(|source| self.chosen.contains(source))
+            .count()
     }
 
     /// Whether the page at `position` in `shown` is selected.
@@ -450,7 +453,9 @@ mod tests {
     /// A staged document's own pages, exactly as the merge tab would build them:
     /// `(0..page_count).map(|page| Source { document, page })`.
     fn staged(document: usize, page_count: usize) -> Vec<Source> {
-        (0..page_count).map(|page| Source { document, page }).collect()
+        (0..page_count)
+            .map(|page| Source { document, page })
+            .collect()
     }
 
     #[test]

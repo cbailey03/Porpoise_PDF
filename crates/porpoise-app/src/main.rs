@@ -607,8 +607,10 @@ mod tests {
 
     #[test]
     fn merge_accepts_several_files_in_order() {
-        let cli = Cli::try_parse_from(["porpoise", "merge", "a.pdf", "b.pdf", "c.pdf", "-o", "out.pdf"])
-            .expect("should parse");
+        let cli = Cli::try_parse_from([
+            "porpoise", "merge", "a.pdf", "b.pdf", "c.pdf", "-o", "out.pdf",
+        ])
+        .expect("should parse");
         let Some(Command::Merge(args)) = cli.command else {
             panic!("expected the merge subcommand");
         };

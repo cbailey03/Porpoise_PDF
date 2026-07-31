@@ -303,7 +303,10 @@ fn worker_loop<R>(
             .ok()
             .and_then(|documents| documents.get(job.document).cloned());
         let Some(document) = document else {
-            tracing::error!(document = job.document, "render job named an unknown document");
+            tracing::error!(
+                document = job.document,
+                "render job named an unknown document"
+            );
             continue;
         };
 

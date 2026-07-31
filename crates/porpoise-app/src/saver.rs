@@ -170,7 +170,12 @@ mod tests {
         let mut saver = Saver::default();
         let mut order = PageOrder::identity(3);
         assert!(order.move_page(0, 2));
-        assert!(saver.start(std::slice::from_ref(&source), &order, &destination, Overwrite::Refuse));
+        assert!(saver.start(
+            std::slice::from_ref(&source),
+            &order,
+            &destination,
+            Overwrite::Refuse
+        ));
         assert!(saver.is_busy(), "reported idle with a save running");
         assert_eq!(saver.destination(), Some(destination.as_path()));
 
@@ -194,7 +199,12 @@ mod tests {
         let mut order = PageOrder::identity(3);
         assert!(order.move_page(0, 2));
         let expected = order.as_slice().to_vec();
-        assert!(saver.start(std::slice::from_ref(&source), &order, &destination, Overwrite::Refuse));
+        assert!(saver.start(
+            std::slice::from_ref(&source),
+            &order,
+            &destination,
+            Overwrite::Refuse
+        ));
 
         // Kept editing while the write ran, exactly as a person would.
         assert!(order.move_page(0, 1));
@@ -240,9 +250,19 @@ mod tests {
 
         let mut saver = Saver::default();
         let order = PageOrder::identity(3);
-        assert!(saver.start(std::slice::from_ref(&source), &order, &first, Overwrite::Refuse));
+        assert!(saver.start(
+            std::slice::from_ref(&source),
+            &order,
+            &first,
+            Overwrite::Refuse
+        ));
         assert!(
-            !saver.start(std::slice::from_ref(&source), &order, &second, Overwrite::Refuse),
+            !saver.start(
+                std::slice::from_ref(&source),
+                &order,
+                &second,
+                Overwrite::Refuse
+            ),
             "started a second save while one was running"
         );
 
@@ -261,7 +281,12 @@ mod tests {
         for round in 0..2 {
             let destination = scratch(&format!("again-{round}.pdf"));
             assert!(
-                saver.start(std::slice::from_ref(&source), &order, &destination, Overwrite::Refuse),
+                saver.start(
+                    std::slice::from_ref(&source),
+                    &order,
+                    &destination,
+                    Overwrite::Refuse
+                ),
                 "round {round} was refused"
             );
             let saved = wait(&mut saver);

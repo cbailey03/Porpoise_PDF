@@ -127,6 +127,39 @@ impl Serve {
         }
     }
 
+    /// Starts the binary with nothing open — no file argument on the command line.
+    /// What an agent sees before the first `open`, and the shape every "refused
+    /// with nothing open" test needs.
+    fn start_empty() -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("porpoise should launch");
+
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Self {
+            child,
+            stdin,
+            lines,
+            next_id: 1,
+            failures_seen: Cell::new(0),
+        }
+    }
+
     /// Sends a raw line.
     fn send_raw(&mut self, line: &str) {
         writeln!(self.stdin, "{line}").expect("should write to the control channel");
@@ -465,30 +498,7 @@ fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
 
     // No file argument: the window starts empty, which is the case that matters for
     // an agent choosing what to look at.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("porpoise should launch");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (sender, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut serve = Serve {
-        child,
-        stdin,
-        lines,
-        next_id: 1,
-        failures_seen: Cell::new(0),
-    };
+    let mut serve = Serve::start_empty();
 
     let view = serve.view();
     assert_eq!(
@@ -824,10 +834,7 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
     // not appended at the end, which is the whole point of this over `insert_file`.
     let id = serve.send(
         "insert_pages",
-        &[
-            ("pages", Value::from(vec![1])),
-            ("at", Value::from(2)),
-        ],
+        &[("pages", Value::from(vec![1])), ("at", Value::from(2))],
     );
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
@@ -845,10 +852,7 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
     // survives more than one drag, per `PageOrder::insert_pages`'s own contract.
     let id = serve.send(
         "insert_pages",
-        &[
-            ("pages", Value::from(vec![2, 3])),
-            ("at", Value::from(1)),
-        ],
+        &[("pages", Value::from(vec![2, 3])), ("at", Value::from(1))],
     );
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
@@ -925,30 +929,7 @@ fn staging_a_document_with_nothing_open_is_refused() {
     // The same empty-window shape `inserting_a_file_with_nothing_open_is_refused`
     // checks for `insert_file` — staging needs a document to merge into, same as
     // inserting does.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("porpoise should launch");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (sender, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut serve = Serve {
-        child,
-        stdin,
-        lines,
-        next_id: 1,
-        failures_seen: Cell::new(0),
-    };
+    let mut serve = Serve::start_empty();
 
     let id = serve.send(
         "stage_document",
@@ -980,30 +961,7 @@ fn inserting_a_file_with_nothing_open_is_refused() {
     // No file argument, the same empty-window shape
     // `an_agent_can_open_a_document_that_was_not_on_the_command_line` starts from —
     // there is nothing to insert pages into.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("porpoise should launch");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (sender, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut serve = Serve {
-        child,
-        stdin,
-        lines,
-        next_id: 1,
-        failures_seen: Cell::new(0),
-    };
+    let mut serve = Serve::start_empty();
 
     let inserted = fixture_of("e2e-insert-refused.pdf", 2);
     let id = serve.send(
@@ -1621,30 +1579,7 @@ fn an_empty_window_can_still_be_captured() {
     // Harmless while a path was mandatory. Since Goal 3 an empty window is how the
     // program starts, so it is the first thing anyone would try to capture.
     let capture = scratch("e2e-empty-window.png");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("porpoise should launch");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (sender, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut serve = Serve {
-        child,
-        stdin,
-        lines,
-        next_id: 1,
-        failures_seen: Cell::new(0),
-    };
+    let mut serve = Serve::start_empty();
 
     let id = serve.send(
         "capture",

@@ -49,7 +49,7 @@
 //! found to either refuse a save that should succeed, or write the wrong pages
 //! without complaint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lopdf::{Document as LoDocument, Object, ObjectId};
@@ -77,13 +77,17 @@ pub enum SaveError {
     /// person editing saw, and the result would be scrambled in a way nobody
     /// notices until later.
     #[error(
-        "cannot edit {path} safely: it was opened with {opened} page(s) but reads as \
-         {found} for writing"
+        "cannot edit {path} safely: its page tree was expected to hold {opened} page(s) \
+         but reads as {found} for writing"
     )]
     PageCountMismatch {
         /// The file that disagreed.
         path: PathBuf,
-        /// What the viewer opened it with.
+        /// What [`PageOrder::on_disk`] expects this document's file to physically
+        /// hold — the count as of its last save, or as first opened, inserted, or
+        /// staged if it has never been saved over. Not necessarily what the viewer
+        /// opened it with; see the module docs' "saving the same path more than
+        /// once".
         opened: usize,
         /// What the writer found.
         found: usize,
@@ -141,11 +145,13 @@ pub enum Overwrite {
 /// Writes the documents named by `sources` to `destination`, keeping only the pages
 /// `order` names and in the order it names them.
 ///
-/// `sources` must have exactly one entry per document `order` refers to, in the
-/// same order [`PageOrder::source_lens`] reports them — that is, `sources[0]` is
-/// the document the viewer was opened with, `sources[1]` is the first one inserted,
-/// and so on. Every retained page keeps the shape it had in its own file; only the
-/// document each page belongs to, and the objects that page depends on, move.
+/// `sources` must have exactly one entry per document [`PageOrder::document_count`]
+/// counts — not only ones with a page currently retained; see [`PageOrder::stage`]
+/// — in the same order [`PageOrder::source_lens`] reports them: `sources[0]` is the
+/// document the viewer was opened with, `sources[1]` is the first one inserted or
+/// staged, and so on. Every retained page keeps the shape it had in its own file;
+/// only the document each page belongs to, and the objects that page depends on,
+/// move.
 ///
 /// The write is atomic: the new document goes to a temporary file beside the
 /// destination and is renamed into place. A rename within one directory either
@@ -157,13 +163,22 @@ pub fn save_reordered(
     destination: &Path,
     overwrite: Overwrite,
 ) -> Result<(), SaveError> {
-    assert_eq!(
-        sources.len(),
-        order.document_count(),
-        "save_reordered was given {} source path(s) for an order spanning {} document(s)",
-        sources.len(),
-        order.document_count()
-    );
+    // The type system does not see that `sources` has one entry per document
+    // `order` refers to — that is the caller's responsibility, per the doc comment
+    // above — so a mismatch is refused here like every other invariant this module
+    // checks, rather than asserted. This runs on a background thread (see
+    // `porpoise-app`'s `saver.rs`), where a panic would drop the result silently
+    // instead of ever reaching whoever is waiting on the save.
+    if sources.len() != order.document_count() {
+        return Err(SaveError::PageTree {
+            path: destination.to_path_buf(),
+            detail: format!(
+                "given {} source path(s) for an order spanning {} document(s)",
+                sources.len(),
+                order.document_count()
+            ),
+        });
+    }
 
     if overwrite == Overwrite::Refuse && destination.exists() {
         return Err(SaveError::WouldOverwrite {
@@ -192,8 +207,25 @@ pub fn save_reordered(
     // says document 0's file physically holds — not by `source.page` directly, since
     // a prior save may have already renumbered that file from zero. Filled in as
     // each document is loaded and validated.
-    let mut pages_by_document: Vec<HashMap<Source, ObjectId>> =
-        vec![page_ids_by_source(&primary, primary_path, on_disk_pages(order, 0, primary_path)?)?];
+    let mut pages_by_document: Vec<HashMap<Source, ObjectId>> = vec![page_ids_by_source(
+        &primary,
+        primary_path,
+        on_disk_pages(order, 0, primary_path)?,
+    )?];
+
+    // Documents actually named by a retained page. `stage` (`docs/goal-5-plan.md`
+    // §10.7) registers a document with `order` before any of its pages are placed —
+    // the merge tab does this the moment a second file is opened, whether or not
+    // anything is ever dragged from it — and nothing ever un-registers one. A
+    // document that stays merely staged, or was staged and then cleared, must not
+    // become load-bearing for every save from then on: if it were loaded and
+    // validated unconditionally below, moving, deleting or breaking a file nobody
+    // ever actually merged from would stop *this* document from saving.
+    let referenced: HashSet<usize> = order
+        .as_slice()
+        .iter()
+        .map(|source| source.document)
+        .collect();
 
     // Every retained page has to hang off `root` in one merged object table.
     // Secondary documents are folded in wholesale — not only their retained pages —
@@ -203,6 +235,13 @@ pub fn save_reordered(
     let mut next_id = primary.max_id + 1;
     for (offset, path) in secondary_paths.iter().enumerate() {
         let document = offset + 1;
+        if !referenced.contains(&document) {
+            // Nothing above will ever look this document up — no position in
+            // `order` names it — so an empty table is exactly as good as the real
+            // one, and costs nothing to be wrong about.
+            pages_by_document.push(HashMap::new());
+            continue;
+        }
         let mut secondary = LoDocument::load(path).map_err(|error| SaveError::Source {
             path: path.clone(),
             detail: error.to_string(),
@@ -236,7 +275,10 @@ pub fn save_reordered(
             .and_then(|pages| pages.get(&source))
             .copied()
             .ok_or_else(|| SaveError::PageTree {
-                path: sources.get(source.document).cloned().unwrap_or_else(|| destination.to_path_buf()),
+                path: sources
+                    .get(source.document)
+                    .cloned()
+                    .unwrap_or_else(|| destination.to_path_buf()),
                 detail: format!("{source:?} is not in that document's page tree"),
             })?;
         kids.push(Object::Reference(id));

@@ -149,12 +149,15 @@ struct OpenDocument {
     /// Every contributing file, index 0 being the one the viewer was opened with.
     /// `Source::document` in [`Self::order`] indexes this.
     files: Vec<OpenFile>,
-    /// What order the pages are shown in. Identity until somebody edits it.
+    /// What order the pages are shown in. Only the identity mapping — position `n`
+    /// is page `n` of document 0 — before the very first edit; a move or a delete
+    /// breaks that identity immediately, and an insert is the only edit that can
+    /// make a position's source name anything other than document 0.
     ///
     /// Everything that rasterizes, caches or measures a page goes through this to turn
-    /// a *display position* into a *source* — a document and a page within it. The two
-    /// are the same document only before the first insert; see `porpoise-doc`'s `order`
-    /// module for why that distinction gets its own crossing point.
+    /// a *display position* into a *source* — a document and a page within it; see
+    /// `porpoise-doc`'s `order` module for why that distinction gets its own crossing
+    /// point.
     order: PageOrder,
     /// Page positions laid out in a column. Rebuilt whenever [`Self::order`] changes,
     /// because the column is in display order while geometry is in source order.
@@ -173,7 +176,7 @@ struct OpenDocument {
     /// Which of [`Self::files`] the merge tab's staging viewport is currently
     /// showing, if any — `docs/goal-5-plan.md` §10.7.
     ///
-    /// A separate pointer rather than a fifth `OpenFile` field: staging never
+    /// A separate pointer rather than a third `OpenFile` field: staging never
     /// removes an entry once added (the same reason `add_file` never reuses one —
     /// see its own doc comment), so "which one is the *current* staging slot" needs
     /// its own place to live. Replacing the staged document points this at a new
@@ -219,19 +222,25 @@ fn hovered_paths(ctx: &egui::Context) -> Vec<PathBuf> {
     })
 }
 
+/// The geometry of one displayed page, resolved across whichever file it belongs
+/// to. Shared by [`geometry_in_display_order`] and [`OpenDocument::geometry_of`],
+/// which differ only in whether they resolve one source or every one `order`
+/// currently names.
+fn geometry_of(files: &[OpenFile], source: Source) -> Option<PageGeometry> {
+    files
+        .get(source.document)?
+        .document
+        .geometry()
+        .get(source.page)
+        .copied()
+}
+
 /// Page sizes in display order, for laying out the scrolling column.
 fn geometry_in_display_order(files: &[OpenFile], order: &PageOrder) -> Vec<PageGeometry> {
     order
         .as_slice()
         .iter()
-        .filter_map(|source| {
-            files
-                .get(source.document)?
-                .document
-                .geometry()
-                .get(source.page)
-                .copied()
-        })
+        .filter_map(|source| geometry_of(files, *source))
         .collect()
 }
 
@@ -243,7 +252,8 @@ impl OpenDocument {
             path,
             document: Arc::clone(&document),
         }];
-        let layout = ScrollLayout::vertical(&geometry_in_display_order(&files, &order), PAGE_GAP_PT);
+        let layout =
+            ScrollLayout::vertical(&geometry_in_display_order(&files, &order), PAGE_GAP_PT);
         let pool = RenderPool::new(
             document,
             HayroRenderer::new(),
@@ -282,7 +292,8 @@ impl OpenDocument {
     }
 
     /// Registers another file's pages as available to show, returning the document
-    /// index [`PageOrder::append`] should use for it.
+    /// index a fresh call to [`PageOrder::append`] or [`PageOrder::stage`] should
+    /// use for it.
     ///
     /// Always a new entry, never reused even if the path matches one already open:
     /// the file may have changed on disk since it was first read, and treating it as
@@ -305,12 +316,7 @@ impl OpenDocument {
     /// The geometry of one displayed page, resolved across whichever file it
     /// belongs to.
     fn geometry_of(&self, source: Source) -> Option<PageGeometry> {
-        self.files
-            .get(source.document)?
-            .document
-            .geometry()
-            .get(source.page)
-            .copied()
+        geometry_of(&self.files, source)
     }
 
     /// How many pages the currently staged document has, or 0 with nothing staged —
@@ -343,8 +349,10 @@ impl OpenDocument {
     /// runs. Cached textures are deliberately *not* touched: they are keyed by
     /// source, so moving page 300 to the front costs nothing to redraw.
     fn relayout(&mut self) {
-        self.layout =
-            ScrollLayout::vertical(&geometry_in_display_order(&self.files, &self.order), PAGE_GAP_PT);
+        self.layout = ScrollLayout::vertical(
+            &geometry_in_display_order(&self.files, &self.order),
+            PAGE_GAP_PT,
+        );
     }
 
     /// Whether every requested page has arrived and nothing is outstanding.
@@ -1134,7 +1142,11 @@ impl Viewer {
     /// staged, which is a real error rather than a no-op: an agent that calls this
     /// without staging anything first has made a mistake worth telling it about,
     /// unlike a move to a position a page is already at.
-    fn insert_pages_from_staging(&mut self, pages: &[PageNumber], at: PageNumber) -> DispatchResult {
+    fn insert_pages_from_staging(
+        &mut self,
+        pages: &[PageNumber],
+        at: PageNumber,
+    ) -> DispatchResult {
         let Some(open) = &self.open else {
             return DispatchResult::Failed(NOTHING_OPEN.to_owned());
         };
@@ -1345,7 +1357,9 @@ impl Viewer {
     fn staged_filter(&self) -> PageFilter {
         PageFilter::parse(
             &self.page_filter,
-            self.open.as_ref().map_or(0, OpenDocument::staged_page_count),
+            self.open
+                .as_ref()
+                .map_or(0, OpenDocument::staged_page_count),
         )
     }
 
@@ -1522,13 +1536,13 @@ impl Viewer {
         let Some(pos) = ctx.pointer_latest_pos() else {
             return DropZone::Elsewhere;
         };
-        if self.open.is_some()
-            && self.thumbnails
-            && self.staging_rect.is_some_and(|rect| rect.contains(pos))
-        {
+        if self.open.is_none() || !self.thumbnails {
+            return DropZone::Elsewhere;
+        }
+        if self.staging_rect.is_some_and(|rect| rect.contains(pos)) {
             return DropZone::Staging;
         }
-        if self.open.is_some() && self.thumbnails && self.thumbnails_rect.contains(pos) {
+        if self.thumbnails_rect.contains(pos) {
             return DropZone::Grid;
         }
         DropZone::Elsewhere
@@ -1587,7 +1601,11 @@ impl Viewer {
             let Ok(rung) = i16::try_from(outcome.tag) else {
                 continue;
             };
-            let key = CacheKey::new(outcome.document, outcome.page_index, ZoomBucket::from_rung(rung));
+            let key = CacheKey::new(
+                outcome.document,
+                outcome.page_index,
+                ZoomBucket::from_rung(rung),
+            );
             if let Some(open) = &mut self.open {
                 open.in_flight.retain(|pending| *pending != key);
             }
@@ -2063,8 +2081,10 @@ impl Viewer {
                 .iter()
                 .filter_map(|&page| PageNumber::new(page.saturating_add(1)))
                 .collect();
-            if let (false, Some(at)) = (pages.is_empty(), PageNumber::new(position.saturating_add(1)))
-            {
+            if let (false, Some(at)) = (
+                pages.is_empty(),
+                PageNumber::new(position.saturating_add(1)),
+            ) {
                 self.dispatch(&ctx, Command::InsertPages { pages, at });
             }
         }

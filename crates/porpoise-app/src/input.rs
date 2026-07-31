@@ -494,7 +494,10 @@ mod tests {
         // that came off a plotter or an email attachment.
         for name in ["sheet.PDF", "sheet.Pdf", "sheet.pDf"] {
             assert!(
-                matches!(drop_action(&paths(&[name]), DropZone::Elsewhere), Some(DropAction::Open { .. })),
+                matches!(
+                    drop_action(&paths(&[name]), DropZone::Elsewhere),
+                    Some(DropAction::Open { .. })
+                ),
                 "{name} was not recognised as a PDF"
             );
         }
@@ -534,7 +537,10 @@ mod tests {
         // Dropping a folder's worth of files that happens to contain one PDF should
         // open the PDF, not refuse everything because a README came first.
         assert_eq!(
-            drop_action(&paths(&["readme.txt", "sheet.pdf", "logo.png"]), DropZone::Elsewhere),
+            drop_action(
+                &paths(&["readme.txt", "sheet.pdf", "logo.png"]),
+                DropZone::Elsewhere
+            ),
             Some(DropAction::Open {
                 path: PathBuf::from("sheet.pdf"),
                 ignored: 2,
@@ -544,7 +550,8 @@ mod tests {
 
     #[test]
     fn refusing_several_files_says_how_many() {
-        let Some(DropAction::Refuse { reason }) = drop_action(&paths(&["a.txt", "b.png"]), DropZone::Elsewhere)
+        let Some(DropAction::Refuse { reason }) =
+            drop_action(&paths(&["a.txt", "b.png"]), DropZone::Elsewhere)
         else {
             panic!("neither is a PDF");
         };
@@ -553,7 +560,8 @@ mod tests {
 
     #[test]
     fn the_hint_names_the_file_that_would_open() {
-        let action = drop_action(&paths(&["plans/ROLT14.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
+        let action = drop_action(&paths(&["plans/ROLT14.pdf"]), DropZone::Elsewhere)
+            .expect("a PDF was dropped");
         let hint = action.hint(false);
         assert!(hint.contains("ROLT14.pdf"), "unhelpful: {hint}");
         // Just the file name: a full path of a hundred characters would run off both
@@ -563,8 +571,8 @@ mod tests {
 
     #[test]
     fn the_hint_says_when_other_files_will_be_ignored() {
-        let action =
-            drop_action(&paths(&["sheet.pdf", "other.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
+        let action = drop_action(&paths(&["sheet.pdf", "other.pdf"]), DropZone::Elsewhere)
+            .expect("a PDF was dropped");
         let hint = action.hint(false);
         assert!(hint.contains("ignoring 1"), "unhelpful: {hint}");
     }
@@ -574,7 +582,8 @@ mod tests {
         // So the drag can be abandoned rather than answered. It must not claim they
         // *will be lost* — `crate::confirm` asks first, and a warning that overstates
         // the stakes is one people stop believing.
-        let action = drop_action(&paths(&["sheet.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
+        let action =
+            drop_action(&paths(&["sheet.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
         assert!(!action.hint(false).contains("unsaved"));
         let warned = action.hint(true);
         assert!(warned.contains("unsaved"), "unhelpful: {warned}");
@@ -598,7 +607,8 @@ mod tests {
     fn the_insert_hint_never_mentions_unsaved_changes() {
         // Inserting is never guarded — see `crate::confirm` — so nothing is at risk to
         // warn about, unlike an open that would replace the document.
-        let action = drop_action(&paths(&["sheet.pdf"]), DropZone::Grid).expect("a PDF was dropped");
+        let action =
+            drop_action(&paths(&["sheet.pdf"]), DropZone::Grid).expect("a PDF was dropped");
         assert!(!action.hint(true).contains("unsaved"));
     }
 

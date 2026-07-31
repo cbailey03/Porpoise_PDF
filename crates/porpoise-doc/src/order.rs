@@ -164,8 +164,10 @@ impl PageOrder {
         self.on_disk.get(document).map(Vec::as_slice)
     }
 
-    /// How many documents contribute pages right now, including the one this was
-    /// opened with. The index a fresh call to [`Self::append`] should use.
+    /// How many documents this knows about — the one this was opened with, plus
+    /// every one since [`Self::append`]ed or [`Self::stage`]d — whether or not it
+    /// currently contributes a page to [`Self::as_slice`]. The index a fresh call
+    /// to [`Self::append`] or [`Self::stage`] should use.
     #[must_use]
     pub fn document_count(&self) -> usize {
         self.source_lens.len()
@@ -202,17 +204,7 @@ impl PageOrder {
             return false;
         }
         self.remember();
-        if document >= self.source_lens.len() {
-            self.source_lens.resize(document + 1, 0);
-            self.on_disk.resize(document + 1, Vec::new());
-        }
-        if let Some(len) = self.source_lens.get_mut(document) {
-            *len = page_count;
-        }
-        let pages: Vec<Source> = (0..page_count).map(|page| Source { document, page }).collect();
-        if let Some(slot) = self.on_disk.get_mut(document) {
-            *slot = pages.clone();
-        }
+        let pages = self.register(document, page_count);
         self.order.extend(pages);
         true
     }
@@ -242,6 +234,15 @@ impl PageOrder {
         if page_count == 0 {
             return false;
         }
+        self.register(document, page_count);
+        true
+    }
+
+    /// Grows [`Self::source_lens`]/[`Self::on_disk`] to include `document` if
+    /// needed, records its page count, and returns the fresh [`Source`]s naming
+    /// its pages — the bookkeeping [`Self::append`] and [`Self::stage`] share,
+    /// differing only in whether the result also joins [`Self::order`].
+    fn register(&mut self, document: usize, page_count: usize) -> Vec<Source> {
         if document >= self.source_lens.len() {
             self.source_lens.resize(document + 1, 0);
             self.on_disk.resize(document + 1, Vec::new());
@@ -249,11 +250,13 @@ impl PageOrder {
         if let Some(len) = self.source_lens.get_mut(document) {
             *len = page_count;
         }
-        let pages: Vec<Source> = (0..page_count).map(|page| Source { document, page }).collect();
+        let pages: Vec<Source> = (0..page_count)
+            .map(|page| Source { document, page })
+            .collect();
         if let Some(slot) = self.on_disk.get_mut(document) {
-            *slot = pages;
+            *slot = pages.clone();
         }
-        true
+        pages
     }
 
     /// Inserts `pages` of `document` — already known via [`Self::stage`] or
@@ -480,7 +483,10 @@ mod tests {
 
     /// Sources naming an arbitrary document, for building an expected order.
     fn from_document(document: usize, pages: impl IntoIterator<Item = usize>) -> Vec<Source> {
-        pages.into_iter().map(|page| Source { document, page }).collect()
+        pages
+            .into_iter()
+            .map(|page| Source { document, page })
+            .collect()
     }
 
     /// A run of primary-document sources, for comparing against `as_slice()`.
@@ -814,7 +820,10 @@ mod tests {
         assert!(order.move_page(2, 0));
         assert_eq!(
             order.source_of(0),
-            Some(Source { document: 1, page: 0 }),
+            Some(Source {
+                document: 1,
+                page: 0
+            }),
             "the first inserted page moved to the front like any other page would"
         );
 
@@ -830,10 +839,20 @@ mod tests {
         assert_eq!(order.document_count(), 3);
         assert_eq!(
             order.as_slice(),
-            vec![Source { document: 0, page: 0 }, Source { document: 1, page: 0 }, Source {
-                document: 2,
-                page: 0
-            }]
+            vec![
+                Source {
+                    document: 0,
+                    page: 0
+                },
+                Source {
+                    document: 1,
+                    page: 0
+                },
+                Source {
+                    document: 2,
+                    page: 0
+                }
+            ]
         );
     }
 
@@ -859,8 +878,16 @@ mod tests {
         let mut order = PageOrder::identity(3);
         assert!(order.stage(order.document_count(), 5));
 
-        assert_eq!(order.as_slice(), primary([0, 1, 2]), "staging is not an edit");
-        assert_eq!(order.document_count(), 2, "the staged document is still known");
+        assert_eq!(
+            order.as_slice(),
+            primary([0, 1, 2]),
+            "staging is not an edit"
+        );
+        assert_eq!(
+            order.document_count(),
+            2,
+            "the staged document is still known"
+        );
         assert_eq!(order.source_lens(), &[3, 5]);
         assert!(!order.can_undo(), "staging recorded an undo step");
         assert!(order.is_unedited(), "staging alone should not be an edit");
@@ -883,7 +910,10 @@ mod tests {
         // though none of them are in the order yet.
         let mut order = PageOrder::identity(2);
         assert!(order.stage(1, 3));
-        assert_eq!(order.on_disk(1), Some(from_document(1, [0, 1, 2]).as_slice()));
+        assert_eq!(
+            order.on_disk(1),
+            Some(from_document(1, [0, 1, 2]).as_slice())
+        );
     }
 
     #[test]
@@ -911,7 +941,11 @@ mod tests {
         assert_eq!(order.as_slice(), expected);
 
         assert!(order.undo());
-        assert_eq!(order.as_slice(), primary([0, 1]), "one undo removed the whole group");
+        assert_eq!(
+            order.as_slice(),
+            primary([0, 1]),
+            "one undo removed the whole group"
+        );
     }
 
     #[test]
@@ -923,7 +957,10 @@ mod tests {
         assert!(order.insert_pages(1, &[3, 1, 2], 1));
         assert_eq!(
             order.as_slice(),
-            [p(0)].into_iter().chain(from_document(1, [3, 1, 2])).collect::<Vec<_>>()
+            [p(0)]
+                .into_iter()
+                .chain(from_document(1, [3, 1, 2]))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -940,7 +977,10 @@ mod tests {
     #[test]
     fn inserting_into_an_unstaged_document_is_refused() {
         let mut order = PageOrder::identity(2);
-        assert!(!order.insert_pages(1, &[0], 1), "document 1 was never staged");
+        assert!(
+            !order.insert_pages(1, &[0], 1),
+            "document 1 was never staged"
+        );
         assert_eq!(order.as_slice(), primary([0, 1]));
         assert!(!order.can_undo());
     }
@@ -953,7 +993,11 @@ mod tests {
             !order.insert_pages(1, &[0, 9], 1),
             "page 9 does not exist in a 2-page staged document"
         );
-        assert_eq!(order.as_slice(), primary([0, 1]), "the whole call was refused");
+        assert_eq!(
+            order.as_slice(),
+            primary([0, 1]),
+            "the whole call was refused"
+        );
         assert!(!order.can_undo(), "a refused insert should not be undoable");
     }
 
@@ -983,10 +1027,20 @@ mod tests {
         assert!(order.stage(1, 1));
         assert!(order.insert_pages(1, &[0], 1));
         assert!(order.insert_pages(1, &[0], 2));
-        assert_eq!(order.as_slice(), [p(0), Source { document: 1, page: 0 }, Source {
-            document: 1,
-            page: 0
-        }]);
+        assert_eq!(
+            order.as_slice(),
+            [
+                p(0),
+                Source {
+                    document: 1,
+                    page: 0
+                },
+                Source {
+                    document: 1,
+                    page: 0
+                }
+            ]
+        );
     }
 
     #[test]
@@ -999,7 +1053,17 @@ mod tests {
         assert!(order.insert_pages(1, &[2], order.len()));
         assert_eq!(
             order.as_slice(),
-            [Source { document: 1, page: 0 }, p(0), Source { document: 1, page: 2 }]
+            [
+                Source {
+                    document: 1,
+                    page: 0
+                },
+                p(0),
+                Source {
+                    document: 1,
+                    page: 2
+                }
+            ]
         );
     }
 
@@ -1013,7 +1077,13 @@ mod tests {
         assert!(order.insert_pages(1, &[0], 1));
 
         assert!(order.move_page(1, 0));
-        assert_eq!(order.source_of(0), Some(Source { document: 1, page: 0 }));
+        assert_eq!(
+            order.source_of(0),
+            Some(Source {
+                document: 1,
+                page: 0
+            })
+        );
 
         assert!(order.remove(0));
         assert_eq!(order.len(), 2);
@@ -1028,7 +1098,10 @@ mod tests {
 
         assert!(order.stage(1, 1));
         assert!(order.insert_pages(1, &[0], 0));
-        assert!(!order.is_unedited(), "an inserted page is an unsaved change");
+        assert!(
+            !order.is_unedited(),
+            "an inserted page is an unsaved change"
+        );
     }
 
     #[test]
@@ -1218,7 +1291,10 @@ mod tests {
     fn an_appended_document_is_on_disk_as_identity_until_its_own_save() {
         let mut order = PageOrder::identity(2);
         assert!(order.append(1, 3));
-        assert_eq!(order.on_disk(1), Some(from_document(1, [0, 1, 2]).as_slice()));
+        assert_eq!(
+            order.on_disk(1),
+            Some(from_document(1, [0, 1, 2]).as_slice())
+        );
     }
 
     #[test]

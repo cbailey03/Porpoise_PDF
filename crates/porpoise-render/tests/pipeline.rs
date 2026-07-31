@@ -444,7 +444,10 @@ fn the_pool_rasterizes_from_more_than_one_document() {
         Duration::from_secs(30),
     );
     let second_index = pool.add_document(Arc::clone(&second));
-    assert_eq!(second_index, 1, "the second document should land at index 1");
+    assert_eq!(
+        second_index, 1,
+        "the second document should land at index 1"
+    );
 
     assert!(pool.submit(0, 0, 1.0, 10));
     assert!(pool.submit(second_index, 0, 1.0, 20));
@@ -455,8 +458,16 @@ fn the_pool_rasterizes_from_more_than_one_document() {
     for outcome in &outcomes {
         let page = outcome.result.as_ref().expect("should rasterize");
         match outcome.document {
-            0 => assert_eq!((page.width, page.height), (200, 100), "wrong page for document 0"),
-            1 => assert_eq!((page.width, page.height), (300, 150), "wrong page for document 1"),
+            0 => assert_eq!(
+                (page.width, page.height),
+                (200, 100),
+                "wrong page for document 0"
+            ),
+            1 => assert_eq!(
+                (page.width, page.height),
+                (300, 150),
+                "wrong page for document 1"
+            ),
             other => panic!("unexpected document index {other}"),
         }
     }
@@ -476,7 +487,11 @@ fn submitting_against_an_unregistered_document_is_refused_rather_than_queued() {
         !pool.submit(7, 0, 1.0, 0),
         "accepted a job for a document that was never added"
     );
-    assert_eq!(pool.queued(), 0, "a refused submission must not sit in the queue");
+    assert_eq!(
+        pool.queued(),
+        0,
+        "a refused submission must not sit in the queue"
+    );
 }
 
 #[test]

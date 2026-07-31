@@ -35,7 +35,11 @@ impl CacheKey {
     /// Convenience constructor.
     #[must_use]
     pub fn new(document: usize, page: usize, bucket: ZoomBucket) -> Self {
-        Self { document, page, bucket }
+        Self {
+            document,
+            page,
+            bucket,
+        }
     }
 }
 
@@ -330,8 +334,16 @@ mod tests {
     fn best_for_page_ignores_other_pages() {
         let mut cache: PageCache<u32> = PageCache::new(10_000);
         cache.insert(key(7, 1.0), 70, 10);
-        assert!(cache.best_for_page(0, 0, ZoomBucket::enclosing(1.0)).is_none());
-        assert!(cache.best_for_page(0, 7, ZoomBucket::enclosing(1.0)).is_some());
+        assert!(
+            cache
+                .best_for_page(0, 0, ZoomBucket::enclosing(1.0))
+                .is_none()
+        );
+        assert!(
+            cache
+                .best_for_page(0, 7, ZoomBucket::enclosing(1.0))
+                .is_some()
+        );
     }
 
     #[test]
@@ -341,10 +353,16 @@ mod tests {
         let mut cache: PageCache<u32> = PageCache::new(10_000);
         cache.insert(key_in(1, 3, 1.0), 13, 10);
         assert!(
-            cache.best_for_page(0, 3, ZoomBucket::enclosing(1.0)).is_none(),
+            cache
+                .best_for_page(0, 3, ZoomBucket::enclosing(1.0))
+                .is_none(),
             "offered another document's page as a fallback"
         );
-        assert!(cache.best_for_page(1, 3, ZoomBucket::enclosing(1.0)).is_some());
+        assert!(
+            cache
+                .best_for_page(1, 3, ZoomBucket::enclosing(1.0))
+                .is_some()
+        );
     }
 
     #[test]

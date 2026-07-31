@@ -73,7 +73,11 @@ fn merging_appends_the_second_documents_pages() {
     save_reordered(&[a, b], &order, &saved, Overwrite::Refuse).expect("should merge and save");
 
     let document = Document::open(&saved).expect("the merged file should open");
-    assert_eq!(document.page_count(), 5, "lost or gained pages while merging");
+    assert_eq!(
+        document.page_count(),
+        5,
+        "lost or gained pages while merging"
+    );
 
     for (position, expected) in before_a.iter().enumerate() {
         assert_same(
@@ -116,10 +120,26 @@ fn an_inserted_page_can_be_moved_before_saving() {
 
     let document = Document::open(&saved).expect("should open");
     assert_eq!(document.page_count(), 4);
-    assert_same(&render(&saved, 0), &before_b[0], "position 0 should be B's first page");
-    assert_same(&render(&saved, 1), &before_a[0], "position 1 should be A's first page");
-    assert_same(&render(&saved, 2), &before_a[1], "position 2 should be A's second page");
-    assert_same(&render(&saved, 3), &before_b[1], "position 3 should be B's second page");
+    assert_same(
+        &render(&saved, 0),
+        &before_b[0],
+        "position 0 should be B's first page",
+    );
+    assert_same(
+        &render(&saved, 1),
+        &before_a[0],
+        "position 1 should be A's first page",
+    );
+    assert_same(
+        &render(&saved, 2),
+        &before_a[1],
+        "position 2 should be A's second page",
+    );
+    assert_same(
+        &render(&saved, 3),
+        &before_b[1],
+        "position 3 should be B's second page",
+    );
 }
 
 #[test]
@@ -138,7 +158,11 @@ fn deleting_an_inserted_page_before_saving_drops_only_that_page() {
 
     let document = Document::open(&saved).expect("should open");
     assert_eq!(document.page_count(), 2);
-    assert_same(&render(&saved, 0), &render(&a, 0), "position 0 should still be A's page");
+    assert_same(
+        &render(&saved, 0),
+        &render(&a, 0),
+        "position 0 should still be A's page",
+    );
     assert_same(
         &render(&saved, 1),
         &before_b[1],
@@ -168,6 +192,72 @@ fn a_page_count_mismatch_in_the_inserted_document_is_refused() {
 }
 
 #[test]
+fn a_staged_but_never_inserted_document_does_not_block_saving() {
+    // Staging registers a document with `PageOrder` (`stage`, not `append`) before
+    // any of its pages are ever placed — the merge tab does this the moment a
+    // second file is opened, whether or not anything is ever dragged from it. A
+    // document that never contributes a page has no business being load-bearing:
+    // if it is later moved, deleted, or edited elsewhere, that must not stop a
+    // save of the document actually being edited.
+    let a = fixture("merge-stage-only-a.pdf", 2);
+    let b = fixture("merge-stage-only-b.pdf", 2);
+    let before_a: Vec<RenderedPage> = (0..2).map(|page| render(&a, page)).collect();
+
+    let mut order = PageOrder::identity(2);
+    assert!(order.stage(1, 2));
+    assert_eq!(
+        order.as_slice().len(),
+        2,
+        "staging alone must not add pages to the order"
+    );
+
+    // Gone by the time of the save — exactly what happens if the staged file is
+    // deleted, or is itself a scratch file the caller cleans up, sometime after
+    // being staged.
+    std::fs::remove_file(&b).expect("should remove the staged file");
+
+    let saved = scratch("merge-stage-only-out.pdf");
+    save_reordered(&[a, b], &order, &saved, Overwrite::Refuse)
+        .expect("a document that was only ever staged must not be read at save time");
+
+    let document = Document::open(&saved).expect("should open");
+    assert_eq!(
+        document.page_count(),
+        2,
+        "only the primary document's pages should be saved"
+    );
+    for (position, expected) in before_a.iter().enumerate() {
+        assert_same(
+            &render(&saved, position),
+            expected,
+            &format!("position {position} should be unchanged"),
+        );
+    }
+}
+
+#[test]
+fn a_mismatched_source_list_is_refused_rather_than_panicking() {
+    // `sources` and `order` falling out of sync is a caller bug this module cannot
+    // rule out at the type level (see `save_reordered`'s own doc comment) — and it
+    // runs on a background thread (`porpoise-app`'s `saver.rs`), where a panic
+    // would drop the result silently instead of ever reaching whoever is waiting
+    // on the save. Refused like every other invariant here, not asserted.
+    let a = fixture("merge-mismatch-sources-a.pdf", 2);
+
+    let mut order = PageOrder::identity(2);
+    assert!(order.append(1, 2)); // order now spans 2 documents...
+
+    let saved = scratch("merge-mismatch-sources-out.pdf");
+    let error = save_reordered(&[a], &order, &saved, Overwrite::Refuse) // ...but only 1 source given
+        .expect_err("should refuse rather than panic");
+    assert!(
+        matches!(error, SaveError::PageTree { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert!(!saved.exists(), "refused and still created a file");
+}
+
+#[test]
 fn merging_a_third_document_folds_in_alongside_the_first_two() {
     let a = fixture("merge-three-a.pdf", 1);
     let b = fixture("merge-three-b.pdf", 1);
@@ -184,6 +274,10 @@ fn merging_a_third_document_folds_in_alongside_the_first_two() {
     let document = Document::open(&saved).expect("should open");
     assert_eq!(document.page_count(), 3);
     for (position, expected) in before.iter().enumerate() {
-        assert_same(&render(&saved, position), expected, &format!("position {position}"));
+        assert_same(
+            &render(&saved, position),
+            expected,
+            &format!("position {position}"),
+        );
     }
 }

@@ -228,15 +228,30 @@ mod tests {
     }
 
     #[test]
+    fn the_purpose_a_staging_dialog_was_opened_for_is_remembered() {
+        // `Purpose::Stage` on the same footing as `Insert` and `Open` above — the
+        // merge tab's dialog is not a special case the getter treats differently.
+        let (_sender, receiver) = channel();
+        let picker = FilePicker::with_pending_for(receiver, Purpose::Stage);
+        assert_eq!(picker.purpose(), Purpose::Stage);
+    }
+
+    #[test]
     fn a_second_open_while_one_is_running_does_not_change_the_purpose() {
         // The live dialog keeps answering what it was originally asked, even if a
         // second request — for the other purpose — arrives while it is still up.
         let (sender, receiver) = channel();
         let mut picker = FilePicker::with_pending_for(receiver, Purpose::Insert);
         picker.open(Purpose::Open);
-        assert_eq!(picker.purpose(), Purpose::Insert, "a dropped request changed the purpose");
+        assert_eq!(
+            picker.purpose(),
+            Purpose::Insert,
+            "a dropped request changed the purpose"
+        );
 
-        sender.send(Some(PathBuf::from("b.pdf"))).expect("still listening");
+        sender
+            .send(Some(PathBuf::from("b.pdf")))
+            .expect("still listening");
         assert_eq!(picker.poll(), Some(PathBuf::from("b.pdf")));
     }
 }

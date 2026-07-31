@@ -354,8 +354,11 @@ primitives M14 built.
 
 **M23.** Launch the real binary, drive it over a real pipe: open A, `insert_file` B,
 confirm `page_count` is the sum of both, save, and reopen the saved file to confirm
-the tail pages are B's. The same evidentiary bar Goal 2's M10 and Goal 4's M15 both
-insist on — a claim about what got written to disk is only real once something
+the combined page count survived. Content — that the tail pages really are B's, not
+just that there are enough of them — is `porpoise-render`'s job (`tests/merge.rs`
+rasterizes and compares pixels); this proves the command path reaches that result,
+not the bytes themselves. The same evidentiary bar Goal 2's M10 and Goal 4's M15
+both insist on — a claim about what got written to disk is only real once something
 reads it back.
 
 **M24.** Optional. Only worth doing once M21 exists to wrap; if the interactive
@@ -696,13 +699,18 @@ close control on the staging viewport for `ClearStaging`.
   zero pages to `order`) is left open — see §10.9. Both produce the same externally
   visible behavior; the second reuses more of M20's existing plumbing.
 - `confirm.rs`: `StageDocument`, `ClearStaging`, and `InsertPages` join `InsertFile`
-  in the unguarded arm, each pinned by its own test the way
+  in the unguarded arm, ~~each pinned by its own test the way
   `inserting_a_file_is_never_guarded_because_it_only_adds_pages` already pins
-  `InsertFile`.
+  `InsertFile`~~. **Landed as one test covering all three**
+  (`staging_and_inserting_pages_are_never_guarded`) rather than three separate
+  ones — a regression that broke only one command's guard-exemption would not be
+  localized by test name the way the plan intended.
 - `protocol.rs`: given §9a's own finding that the hand-written decoder has no
-  exhaustive-coverage check, each new command's decoder arm gets a test pinning its
-  wire form specifically, rather than assuming the general fix (still open,
-  unstarted follow-up work) lands first.
+  exhaustive-coverage check, ~~each new command's decoder arm gets a test pinning
+  its wire form specifically~~ **landed the same way as `confirm.rs` above: one
+  test for all three** (`the_merge_tab_commands_decode_with_their_arguments`),
+  rather than assuming the general fix (still open, unstarted follow-up work)
+  lands first.
 
 ### 10.8 Milestones
 
@@ -835,7 +843,7 @@ survived. A screenshot taken the same way confirmed the toolbar's new **Stage a
 file…** button and both live viewports render real thumbnails, not just the M27
 placeholder.
 
-Each new command's decoder arm got its own pinned test
+All three new commands' decoder arms are pinned by one combined test
 (`the_merge_tab_commands_decode_with_their_arguments`), per §9a's own finding
 about `insert_file` — not deferred to the general exhaustive-coverage fix, which
 is still unstarted follow-up work.
@@ -874,3 +882,40 @@ place, and save — all reachable by hand and by an agent, over the same command
    Staging reuses `add_file` exactly as `InsertFile` does; `staging` only ever
    says which entry is the current slot. See M28's retrospective.
 3. **M30**, deferred rather than decided against.
+
+### 10.10 Hardening found by a review after "done"
+
+A review across the backend, the app's state layer, the UI, and the tests turned
+up one real correctness gap the milestones above did not catch: staging a
+document registers it with `PageOrder` permanently — `stage` has no `unstage`,
+by the same "never reuse a document index" rule `append` already follows — but
+`save_reordered` was loading, renumbering, and flatness-checking *every*
+registered document on *every* save, including ones that had only ever been
+staged and never had a page inserted. Stage a file to look at it, decide not to
+merge from it, clear staging — and every save from then on silently depended on
+that file still existing and still parsing, for no reason connected to what was
+actually being saved.
+
+**Fixed** in `save_reordered`: a document not named by any `Source` currently in
+`order.as_slice()` is now skipped entirely rather than loaded — an empty page
+table stands in for it, since nothing will ever look one up there.
+`porpoise-render`'s `tests/merge.rs` gained
+`a_staged_but_never_inserted_document_does_not_block_saving`, which stages a
+document, deletes its file, and confirms the save still succeeds.
+
+The same pass replaced the `assert_eq!` at the top of `save_reordered` — guarding
+a mismatch between `sources` and `order.document_count()`, a caller bug the type
+system cannot rule out — with a proper `SaveError`. A panic there would run on
+the background thread `saver.rs` spawns for every save, and would have dropped
+the result silently rather than ever reaching whoever was waiting on it.
+
+It also found and fixed several stale doc comments this goal introduced
+(`OpenDocument::order`'s "identity" claim contradicting itself over what counts
+as an edit, a miscounted `OpenFile` field reference, `PageCountMismatch::opened`
+still describing what a document was "opened with" after this goal moved its
+real source to `PageOrder::on_disk`, and the "M23" and "each pinned by its own
+test" claims corrected above) and two small duplications (`PageOrder::append`/
+`stage`'s registration bookkeeping, and the layout-metrics block shared by
+`draw_single_grid`/`draw_staged_grid`) — none behavior-changing, recorded here
+because a plan document going stale the moment a review looks past it is the
+same problem in miniature.

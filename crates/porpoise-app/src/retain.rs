@@ -139,7 +139,10 @@ mod tests {
         // A merged document can show page 0 of two different files at once. The column's
         // window and the grid's set both name sources, not bare page numbers, so a page
         // from document 1 must never be confused with document 0's page of the same number.
-        let inserted = Source { document: 1, page: 0 };
+        let inserted = Source {
+            document: 1,
+            page: 0,
+        };
         let source_of = move |position: usize| match position {
             0 => Some(p(0)),
             1 => Some(inserted),
@@ -148,6 +151,10 @@ mod tests {
         let keep = pages_to_keep(&(0..2), 0, Vec::new(), source_of);
         assert!(keep.contains(&p(0)));
         assert!(keep.contains(&inserted));
-        assert_eq!(keep.len(), 2, "the two documents' pages collapsed into one: {keep:?}");
+        assert_eq!(
+            keep.len(),
+            2,
+            "the two documents' pages collapsed into one: {keep:?}"
+        );
     }
 }

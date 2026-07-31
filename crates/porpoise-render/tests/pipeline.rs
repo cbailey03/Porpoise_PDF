@@ -411,7 +411,7 @@ fn the_pool_rasterizes_every_submitted_page() {
     );
 
     for tag in 0..4 {
-        assert!(pool.submit(0, 1.0, tag), "submit should be accepted");
+        assert!(pool.submit(0, 0, 1.0, tag), "submit should be accepted");
     }
 
     let outcomes = drain_outcomes(&pool, 4, Duration::from_secs(30));
@@ -430,6 +430,56 @@ fn the_pool_rasterizes_every_submitted_page() {
 }
 
 #[test]
+fn the_pool_rasterizes_from_more_than_one_document() {
+    // What a merge needs: pages queued against different documents must come back
+    // rasterized from the *right* one, not conflated because they share a page
+    // index or a tag.
+    let first = Arc::new(open_minimal());
+    let second = Arc::new(Document::from_bytes(single_page_pdf(300, 150)).expect("should parse"));
+
+    let pool = porpoise_render::RenderPool::new(
+        Arc::clone(&first),
+        HayroRenderer::new(),
+        2,
+        Duration::from_secs(30),
+    );
+    let second_index = pool.add_document(Arc::clone(&second));
+    assert_eq!(second_index, 1, "the second document should land at index 1");
+
+    assert!(pool.submit(0, 0, 1.0, 10));
+    assert!(pool.submit(second_index, 0, 1.0, 20));
+
+    let outcomes = drain_outcomes(&pool, 2, Duration::from_secs(30));
+    assert_eq!(outcomes.len(), 2);
+
+    for outcome in &outcomes {
+        let page = outcome.result.as_ref().expect("should rasterize");
+        match outcome.document {
+            0 => assert_eq!((page.width, page.height), (200, 100), "wrong page for document 0"),
+            1 => assert_eq!((page.width, page.height), (300, 150), "wrong page for document 1"),
+            other => panic!("unexpected document index {other}"),
+        }
+    }
+}
+
+#[test]
+fn submitting_against_an_unregistered_document_is_refused_rather_than_queued() {
+    let document = Arc::new(open_minimal());
+    let pool = porpoise_render::RenderPool::new(
+        document,
+        HayroRenderer::new(),
+        1,
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        !pool.submit(7, 0, 1.0, 0),
+        "accepted a job for a document that was never added"
+    );
+    assert_eq!(pool.queued(), 0, "a refused submission must not sit in the queue");
+}
+
+#[test]
 fn the_pool_reports_render_errors_rather_than_dropping_them() {
     let document = Arc::new(open_minimal());
     let pool = porpoise_render::RenderPool::new(
@@ -439,7 +489,7 @@ fn the_pool_reports_render_errors_rather_than_dropping_them() {
         Duration::from_secs(30),
     );
 
-    pool.submit(99, 1.0, 0);
+    pool.submit(0, 99, 1.0, 0);
 
     let outcomes = drain_outcomes(&pool, 1, Duration::from_secs(30));
     let outcome = outcomes.first().expect("an outcome for a bad page");
@@ -468,7 +518,7 @@ fn cancel_pending_drops_queued_work() {
     );
 
     for tag in 0..8 {
-        pool.submit(0, 1.0, tag);
+        pool.submit(0, 0, 1.0, tag);
     }
     let dropped = pool.cancel_pending();
 
@@ -496,7 +546,7 @@ fn a_hung_render_does_not_permanently_consume_a_worker() {
 
     // Three jobs that all hang. With a healthy worker each times out in turn.
     for tag in 0..3 {
-        pool.submit(0, 1.0, tag);
+        pool.submit(0, 0, 1.0, tag);
     }
 
     let outcomes = drain_outcomes(&pool, 3, Duration::from_secs(20));
@@ -528,7 +578,7 @@ fn a_full_queue_is_bounded_rather_than_unbounded() {
 
     // Far more than the internal cap.
     for tag in 0..500 {
-        pool.submit(0, 1.0, tag);
+        pool.submit(0, 0, 1.0, tag);
     }
     assert!(
         pool.queued() <= 64,

@@ -15,9 +15,14 @@
 
 use std::path::{Path, PathBuf};
 
-use porpoise_doc::{Document, Overwrite, PageOrder, SaveError, save_reordered};
+use porpoise_doc::{Document, Overwrite, PageOrder, SaveError, Source, save_reordered};
 use porpoise_render::{HayroRenderer, RenderRequest, RenderedPage, Renderer};
 use porpoise_testkit::{multi_page_pdf, pixel_diff, single_page_pdf};
+
+/// A page of the one document these tests save from, before merging existed.
+fn p(page: usize) -> Source {
+    Source { document: 0, page }
+}
 
 /// Pages in the fixture. Each one's rectangle is inset differently, so any two
 /// rasterize to visibly different images — without that, a reorder test could pass on
@@ -87,10 +92,10 @@ fn reversing_a_document_puts_the_last_page_first() {
     for step in 0..PAGES {
         order.move_page(PAGES - 1, step);
     }
-    assert_eq!(order.as_slice(), &[3, 2, 1, 0]);
+    assert_eq!(order.as_slice(), vec![p(3), p(2), p(1), p(0)]);
 
     let saved = scratch("reorder-reverse-out.pdf");
-    save_reordered(&source, &order, &saved, Overwrite::Refuse).expect("should save");
+    save_reordered(std::slice::from_ref(&source), &order, &saved, Overwrite::Refuse).expect("should save");
 
     let document = Document::open(&saved).expect("the saved file should open");
     assert_eq!(document.page_count(), PAGES, "lost or gained pages");
@@ -118,7 +123,7 @@ fn moving_one_page_leaves_the_others_alone() {
     assert!(order.move_page(0, 2));
 
     let saved = scratch("reorder-one-out.pdf");
-    save_reordered(&source, &order, &saved, Overwrite::Refuse).expect("should save");
+    save_reordered(std::slice::from_ref(&source), &order, &saved, Overwrite::Refuse).expect("should save");
 
     for (position, source_page) in [(0, 1), (1, 2), (2, 0), (3, 3)] {
         assert_same(
@@ -138,7 +143,7 @@ fn a_deleted_page_is_gone_and_the_rest_close_up() {
     assert!(order.remove(1));
 
     let saved = scratch("reorder-delete-out.pdf");
-    save_reordered(&source, &order, &saved, Overwrite::Refuse).expect("should save");
+    save_reordered(std::slice::from_ref(&source), &order, &saved, Overwrite::Refuse).expect("should save");
 
     let document = Document::open(&saved).expect("should open");
     assert_eq!(document.page_count(), PAGES - 1);
@@ -162,7 +167,7 @@ fn saving_over_the_original_replaces_it() {
     let mut order = PageOrder::identity(PAGES);
     assert!(order.move_page(0, 3));
 
-    save_reordered(&source, &order, &source, Overwrite::Allow).expect("should save in place");
+    save_reordered(std::slice::from_ref(&source), &order, &source, Overwrite::Allow).expect("should save in place");
 
     let document = Document::open(&source).expect("the original should still open");
     assert_eq!(document.page_count(), PAGES);
@@ -185,7 +190,7 @@ fn save_as_refuses_to_replace_an_existing_file() {
 
     let order = PageOrder::identity(PAGES);
     let error =
-        save_reordered(&source, &order, &occupied, Overwrite::Refuse).expect_err("should refuse");
+        save_reordered(std::slice::from_ref(&source), &order, &occupied, Overwrite::Refuse).expect_err("should refuse");
     assert!(
         matches!(error, SaveError::WouldOverwrite { .. }),
         "unexpected error: {error:?}"
@@ -207,7 +212,7 @@ fn a_page_count_the_writer_disagrees_with_is_refused() {
     let saved = scratch("reorder-mismatch-out.pdf");
 
     let error =
-        save_reordered(&source, &order, &saved, Overwrite::Refuse).expect_err("should refuse");
+        save_reordered(std::slice::from_ref(&source), &order, &saved, Overwrite::Refuse).expect_err("should refuse");
     assert!(
         matches!(error, SaveError::PageCountMismatch { .. }),
         "unexpected error: {error:?}"
@@ -223,11 +228,76 @@ fn a_refused_save_leaves_no_partial_file_behind() {
     let saved = scratch("reorder-partial-out.pdf");
     let order = PageOrder::identity(PAGES + 1);
 
-    let _ = save_reordered(&source, &order, &saved, Overwrite::Refuse);
+    let _ = save_reordered(std::slice::from_ref(&source), &order, &saved, Overwrite::Refuse);
 
     let mut partial = saved.as_os_str().to_owned();
     partial.push(".porpoise-partial");
     assert!(!Path::new(&partial).exists(), "left a partial file behind");
+}
+
+#[test]
+fn deleting_then_saving_then_editing_again_saves_correctly_a_second_time() {
+    // The exact bug this pins down: `PageOrder::source_lens` used to be fixed at
+    // open time and never updated after a save. A delete changes the file's
+    // physical page count, so a second save over the same path re-read a file with
+    // fewer pages than the (stale) count claimed, and refused with
+    // `PageCountMismatch` even though nothing was actually wrong. See
+    // `docs/goal-5-plan.md` §9a.
+    let source = fixture("reorder-twice-delete.pdf");
+    let before: Vec<RenderedPage> = (0..PAGES).map(|page| render(&source, page)).collect();
+
+    let mut order = PageOrder::identity(PAGES);
+    assert!(order.remove(0)); // [1,2,3]
+    save_reordered(std::slice::from_ref(&source), &order, &source, Overwrite::Allow)
+        .expect("first save should succeed");
+    let written = order.as_slice().to_vec();
+    order.mark_saved(0, &written);
+
+    assert!(order.move_page(0, 1)); // [2,1,3]
+    save_reordered(std::slice::from_ref(&source), &order, &source, Overwrite::Allow)
+        .expect("second save over the same path should succeed, not refuse with PageCountMismatch");
+
+    let document = Document::open(&source).expect("the twice-saved file should open");
+    assert_eq!(document.page_count(), PAGES - 1);
+    for (position, source_page) in [(0, 2), (1, 1), (2, 3)] {
+        assert_same(
+            &render(&source, position),
+            &before[source_page],
+            &format!("position {position} should be original page {source_page}"),
+        );
+    }
+}
+
+#[test]
+fn reordering_then_saving_twice_over_the_same_path_does_not_scramble_pages() {
+    // A page count alone is not enough to catch every case: two plain reorders,
+    // with no delete between them, leave the count unchanged at every step, so a
+    // stale count check would never fire — yet without tracking what the file
+    // physically holds after the first save, the second save silently wrote the
+    // wrong pages. See `docs/goal-5-plan.md` §9a.
+    let source = fixture("reorder-twice-move.pdf");
+    let before: Vec<RenderedPage> = (0..PAGES).map(|page| render(&source, page)).collect();
+
+    let mut order = PageOrder::identity(PAGES);
+    assert!(order.move_page(0, 3)); // [1,2,3,0]
+    save_reordered(std::slice::from_ref(&source), &order, &source, Overwrite::Allow)
+        .expect("first save should succeed");
+    let written = order.as_slice().to_vec();
+    order.mark_saved(0, &written);
+
+    assert!(order.move_page(0, 1)); // [2,1,3,0]
+    save_reordered(std::slice::from_ref(&source), &order, &source, Overwrite::Allow)
+        .expect("second save should succeed");
+
+    let document = Document::open(&source).expect("the twice-saved file should open");
+    assert_eq!(document.page_count(), PAGES);
+    for (position, source_page) in [(0, 2), (1, 1), (2, 3), (3, 0)] {
+        assert_same(
+            &render(&source, position),
+            &before[source_page],
+            &format!("position {position} should be original page {source_page}, not whatever the first save happened to leave there"),
+        );
+    }
 }
 
 #[test]
@@ -240,7 +310,8 @@ fn a_single_page_document_saves_unchanged() {
 
     let order = PageOrder::identity(1);
     let saved = scratch("reorder-single-out.pdf");
-    save_reordered(&path, &order, &saved, Overwrite::Refuse).expect("should save");
+    save_reordered(std::slice::from_ref(&path), &order, &saved, Overwrite::Refuse)
+        .expect("should save");
 
     let document = Document::open(&saved).expect("should open");
     assert_eq!(document.page_count(), 1);

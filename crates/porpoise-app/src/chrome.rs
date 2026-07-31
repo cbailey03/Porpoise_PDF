@@ -24,18 +24,23 @@
 //! `&mut Viewer` while `ui` holds the borrow. The one exception is **Open…**, which asks
 //! a person a question rather than having an effect, so it comes back as its own flag —
 //! see [`crate::picker`] for why the dialog is not a command.
+//!
+//! None of these controls is drawn by hand. Every one goes through [`crate::button`], which
+//! is where "a lit button and a live key binding cannot disagree" is enforced.
 
 use std::path::Path;
 
 use eframe::egui;
 use porpoise_view::{ScrollMode, ViewCommand, ZoomTarget};
 
+use crate::button::{Action, Glyph, Toggle, button, toggle};
 use crate::command::Command;
 use crate::confirm::Answer;
 use crate::devtools::FrameTiming;
 use crate::edits::Edits;
 use crate::input::DropAction;
 use crate::label::file_label;
+use crate::picker::Purpose;
 
 /// Point size of the text in the two overlays.
 const OVERLAY_TEXT_PT: f32 = 20.0;
@@ -52,14 +57,17 @@ pub(crate) struct Toolbar<'a> {
     pub(crate) thumbnails: bool,
     /// Whether a file dialog is already up, so a second click cannot stack one.
     pub(crate) picker_open: bool,
+    /// Whether a document is open, so **Add pages…** has something to insert into.
+    pub(crate) document_open: bool,
 }
 
 /// What the toolbar was asked for this frame.
 pub(crate) struct Clicked {
     /// Commands to dispatch, in the order they were clicked.
     pub(crate) commands: Vec<Command>,
-    /// The **Open…** button. Not a command; see the module docs.
-    pub(crate) open_picker: bool,
+    /// **Open…** or **Add pages…**, naming which one — neither is a command; see the
+    /// module docs and `docs/goal-5-plan.md` §6.
+    pub(crate) open_picker: Option<Purpose>,
 }
 
 /// What the status bar reads.
@@ -106,147 +114,172 @@ pub(crate) struct StatusDocument {
 /// Draws the toolbar and reports what was clicked.
 pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
     let mut commands = Vec::new();
-    let mut open_picker = false;
+    let mut open_picker = None;
 
+    // `extend` rather than `push` throughout: every control hands back an `Option` of what
+    // it produced, and an `Option` iterates over nothing when it is `None`.
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!state.picker_open, egui::Button::new("Open…"))
-            .on_hover_text("Open a PDF (Ctrl+O), or drag one onto the window")
-            .clicked()
+        // The unit payload is the odd one out, because **Open…** is one of two controls
+        // with nothing to dispatch — see the module docs.
+        if button(
+            ui,
+            Action {
+                text: "Open…",
+                hover: "Open a PDF (Ctrl+O), or drag one onto the window",
+                // Greyed out while a dialog is already up, so a second click cannot
+                // stack one.
+                produces: (!state.picker_open).then_some(()),
+            },
+        )
+        .is_some()
         {
-            open_picker = true;
+            open_picker = Some(Purpose::Open);
+        }
+
+        // Needs a document to add to, and reuses the same dialog rather than growing a
+        // second one — see `docs/goal-5-plan.md` §6. Dropping a file onto the page grid
+        // does the same thing without opening a dialog at all.
+        if button(
+            ui,
+            Action {
+                text: "Add pages…",
+                hover: "Add every page of another PDF to the end of this one, \
+                        or drag one onto the page grid",
+                produces: (state.document_open && !state.picker_open).then_some(()),
+            },
+        )
+        .is_some()
+        {
+            open_picker = Some(Purpose::Insert);
         }
         ui.separator();
 
-        if ui
-            .selectable_label(state.thumbnails, "Pages")
-            .on_hover_text("Show the page grid, to jump to a page or drag pages around (Ctrl+T)")
-            .clicked()
-        {
-            commands.push(state.edits.toggle_thumbnails.clone());
-        }
+        commands.extend(toggle(
+            ui,
+            Toggle {
+                text: "Pages",
+                hover: "Show the page grid, to jump to a page or drag pages around (Ctrl+T)",
+                on: state.thumbnails,
+                produces: state.edits.toggle_thumbnails.clone(),
+            },
+        ));
         ui.separator();
 
-        if ui.button("⏮").on_hover_text("First page (Home)").clicked() {
-            commands.push(ViewCommand::FirstPage.into());
-        }
-        if ui.button("⏭").on_hover_text("Last page (End)").clicked() {
-            commands.push(ViewCommand::LastPage.into());
-        }
+        // `Some` unconditionally: paging and zooming apply whatever is open, and with no
+        // document at all the view refuses them quietly rather than failing. Spelled out
+        // because it is the one place a control does *not* gate on a situation.
+        commands.extend(button(
+            ui,
+            Action {
+                text: Glyph::FirstPage.text(),
+                hover: "First page (Home)",
+                produces: Some(ViewCommand::FirstPage.into()),
+            },
+        ));
+        commands.extend(button(
+            ui,
+            Action {
+                text: Glyph::LastPage.text(),
+                hover: "Last page (End)",
+                produces: Some(ViewCommand::LastPage.into()),
+            },
+        ));
         ui.separator();
 
         // Page editing. Words rather than arrow glyphs: U+2191/U+2193 are missing from
         // egui's bundled fonts and rendered as empty boxes — caught by looking at a
         // capture of the real toolbar rather than by any test.
-        edit_button(
-            ui,
-            &mut commands,
-            "Up",
-            "Move this page earlier (Ctrl+Up)",
-            state.edits.move_earlier.as_ref(),
-        );
-        edit_button(
-            ui,
-            &mut commands,
-            "Down",
-            "Move this page later (Ctrl+Down)",
-            state.edits.move_later.as_ref(),
-        );
-        edit_button(
-            ui,
-            &mut commands,
-            "Delete",
-            "Delete this page",
-            state.edits.delete.as_ref(),
-        );
-        edit_button(
-            ui,
-            &mut commands,
-            "Undo",
-            "Undo the last page edit (Ctrl+Z)",
-            state.edits.undo.as_ref(),
-        );
-        edit_button(
-            ui,
-            &mut commands,
-            "Save",
-            "Write the changes over the file (Ctrl+S)",
-            state.edits.save.as_ref(),
-        );
+        //
+        // A loop, because these five differ only in their wording and which field of
+        // [`Edits`] they come from. Each is enabled exactly when that field holds a
+        // command, which is the whole point — see [`crate::button`].
+        for (text, hover, command) in [
+            (
+                "Up",
+                "Move this page earlier (Ctrl+Up)",
+                &state.edits.move_earlier,
+            ),
+            (
+                "Down",
+                "Move this page later (Ctrl+Down)",
+                &state.edits.move_later,
+            ),
+            ("Delete", "Delete this page", &state.edits.delete),
+            (
+                "Undo",
+                "Undo the last page edit (Ctrl+Z)",
+                &state.edits.undo,
+            ),
+            (
+                "Save",
+                "Write the changes over the file (Ctrl+S)",
+                &state.edits.save,
+            ),
+        ] {
+            commands.extend(button(
+                ui,
+                Action {
+                    text,
+                    hover,
+                    produces: command.clone(),
+                },
+            ));
+        }
         ui.separator();
 
-        if ui.button("−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
-            commands.push(ViewCommand::StepZoom { rungs: -1 }.into());
-        }
-        if ui.button("+").on_hover_text("Zoom in (Ctrl++)").clicked() {
-            commands.push(ViewCommand::StepZoom { rungs: 1 }.into());
-        }
-        if ui
-            .selectable_label(state.zoom_target == ZoomTarget::FitWidth, "Width")
-            .on_hover_text("Fit width (Ctrl+0)")
-            .clicked()
-        {
-            commands.push(
-                ViewCommand::SetZoom {
-                    target: ZoomTarget::FitWidth,
-                }
-                .into(),
-            );
-        }
-        if ui
-            .selectable_label(state.zoom_target == ZoomTarget::FitPage, "Page")
-            .on_hover_text("Fit page (Ctrl+2)")
-            .clicked()
-        {
-            commands.push(
-                ViewCommand::SetZoom {
-                    target: ZoomTarget::FitPage,
-                }
-                .into(),
-            );
+        commands.extend(button(
+            ui,
+            Action {
+                text: Glyph::ZoomOut.text(),
+                hover: "Zoom out (Ctrl+-)",
+                produces: Some(ViewCommand::StepZoom { rungs: -1 }.into()),
+            },
+        ));
+        commands.extend(button(
+            ui,
+            Action {
+                text: Glyph::ZoomIn.text(),
+                hover: "Zoom in (Ctrl++)",
+                produces: Some(ViewCommand::StepZoom { rungs: 1 }.into()),
+            },
+        ));
+        for (text, hover, target) in [
+            ("Width", "Fit width (Ctrl+0)", ZoomTarget::FitWidth),
+            ("Page", "Fit page (Ctrl+2)", ZoomTarget::FitPage),
+        ] {
+            commands.extend(toggle(
+                ui,
+                Toggle {
+                    text,
+                    hover,
+                    on: state.zoom_target == target,
+                    produces: ViewCommand::SetZoom { target }.into(),
+                },
+            ));
         }
         ui.separator();
 
         // Paged versus free changes what PageDown and Space mean.
         let paged = state.scroll_mode == ScrollMode::Paged;
-        if ui
-            .selectable_label(paged, "Paged")
-            .on_hover_text("Page-by-page instead of continuous scrolling")
-            .clicked()
-        {
-            let mode = if paged {
-                ScrollMode::Free
-            } else {
-                ScrollMode::Paged
-            };
-            commands.push(ViewCommand::SetScrollMode { mode }.into());
-        }
+        let mode = if paged {
+            ScrollMode::Free
+        } else {
+            ScrollMode::Paged
+        };
+        commands.extend(toggle(
+            ui,
+            Toggle {
+                text: "Paged",
+                hover: "Page-by-page instead of continuous scrolling",
+                on: paged,
+                produces: ViewCommand::SetScrollMode { mode }.into(),
+            },
+        ));
     });
 
     Clicked {
         commands,
         open_picker,
-    }
-}
-
-/// One page-edit button, enabled exactly when there is a command for it.
-///
-/// The whole point of taking the command as the enabled state: a lit button and a live
-/// key binding cannot disagree, because they are the same `Option`.
-fn edit_button(
-    ui: &mut egui::Ui,
-    commands: &mut Vec<Command>,
-    text: &str,
-    hover: &str,
-    command: Option<&Command>,
-) {
-    if ui
-        .add_enabled(command.is_some(), egui::Button::new(text))
-        .on_hover_text(hover)
-        .clicked()
-        && let Some(command) = command
-    {
-        commands.push(command.clone());
     }
 }
 
@@ -338,23 +371,32 @@ pub(crate) fn question(ctx: &egui::Context, what: &str) -> Option<Answer> {
         ));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            // Save first, because it is the answer that loses nothing.
-            if ui
-                .button("Save, then continue")
-                .on_hover_text("Write the changes over the file, then go ahead")
-                .clicked()
-            {
-                choice = Some(Answer::Save);
-            }
-            if ui
-                .button("Discard changes")
-                .on_hover_text("Go ahead and lose the reordering")
-                .clicked()
-            {
-                choice = Some(Answer::Discard);
-            }
-            if ui.button("Cancel").clicked() {
-                choice = Some(Answer::Cancel);
+            // A loop, and every button drawn on every pass — an early exit once one is
+            // clicked would remove the others from the frame they were clicked in.
+            for (text, hover, answer) in [
+                // Save first, because it is the answer that loses nothing.
+                (
+                    "Save, then continue",
+                    "Write the changes over the file, then go ahead",
+                    Answer::Save,
+                ),
+                (
+                    "Discard changes",
+                    "Go ahead and lose the reordering",
+                    Answer::Discard,
+                ),
+                ("Cancel", "Never mind; stay here", Answer::Cancel),
+            ] {
+                if let Some(answer) = button(
+                    ui,
+                    Action {
+                        text,
+                        hover,
+                        produces: Some(answer),
+                    },
+                ) {
+                    choice = Some(answer);
+                }
             }
         });
     });
@@ -373,7 +415,7 @@ pub(crate) fn question(ctx: &egui::Context, what: &str) -> Option<Answer> {
 /// it — so this function has no opinion about what the sentence says, which is the point.
 pub(crate) fn drop_hint(ctx: &egui::Context, action: &DropAction, unsaved_changes: bool) {
     let colour = match action {
-        DropAction::Open { .. } => egui::Color32::WHITE,
+        DropAction::Open { .. } | DropAction::Insert { .. } => egui::Color32::WHITE,
         DropAction::Refuse { .. } => egui::Color32::from_rgb(240, 150, 150),
     };
 

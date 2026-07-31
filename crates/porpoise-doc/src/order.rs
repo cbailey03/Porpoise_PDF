@@ -1,20 +1,64 @@
 //! What order the pages are in, and how to change it.
 //!
-//! An edit never touches the file. It is held as a list of **source page indices in
-//! display order**, starting at `[0, 1, 2, …]`. Moving a page reorders the list;
-//! deleting one drops an entry. The document on disk changes only on save.
+//! An edit never touches a file. It is held as a list of **sources in display
+//! order**, starting at one entry per page of the document the viewer was opened
+//! with. Moving a page reorders the list; deleting one drops an entry; inserting
+//! another document's pages appends entries naming it. The document on disk
+//! changes only on save.
 //!
-//! Pure arithmetic over a `Vec<usize>` — no PDF, no `lopdf`, no window. Two useful
+//! Pure arithmetic over a `Vec<Source>` — no PDF, no `lopdf`, no window. Two useful
 //! consequences: undo is a snapshot rather than an inverse operation, and a reorder
-//! invalidates no rendered pages, because page textures stay keyed by source page.
+//! invalidates no rendered pages, because page textures stay keyed by source.
 //!
-//! # Display position is not source page
+//! # Display position is not source page — and now not source document either
 //!
 //! After any edit there are two page numbers in play and both are `usize`. This
 //! codebase has been caught by that shape three times already — pixels versus PDF
 //! points, zero-based indices versus one-based numbers, screen units versus document
 //! units. Every crossing here goes through [`PageOrder::source_of`], and variables
 //! are named `position` or `source`, never `page`. See `docs/goal-4-plan.md` §3.
+//!
+//! Merging pages from more than one document (`docs/goal-5-plan.md` §3) adds a third
+//! axis — *which* document — so a variable naming one is called `document`, never
+//! `page` or `source` on its own. [`Source`] bundles a document with a page
+//! precisely so the two travel together and cannot be paired up wrong.
+//!
+//! # A source's identity outlives its file's layout
+//!
+//! `Source { document, page }` names a page once, at open or insert time, and never
+//! again — `move_page` and `remove` only reorder or drop entries, and `append` only
+//! ever hands out fresh ones. But saving physically rewrites a document's file,
+//! compacted to hold only the retained pages and renumbered from zero, so a second
+//! save over the same path would be reading a file whose page `n` is no longer the
+//! `n` any `Source` still names. [`PageOrder::on_disk`] is the record that keeps the
+//! two apart: what a `Source` means never changes, but what a document's *file*
+//! currently holds does, and only [`PageOrder::mark_saved`] moves it. See
+//! `docs/goal-5-plan.md` §9a, where saving twice over the same path was found to
+//! either refuse a save that should succeed, or write the wrong pages without
+//! complaint.
+
+/// A page in one of the documents contributing to what is shown.
+///
+/// `document` is an index the caller hands in, not something this module invents —
+/// this crate knows no PDF, no path and no `lopdf`, and a document index is exactly
+/// the kind of thing that stays true of. Which path that index names, and what
+/// parsed document backs it, is bookkeeping the viewer owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Source {
+    /// Which contributing document, in the order it was added to the session. `0`
+    /// is the document the viewer was opened with.
+    pub document: usize,
+    /// A page index within that document.
+    pub page: usize,
+}
+
+impl Source {
+    /// A page of the first — and, before any page is inserted from elsewhere, only
+    /// — contributing document.
+    fn primary(page: usize) -> Self {
+        Self { document: 0, page }
+    }
+}
 
 /// How many undo steps are remembered.
 ///
@@ -26,8 +70,8 @@ const UNDO_DEPTH: usize = 64;
 /// The order pages are shown in, and the history to undo it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageOrder {
-    /// Source page indices, in display order.
-    order: Vec<usize>,
+    /// Sources, in display order.
+    order: Vec<Source>,
     /// The order as it stands in the file. Starts equal to [`Self::order`] and moves
     /// only when a save reports success.
     ///
@@ -36,23 +80,54 @@ pub struct PageOrder {
     /// changes forever — the status bar nags, the Save button stays lit, and anything
     /// built on top warns when there is nothing left to lose. A warning that fires when
     /// nothing is at risk is one people learn to click through.
-    saved: Vec<usize>,
-    /// Pages in the document as opened. Needed to tell an edited order from a fresh
-    /// one even after pages are deleted.
-    source_len: usize,
+    saved: Vec<Source>,
+    /// Pages in each contributing document as it was added, indexed by
+    /// [`Source::document`]. Needed to tell an edited order from a fresh one even
+    /// after pages are deleted, and to bounds-check a source against the right
+    /// document rather than any of them.
+    ///
+    /// This never changes after a document is opened or inserted, even once a save
+    /// has rewritten its file — see [`Self::on_disk`] for the count that does.
+    source_lens: Vec<usize>,
+    /// The [`Source`]s each contributing document's file currently holds,
+    /// physically, in the order they sit in that file — indexed by
+    /// [`Source::document`], one list per document, each starting as
+    /// `document`'s pages in order (`0, 1, 2, ...`).
+    ///
+    /// A [`Source`]'s identity never changes: `move_page` and `remove` only reorder
+    /// or drop entries, and `append` only ever hands out fresh ones. But a save
+    /// physically rewrites a document's file, compacted to hold only the retained
+    /// pages and renumbered from zero — so the *file* no longer agrees that its
+    /// physical page `n` is `Source`'s page `n`. [`Self::mark_saved`] is the only
+    /// thing that changes this, recording what a document's file now holds so a
+    /// later save can still translate a stable [`Source`] into the right physical
+    /// page of that file. Without it, a second save over the same path either
+    /// refuses a save that should succeed, or — if the two page counts happen to
+    /// still agree — writes the wrong pages without complaint. See
+    /// `docs/goal-5-plan.md` §9a, where this was found.
+    ///
+    /// Saving a merge into a document's own path folds every contributing file into
+    /// that one file, so `on_disk[document]` after such a save can list `Source`s
+    /// that named a *different* document before the save — accurate, since they are
+    /// now physically inside `document`'s file too. This is never a problem: a
+    /// lookup for one of those `Source`s still goes through *its own* document's
+    /// record, which was never touched and still finds it in its own, untouched
+    /// file.
+    on_disk: Vec<Vec<Source>>,
     /// Previous orders, most recent last.
-    history: Vec<Vec<usize>>,
+    history: Vec<Vec<Source>>,
 }
 
 impl PageOrder {
     /// The unedited order of a document with `page_count` pages.
     #[must_use]
     pub fn identity(page_count: usize) -> Self {
-        let order: Vec<usize> = (0..page_count).collect();
+        let order: Vec<Source> = (0..page_count).map(Source::primary).collect();
         Self {
             saved: order.clone(),
+            on_disk: vec![order.clone()],
             order,
-            source_len: page_count,
+            source_lens: vec![page_count],
             history: Vec::new(),
         }
     }
@@ -69,25 +144,77 @@ impl PageOrder {
         self.order.is_empty()
     }
 
-    /// Pages in the document as opened, however many have since been deleted.
+    /// Pages in each contributing document as it was added, indexed by document.
+    /// However many pages have since been deleted, this still names the document's
+    /// full page count — what "opened with" or "inserted with" meant at the time.
     #[must_use]
-    pub fn source_len(&self) -> usize {
-        self.source_len
+    pub fn source_lens(&self) -> &[usize] {
+        &self.source_lens
     }
 
-    /// The source page shown at `position`, or `None` if there is no such position.
+    /// The [`Source`]s `document`'s file currently holds, physically, in the order
+    /// they sit in that file. `None` if `document` is out of range for
+    /// [`Self::document_count`].
     ///
-    /// The one place a display position becomes a source page. Everything that
+    /// This is what a save reads instead of assuming a document's file still agrees
+    /// with `source.page` — see the field docs on the private `on_disk` this
+    /// exposes.
+    #[must_use]
+    pub fn on_disk(&self, document: usize) -> Option<&[Source]> {
+        self.on_disk.get(document).map(Vec::as_slice)
+    }
+
+    /// How many documents contribute pages right now, including the one this was
+    /// opened with. The index a fresh call to [`Self::append`] should use.
+    #[must_use]
+    pub fn document_count(&self) -> usize {
+        self.source_lens.len()
+    }
+
+    /// The source shown at `position`, or `None` if there is no such position.
+    ///
+    /// The one place a display position becomes a source. Everything that
     /// rasterizes, caches or looks up geometry goes through here.
     #[must_use]
-    pub fn source_of(&self, position: usize) -> Option<usize> {
+    pub fn source_of(&self, position: usize) -> Option<Source> {
         self.order.get(position).copied()
     }
 
-    /// Source pages in display order.
+    /// Sources in display order.
     #[must_use]
-    pub fn as_slice(&self) -> &[usize] {
+    pub fn as_slice(&self) -> &[Source] {
         &self.order
+    }
+
+    /// Appends every page of another contributing document to the end of the
+    /// order, as one undo step.
+    ///
+    /// `document` is the index future sources should carry for this document —
+    /// ordinarily [`Self::document_count`], since a document already known is never
+    /// reused: the file on disk may have changed between two inserts of the "same"
+    /// path, and silently treating it as unchanged would be exactly the kind of
+    /// quiet incorrectness this project refuses to ship.
+    ///
+    /// A no-op, reporting so, when `page_count` is zero: there is nothing to add,
+    /// and an empty document contributing nothing is not an edit.
+    pub fn append(&mut self, document: usize, page_count: usize) -> bool {
+        if page_count == 0 {
+            return false;
+        }
+        self.remember();
+        if document >= self.source_lens.len() {
+            self.source_lens.resize(document + 1, 0);
+            self.on_disk.resize(document + 1, Vec::new());
+        }
+        if let Some(len) = self.source_lens.get_mut(document) {
+            *len = page_count;
+        }
+        let pages: Vec<Source> = (0..page_count).map(|page| Source { document, page }).collect();
+        if let Some(slot) = self.on_disk.get_mut(document) {
+            *slot = pages.clone();
+        }
+        self.order.extend(pages);
+        true
     }
 
     /// Whether this matches what is on disk.
@@ -100,7 +227,9 @@ impl PageOrder {
         self.order == self.saved
     }
 
-    /// Records that `written` is now what the file contains.
+    /// Records that `document`'s file was just rewritten to hold exactly `written`,
+    /// physically in that order — and that `written` is now what the whole order
+    /// last matched on disk.
     ///
     /// Takes the order that was actually written rather than assuming it is the current
     /// one. A save runs off the UI thread and takes about a second on a 400-page
@@ -108,8 +237,19 @@ impl PageOrder {
     /// *those* moves as saved would tell somebody their work is on disk when it is not.
     /// Passing the written order through makes that case come out right on its own
     /// rather than needing to be noticed.
-    pub fn mark_saved(&mut self, written: &[usize]) {
+    ///
+    /// `document` is whichever document's file `written` was saved to — in this
+    /// project, always the one the viewer was opened with, since every save replaces
+    /// that file (`docs/goal-5-plan.md` §9a). Recording it in [`Self::on_disk`] is
+    /// what lets a later save over the same path find the right page a second time:
+    /// without it, that file's physical layout has moved out from under the
+    /// [`Source`]s naming it, and a second save either refuses one that should
+    /// succeed or writes the wrong pages without complaint.
+    pub fn mark_saved(&mut self, document: usize, written: &[Source]) {
         self.saved = written.to_vec();
+        if let Some(slot) = self.on_disk.get_mut(document) {
+            *slot = written.to_vec();
+        }
     }
 
     /// Whether there is anything to undo.
@@ -156,11 +296,11 @@ impl PageOrder {
         // keeps `move_page`'s existing behaviour exactly as it was.
         let landing = to.min(self.order.len() - taken.len());
 
-        let group: Vec<usize> = taken
+        let group: Vec<Source> = taken
             .iter()
             .filter_map(|&position| self.order.get(position).copied())
             .collect();
-        let mut rest: Vec<usize> = self
+        let mut rest: Vec<Source> = self
             .order
             .iter()
             .enumerate()
@@ -252,12 +392,29 @@ impl PageOrder {
 mod tests {
     use super::*;
 
+    /// A page of the primary document — shorthand for the document every test
+    /// predating [`Source`] only ever needed.
+    fn p(page: usize) -> Source {
+        Source::primary(page)
+    }
+
+    /// Sources naming an arbitrary document, for building an expected order.
+    fn from_document(document: usize, pages: impl IntoIterator<Item = usize>) -> Vec<Source> {
+        pages.into_iter().map(|page| Source { document, page }).collect()
+    }
+
+    /// A run of primary-document sources, for comparing against `as_slice()`.
+    fn primary(pages: impl IntoIterator<Item = usize>) -> Vec<Source> {
+        from_document(0, pages)
+    }
+
     #[test]
     fn a_fresh_order_is_the_document_as_opened() {
         let order = PageOrder::identity(4);
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3]));
         assert_eq!(order.len(), 4);
-        assert_eq!(order.source_len(), 4);
+        assert_eq!(order.source_lens(), &[4]);
+        assert_eq!(order.document_count(), 1);
         assert!(order.is_unedited());
         assert!(!order.can_undo());
     }
@@ -265,8 +422,8 @@ mod tests {
     #[test]
     fn a_position_maps_to_a_source_page() {
         let order = PageOrder::identity(3);
-        assert_eq!(order.source_of(0), Some(0));
-        assert_eq!(order.source_of(2), Some(2));
+        assert_eq!(order.source_of(0), Some(p(0)));
+        assert_eq!(order.source_of(2), Some(p(2)));
         assert_eq!(order.source_of(3), None, "past the end");
     }
 
@@ -274,10 +431,10 @@ mod tests {
     fn moving_a_page_forward_shifts_the_rest_back() {
         let mut order = PageOrder::identity(5);
         assert!(order.move_page(0, 2));
-        assert_eq!(order.as_slice(), &[1, 2, 0, 3, 4]);
+        assert_eq!(order.as_slice(), primary([1, 2, 0, 3, 4]));
         assert_eq!(
             order.source_of(2),
-            Some(0),
+            Some(p(0)),
             "the moved page is now shown third"
         );
     }
@@ -286,14 +443,14 @@ mod tests {
     fn moving_a_page_backward_shifts_the_rest_forward() {
         let mut order = PageOrder::identity(5);
         assert!(order.move_page(3, 1));
-        assert_eq!(order.as_slice(), &[0, 3, 1, 2, 4]);
+        assert_eq!(order.as_slice(), primary([0, 3, 1, 2, 4]));
     }
 
     #[test]
     fn moving_the_last_page_to_the_front_reverses_nothing_else() {
         let mut order = PageOrder::identity(3);
         assert!(order.move_page(2, 0));
-        assert_eq!(order.as_slice(), &[2, 0, 1]);
+        assert_eq!(order.as_slice(), primary([2, 0, 1]));
     }
 
     #[test]
@@ -302,7 +459,7 @@ mod tests {
         assert!(!order.move_page(1, 1), "moved a page onto itself");
         assert!(!order.move_page(0, 9), "moved past the end");
         assert!(!order.move_page(9, 0), "moved from past the end");
-        assert_eq!(order.as_slice(), &[0, 1, 2]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2]));
         assert!(
             !order.can_undo(),
             "a move that did nothing still recorded history"
@@ -313,11 +470,11 @@ mod tests {
     fn deleting_a_page_drops_it_from_the_order() {
         let mut order = PageOrder::identity(4);
         assert!(order.remove(1));
-        assert_eq!(order.as_slice(), &[0, 2, 3]);
+        assert_eq!(order.as_slice(), primary([0, 2, 3]));
         assert_eq!(order.len(), 3);
         assert_eq!(
-            order.source_len(),
-            4,
+            order.source_lens(),
+            &[4],
             "the source document still has four pages"
         );
     }
@@ -335,7 +492,7 @@ mod tests {
     fn deleting_past_the_end_changes_nothing() {
         let mut order = PageOrder::identity(3);
         assert!(!order.remove(7));
-        assert_eq!(order.as_slice(), &[0, 1, 2]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2]));
     }
 
     // --- Group edits ---------------------------------------------------------
@@ -344,10 +501,10 @@ mod tests {
     fn a_group_moves_as_a_block_and_keeps_its_order() {
         let mut order = PageOrder::identity(6);
         assert!(order.move_pages(&[0, 1], 3));
-        assert_eq!(order.as_slice(), &[2, 3, 4, 0, 1, 5]);
+        assert_eq!(order.as_slice(), primary([2, 3, 4, 0, 1, 5]));
         assert_eq!(
             order.source_of(3),
-            Some(0),
+            Some(p(0)),
             "the group should start where it was asked to"
         );
     }
@@ -356,7 +513,7 @@ mod tests {
     fn a_group_moving_backward_lands_where_asked() {
         let mut order = PageOrder::identity(6);
         assert!(order.move_pages(&[3, 4], 1));
-        assert_eq!(order.as_slice(), &[0, 3, 4, 1, 2, 5]);
+        assert_eq!(order.as_slice(), primary([0, 3, 4, 1, 2, 5]));
     }
 
     #[test]
@@ -365,7 +522,7 @@ mod tests {
         // point of selecting more than one, so they arrive contiguous.
         let mut order = PageOrder::identity(6);
         assert!(order.move_pages(&[0, 2, 4], 2));
-        assert_eq!(order.as_slice(), &[1, 3, 0, 2, 4, 5]);
+        assert_eq!(order.as_slice(), primary([1, 3, 0, 2, 4, 5]));
     }
 
     #[test]
@@ -374,7 +531,7 @@ mod tests {
         // means "put them last", and refusing would read as the drag not working.
         let mut order = PageOrder::identity(5);
         assert!(order.move_pages(&[0, 1, 2], 4));
-        assert_eq!(order.as_slice(), &[3, 4, 0, 1, 2]);
+        assert_eq!(order.as_slice(), primary([3, 4, 0, 1, 2]));
     }
 
     #[test]
@@ -399,7 +556,7 @@ mod tests {
     fn moving_a_group_onto_itself_changes_nothing() {
         let mut order = PageOrder::identity(5);
         assert!(!order.move_pages(&[1, 2], 1));
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3, 4]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3, 4]));
         assert!(
             !order.can_undo(),
             "a move that did nothing recorded history"
@@ -410,7 +567,7 @@ mod tests {
     fn moving_every_page_at_once_changes_nothing() {
         let mut order = PageOrder::identity(4);
         assert!(!order.move_pages(&[0, 1, 2, 3], 0));
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3]));
     }
 
     #[test]
@@ -419,9 +576,9 @@ mod tests {
         // pages and pressing undo once has to put all five back, not one of them.
         let mut order = PageOrder::identity(6);
         order.move_pages(&[0, 1, 2], 3);
-        assert_eq!(order.as_slice(), &[3, 4, 5, 0, 1, 2]);
+        assert_eq!(order.as_slice(), primary([3, 4, 5, 0, 1, 2]));
         assert!(order.undo());
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3, 4, 5]));
         assert!(!order.can_undo(), "one drag left more than one step behind");
     }
 
@@ -429,9 +586,9 @@ mod tests {
     fn a_group_delete_is_one_undo_step() {
         let mut order = PageOrder::identity(6);
         assert!(order.remove_pages(&[1, 3, 5]));
-        assert_eq!(order.as_slice(), &[0, 2, 4]);
+        assert_eq!(order.as_slice(), primary([0, 2, 4]));
         assert!(order.undo());
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3, 4, 5]));
         assert!(!order.can_undo());
     }
 
@@ -441,7 +598,7 @@ mod tests {
         // necessarily unique once a range overlaps an earlier pick.
         let mut order = PageOrder::identity(6);
         assert!(order.move_pages(&[4, 0, 4, 0], 2));
-        assert_eq!(order.as_slice(), &[1, 2, 0, 4, 3, 5]);
+        assert_eq!(order.as_slice(), primary([1, 2, 0, 4, 3, 5]));
     }
 
     #[test]
@@ -450,7 +607,7 @@ mod tests {
         // this can guess.
         let mut order = PageOrder::identity(3);
         assert!(!order.remove_pages(&[0, 1, 2]));
-        assert_eq!(order.as_slice(), &[0, 1, 2]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2]));
         assert!(!order.can_undo());
     }
 
@@ -460,9 +617,9 @@ mod tests {
         // pages and got two moved has no way to notice.
         let mut order = PageOrder::identity(4);
         assert!(!order.move_pages(&[0, 1, 9], 2));
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3]));
         assert!(!order.remove_pages(&[0, 9]));
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3]));
     }
 
     #[test]
@@ -470,7 +627,7 @@ mod tests {
         let mut order = PageOrder::identity(3);
         assert!(!order.move_pages(&[], 1));
         assert!(!order.remove_pages(&[]));
-        assert_eq!(order.as_slice(), &[0, 1, 2]);
+        assert_eq!(order.as_slice(), primary([0, 1, 2]));
     }
 
     #[test]
@@ -488,7 +645,10 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), count, "a page appeared twice: {order:?}");
         for &source in order.as_slice() {
-            assert!(source < order.source_len(), "invented page {source}");
+            assert!(
+                source.page < order.source_lens()[source.document],
+                "invented page {source:?}"
+            );
         }
     }
 
@@ -497,13 +657,13 @@ mod tests {
         let mut order = PageOrder::identity(4);
         order.move_page(0, 3); // [1,2,3,0]
         order.remove(0); // [2,3,0]
-        assert_eq!(order.as_slice(), &[2, 3, 0]);
+        assert_eq!(order.as_slice(), primary([2, 3, 0]));
 
         assert!(order.undo());
-        assert_eq!(order.as_slice(), &[1, 2, 3, 0], "one step back");
+        assert_eq!(order.as_slice(), primary([1, 2, 3, 0]), "one step back");
 
         assert!(order.undo());
-        assert_eq!(order.as_slice(), &[0, 1, 2, 3], "back to the start");
+        assert_eq!(order.as_slice(), primary([0, 1, 2, 3]), "back to the start");
         assert!(order.is_unedited());
     }
 
@@ -511,7 +671,105 @@ mod tests {
     fn undo_past_the_beginning_is_a_no_op() {
         let mut order = PageOrder::identity(2);
         assert!(!order.undo());
-        assert_eq!(order.as_slice(), &[0, 1]);
+        assert_eq!(order.as_slice(), primary([0, 1]));
+    }
+
+    // --- Merging in another document ------------------------------------------
+
+    #[test]
+    fn appending_another_documents_pages_extends_the_order() {
+        let mut order = PageOrder::identity(3);
+        assert!(order.append(order.document_count(), 2));
+
+        let mut expected = primary([0, 1, 2]);
+        expected.extend(from_document(1, [0, 1]));
+        assert_eq!(order.as_slice(), expected);
+        assert_eq!(order.len(), 5);
+        assert_eq!(order.document_count(), 2);
+        assert_eq!(order.source_lens(), &[3, 2]);
+    }
+
+    #[test]
+    fn appending_zero_pages_changes_nothing() {
+        // An empty document contributing nothing is not an edit.
+        let mut order = PageOrder::identity(3);
+        assert!(!order.append(1, 0));
+        assert_eq!(
+            order.document_count(),
+            1,
+            "an append that did nothing still counted a document"
+        );
+        assert!(!order.can_undo());
+    }
+
+    #[test]
+    fn appending_is_its_own_undo_step() {
+        let mut order = PageOrder::identity(3);
+        assert!(order.append(1, 2));
+        assert_eq!(order.len(), 5);
+
+        assert!(order.undo());
+        assert_eq!(order.as_slice(), primary([0, 1, 2]));
+        assert_eq!(order.len(), 3, "the undo did not remove the appended pages");
+    }
+
+    #[test]
+    fn an_appended_document_makes_the_order_edited() {
+        let mut order = PageOrder::identity(3);
+        let written = order.as_slice().to_vec();
+        order.mark_saved(0, &written);
+        assert!(order.is_unedited());
+
+        order.append(1, 2);
+        assert!(!order.is_unedited(), "inserted pages are unsaved changes");
+    }
+
+    #[test]
+    fn an_inserted_page_can_be_moved_and_deleted_like_any_other() {
+        // The point of the whole model: once appended, an inserted page is an
+        // ordinary entry, with no special casing anywhere else in this module.
+        let mut order = PageOrder::identity(2);
+        assert!(order.append(1, 2));
+
+        assert!(order.move_page(2, 0));
+        assert_eq!(
+            order.source_of(0),
+            Some(Source { document: 1, page: 0 }),
+            "the first inserted page moved to the front like any other page would"
+        );
+
+        assert!(order.remove(0));
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn a_third_and_later_document_gets_its_own_index() {
+        let mut order = PageOrder::identity(1);
+        order.append(order.document_count(), 1);
+        order.append(order.document_count(), 1);
+        assert_eq!(order.document_count(), 3);
+        assert_eq!(
+            order.as_slice(),
+            vec![Source { document: 0, page: 0 }, Source { document: 1, page: 0 }, Source {
+                document: 2,
+                page: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn each_documents_bound_is_checked_against_its_own_length() {
+        // A page from the smaller document must never be mistaken for a page that
+        // only the larger one has.
+        let mut order = PageOrder::identity(2);
+        order.append(1, 5);
+        assert_eq!(order.source_lens(), &[2, 5]);
+        for &source in order.as_slice() {
+            assert!(
+                source.page < order.source_lens()[source.document],
+                "{source:?} is out of range for its own document"
+            );
+        }
     }
 
     // --- What is on disk -----------------------------------------------------
@@ -526,7 +784,7 @@ mod tests {
         assert!(!order.is_unedited());
 
         let written = order.as_slice().to_vec();
-        order.mark_saved(&written);
+        order.mark_saved(0, &written);
         assert!(
             order.is_unedited(),
             "still dirty after saving that exact order"
@@ -538,7 +796,7 @@ mod tests {
         let mut order = PageOrder::identity(4);
         order.move_page(0, 3);
         let written = order.as_slice().to_vec();
-        order.mark_saved(&written);
+        order.mark_saved(0, &written);
 
         order.move_page(1, 2);
         assert!(!order.is_unedited(), "an edit after a save reported clean");
@@ -556,7 +814,7 @@ mod tests {
 
         // ... and while it was writing, another move.
         order.move_page(1, 2);
-        order.mark_saved(&written);
+        order.mark_saved(0, &written);
 
         assert!(
             !order.is_unedited(),
@@ -576,7 +834,7 @@ mod tests {
         let mut order = PageOrder::identity(3);
         order.move_page(0, 2);
         let written = order.as_slice().to_vec();
-        order.mark_saved(&written);
+        order.mark_saved(0, &written);
         order.remove(1);
         assert!(!order.is_unedited());
 
@@ -649,8 +907,8 @@ mod tests {
         for position in 0..order.len() {
             let source = order.source_of(position).expect("a source page");
             assert!(
-                source < order.source_len(),
-                "position {position} -> {source}"
+                source.page < order.source_lens()[source.document],
+                "position {position} -> {source:?}"
             );
         }
         // And no page appears twice, which a careless move-then-insert would cause.
@@ -666,5 +924,85 @@ mod tests {
         assert!(order.is_empty());
         assert_eq!(order.source_of(0), None);
         assert!(order.is_unedited());
+    }
+
+    // --- What a save leaves on disk -------------------------------------------
+
+    #[test]
+    fn a_fresh_document_is_on_disk_as_opened() {
+        let order = PageOrder::identity(3);
+        assert_eq!(order.on_disk(0), Some(primary([0, 1, 2]).as_slice()));
+    }
+
+    #[test]
+    fn an_appended_document_is_on_disk_as_identity_until_its_own_save() {
+        let mut order = PageOrder::identity(2);
+        assert!(order.append(1, 3));
+        assert_eq!(order.on_disk(1), Some(from_document(1, [0, 1, 2]).as_slice()));
+    }
+
+    #[test]
+    fn saving_records_what_the_document_now_physically_holds() {
+        // [0,1,2,3] -> delete page 0 -> [1,2,3]. The file on disk now holds three
+        // pages, and they are original pages 1, 2 and 3 — not fresh pages 0, 1, 2.
+        let mut order = PageOrder::identity(4);
+        assert!(order.remove(0));
+        let written = order.as_slice().to_vec();
+        order.mark_saved(0, &written);
+
+        assert_eq!(
+            order.on_disk(0),
+            Some(primary([1, 2, 3]).as_slice()),
+            "the file's new physical layout should be exactly what was written"
+        );
+        assert_eq!(
+            order.source_lens(),
+            &[4],
+            "source_lens still names the document as it was first opened"
+        );
+    }
+
+    #[test]
+    fn a_document_out_of_range_has_no_on_disk_record() {
+        let order = PageOrder::identity(3);
+        assert_eq!(order.on_disk(1), None);
+    }
+
+    #[test]
+    fn saving_twice_keeps_on_disk_in_step_with_each_write() {
+        // The scenario `save_reordered` depends on this for: two saves to the same
+        // path, with an edit in between. Each `mark_saved` has to describe the file
+        // as it now stands, not as it stood after the first write.
+        let mut order = PageOrder::identity(4);
+        assert!(order.remove(0)); // [1,2,3]
+        let first_write = order.as_slice().to_vec();
+        order.mark_saved(0, &first_write);
+        assert_eq!(order.on_disk(0), Some(primary([1, 2, 3]).as_slice()));
+
+        assert!(order.move_page(0, 1)); // [2,1,3]
+        let second_write = order.as_slice().to_vec();
+        order.mark_saved(0, &second_write);
+        assert_eq!(
+            order.on_disk(0),
+            Some(primary([2, 1, 3]).as_slice()),
+            "the second save's layout should replace the first's, not extend it"
+        );
+    }
+
+    #[test]
+    fn a_secondary_documents_on_disk_record_survives_the_primarys_save() {
+        // The primary's file was rewritten; the secondary's was not, so its record
+        // should be untouched by a save that never touched its path.
+        let mut order = PageOrder::identity(2);
+        assert!(order.append(1, 2));
+        assert!(order.remove(0));
+        let written = order.as_slice().to_vec();
+        order.mark_saved(0, &written);
+
+        assert_eq!(
+            order.on_disk(1),
+            Some(from_document(1, [0, 1]).as_slice()),
+            "a document whose file was not the save's destination keeps its record"
+        );
     }
 }

@@ -45,3 +45,9 @@ This is the first thing that writes to disk, so a save must either produce a
 complete correct file or leave the original untouched — never something in between.
 
 Plan: [docs/goal-4-plan.md](docs/goal-4-plan.md)
+
+## Goal 5: Merge PDFs
+
+Let a person combine multiple PDFs into one document.
+
+Plan: [docs/goal-5-plan.md](docs/goal-5-plan.md)

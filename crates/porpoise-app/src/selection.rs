@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 
-use porpoise_doc::PageOrder;
+use porpoise_doc::{PageOrder, Source};
 
 /// What a click on a thumbnail was asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,14 +66,14 @@ impl Pick {
 /// is start a selection rather than extend one somebody has forgotten about.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Selection {
-    /// Selected **source** pages. See the module docs.
-    chosen: BTreeSet<usize>,
-    /// The source page a shift-click measures from.
+    /// Selected **sources**. See the module docs.
+    chosen: BTreeSet<Source>,
+    /// The source a shift-click measures from.
     ///
     /// Separate from the selection because it survives the selection shrinking: shift
     /// clicking twice should measure from the same place both times, which is what makes
     /// a range you got slightly wrong fixable by clicking again rather than starting over.
-    anchor: Option<usize>,
+    anchor: Option<Source>,
 }
 
 impl Selection {
@@ -350,7 +350,12 @@ mod tests {
         assert_eq!(selection.positions(&order), vec![0, 1]);
 
         assert!(order.move_pages(&[0, 1], 4));
-        assert_eq!(order.as_slice(), &[2, 3, 4, 5, 0, 1]);
+        assert_eq!(
+            order.as_slice(),
+            [2, 3, 4, 5, 0, 1]
+                .map(|page| Source { document: 0, page })
+                .to_vec()
+        );
         assert_eq!(
             selection.positions(&order),
             vec![4, 5],

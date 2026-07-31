@@ -5,6 +5,22 @@
 //! A viewer that blocks on rasterization cannot scroll smoothly no matter how
 //! fast the renderer is.
 //!
+//! # More than one document
+//!
+//! A merge (`docs/goal-5-plan.md` §4) can put pages from more than one document on
+//! screen, and the pool serves all of them rather than being rebuilt per document.
+//! The obvious alternative — one pool per document — was considered and rejected:
+//! [`RenderPool::recommended_workers`] already sizes itself for one machine, so two
+//! pools would mean up to twice the worker threads competing for the same cores,
+//! three pools three times, with nothing bounding it as documents accumulate over a
+//! session. Instead there is one pool, sized once, and [`RenderPool::add_document`]
+//! grows the list of documents it can be asked to rasterize from.
+//!
+//! The list only ever grows. A worker that reads it after [`RenderPool::submit`]
+//! validated a document index is guaranteed to still find it there — nothing
+//! removes an entry or renumbers one — so the read on the hot path never has to
+//! guess.
+//!
 //! # Cancellation
 //!
 //! Queued work can be dropped wholesale with [`RenderPool::cancel_pending`],
@@ -27,7 +43,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
 use porpoise_doc::Document;
@@ -43,6 +59,8 @@ const MAX_QUEUED: usize = 64;
 /// One unit of work.
 #[derive(Debug, Clone, Copy)]
 struct Job {
+    /// Which document to rasterize from, an index into the pool's document list.
+    document: usize,
     page_index: usize,
     scale: f32,
     tag: i64,
@@ -51,6 +69,8 @@ struct Job {
 /// A finished render, carrying back enough context to match it to its request.
 #[derive(Debug)]
 pub struct RenderOutcome {
+    /// Which document the page was rasterized from.
+    pub document: usize,
     /// The page that was rasterized.
     pub page_index: usize,
     /// The scale it was rasterized at.
@@ -78,6 +98,10 @@ struct Shared {
 /// job timeout, which is a poor trade for a viewer being closed.
 pub struct RenderPool {
     shared: Arc<Shared>,
+    /// Every document the pool can be asked to rasterize from, index 0 being the
+    /// one it was constructed with. Shared with every worker; see the module docs
+    /// for why appending to it is the only mutation it ever needs.
+    documents: Arc<RwLock<Vec<Arc<Document>>>>,
     results: Receiver<RenderOutcome>,
     worker_count: usize,
 }
@@ -104,16 +128,17 @@ impl RenderPool {
             shutdown: AtomicBool::new(false),
             active: AtomicUsize::new(0),
         });
+        let documents = Arc::new(RwLock::new(vec![document]));
         let (sender, results) = mpsc::channel();
 
         for index in 0..worker_count {
             let shared = Arc::clone(&shared);
-            let document = Arc::clone(&document);
+            let documents = Arc::clone(&documents);
             let renderer = renderer.clone();
             let sender = sender.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("porpoise-render-{index}"))
-                .spawn(move || worker_loop(&shared, &document, &renderer, job_timeout, &sender));
+                .spawn(move || worker_loop(&shared, &documents, &renderer, job_timeout, &sender));
 
             if let Err(error) = spawned {
                 // One worker failing to spawn is survivable as long as another
@@ -124,12 +149,16 @@ impl RenderPool {
 
         Self {
             shared,
+            documents,
             results,
             worker_count,
         }
     }
 
     /// A pool sized for this machine, leaving a core for the UI thread.
+    ///
+    /// Sized once regardless of how many documents the pool ends up serving — see
+    /// the module docs for why that is the point rather than an oversight.
     #[must_use]
     pub fn recommended_workers() -> usize {
         std::thread::available_parallelism()
@@ -137,10 +166,42 @@ impl RenderPool {
             .unwrap_or(1)
     }
 
+    /// Registers another document the pool can be asked to rasterize from,
+    /// returning the index [`Self::submit`] should use for it.
+    ///
+    /// The list only grows: nothing in this pool ever removes or renumbers an
+    /// entry, which is what lets a worker trust an index once `submit` has
+    /// validated it.
+    pub fn add_document(&self, document: Arc<Document>) -> usize {
+        let Ok(mut documents) = self.documents.write() else {
+            // Poisoned means some other thread panicked while holding this lock,
+            // which nothing in this module's own code does. Reporting index 0
+            // would be a guess that could point a future submission at the wrong
+            // document, so this is the one place a caller can be told the
+            // document was not actually added — by the number never appearing in
+            // a later `submit` that returns `true`. Recorded rather than
+            // papered over; see `docs/goal-1-plan.md` §2 for this project's
+            // stance on more of this kind of degradation.
+            tracing::error!("render pool's document list is poisoned; refusing to add one");
+            return usize::MAX;
+        };
+        documents.push(document);
+        documents.len() - 1
+    }
+
     /// Queues a page for rasterization. Never blocks.
     ///
-    /// Returns `false` if the queue was full and the job was refused.
-    pub fn submit(&self, page_index: usize, scale: f32, tag: i64) -> bool {
+    /// Returns `false` if `document` names no document this pool knows about, or
+    /// if the queue was full and the job was refused.
+    pub fn submit(&self, document: usize, page_index: usize, scale: f32, tag: i64) -> bool {
+        let known = self
+            .documents
+            .read()
+            .is_ok_and(|documents| document < documents.len());
+        if !known {
+            return false;
+        }
+
         let Ok(mut queue) = self.shared.queue.lock() else {
             return false;
         };
@@ -150,6 +211,7 @@ impl RenderPool {
             queue.pop_back();
         }
         queue.push_back(Job {
+            document,
             page_index,
             scale,
             tag,
@@ -224,7 +286,7 @@ fn next_job(shared: &Shared) -> Option<Job> {
 
 fn worker_loop<R>(
     shared: &Shared,
-    document: &Arc<Document>,
+    documents: &Arc<RwLock<Vec<Arc<Document>>>>,
     renderer: &R,
     job_timeout: Duration,
     results: &Sender<RenderOutcome>,
@@ -232,11 +294,24 @@ fn worker_loop<R>(
     R: Renderer + Clone + Send + 'static,
 {
     while let Some(job) = next_job(shared) {
+        // The list only grows, and `submit` already checked this index against it
+        // — so `None` here means the list was poisoned between then and now, not
+        // an ordinary race. Dropping the job silently is still the right call: a
+        // worker must never guess which document a page came from.
+        let document = documents
+            .read()
+            .ok()
+            .and_then(|documents| documents.get(job.document).cloned());
+        let Some(document) = document else {
+            tracing::error!(document = job.document, "render job named an unknown document");
+            continue;
+        };
+
         shared.active.fetch_add(1, Ordering::Release);
 
         let result = render_with_timeout(
             renderer.clone(),
-            Arc::clone(document),
+            document,
             RenderRequest {
                 page_index: job.page_index,
                 scale: job.scale,
@@ -247,6 +322,7 @@ fn worker_loop<R>(
         shared.active.fetch_sub(1, Ordering::Release);
 
         let outcome = RenderOutcome {
+            document: job.document,
             page_index: job.page_index,
             scale: job.scale,
             tag: job.tag,

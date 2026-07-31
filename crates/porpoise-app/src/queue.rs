@@ -92,7 +92,7 @@ impl<'a> RenderQueue<'a> {
         let scale = key.bucket.scale() * pixels_per_point;
         if !self
             .pool
-            .submit(key.page, scale, i64::from(key.bucket.rung()))
+            .submit(key.document, key.page, scale, i64::from(key.bucket.rung()))
         {
             return false;
         }
@@ -115,7 +115,7 @@ mod tests {
     use crate::failure::MAX_RENDER_RETRIES;
 
     fn key(page: usize) -> CacheKey {
-        CacheKey::new(page, ZoomBucket::enclosing(1.0))
+        CacheKey::new(0, page, ZoomBucket::enclosing(1.0))
     }
 
     fn timed_out() -> RenderError {
@@ -143,7 +143,7 @@ mod tests {
     fn a_page_at_another_rung_is_a_different_request() {
         // The grid and the column hold the same page at two sizes, so one being in flight
         // must not block the other — that would leave a panel with a permanent grey box.
-        let thumbnail = CacheKey::new(3, ZoomBucket::enclosing(0.1));
+        let thumbnail = CacheKey::new(0, 3, ZoomBucket::enclosing(0.1));
         assert!(worth_asking_for(thumbnail, &[key(3)], &HashMap::new()));
     }
 

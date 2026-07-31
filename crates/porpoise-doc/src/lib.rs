@@ -12,7 +12,7 @@
 mod order;
 mod save;
 
-pub use order::PageOrder;
+pub use order::{PageOrder, Source};
 pub use save::{Overwrite, SaveError, save_reordered};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};

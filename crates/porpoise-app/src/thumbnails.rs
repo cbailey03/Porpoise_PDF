@@ -41,11 +41,14 @@
 //! [`GridMode`]. Which pages are picked is [`crate::selection`]'s decision, not this
 //! module's; all that happens here is turning rectangles into positions.
 
+use std::sync::Arc;
+
 use eframe::egui;
 use eframe::egui::containers::scroll_area::{DragScroll, ScrollSource};
-use porpoise_doc::{Document, PageOrder};
+use porpoise_doc::{Document, PageGeometry, PageOrder, Source};
 use porpoise_view::{CacheKey, PageCache, PageNumber, ZoomBucket};
 
+use crate::button::{Action, Glyph, Toggle, small_button, toggle};
 use crate::queue::RenderQueue;
 use crate::search::PageFilter;
 use crate::selection::{Pick, Selection};
@@ -211,7 +214,11 @@ impl GridMode {
 /// stays the only thing that knows how the grid is arranged.
 pub(crate) struct Grid<'a> {
     pub(crate) order: &'a PageOrder,
-    pub(crate) document: &'a Document,
+    /// Every contributing document, indexed the way `Source::document` does. Not
+    /// `OpenDocument`'s own file list — this module only ever needs geometry, and
+    /// staying decoupled from how the viewer tracks paths is what let it not change
+    /// at all when a document gained more than one contributing file.
+    pub(crate) documents: &'a [Arc<Document>],
     pub(crate) cache: &'a mut PageCache<egui::TextureHandle>,
     /// Where a missing thumbnail is asked for.
     ///
@@ -241,6 +248,31 @@ pub(crate) struct Grid<'a> {
 /// [`THUMBNAIL_WIDTH`] and narrower pages come out proportionally smaller — the same
 /// rule the main column uses, so a grid of mixed page sizes reads the way the document
 /// does. Quantized to a rung because that is what the cache is keyed by.
+/// The geometry of one displayed page, resolved across whichever document it
+/// belongs to.
+fn geometry_of(documents: &[Arc<Document>], source: Source) -> Option<PageGeometry> {
+    documents
+        .get(source.document)?
+        .geometry()
+        .get(source.page)
+        .copied()
+}
+
+/// Geometry of every page currently in `order`, across every contributing document.
+///
+/// Not "every page of every document": a page a delete has dropped from `order` is
+/// no longer shown, so it should not stretch the grid's rows either — see
+/// `docs/goal-5-plan.md` §4 for the sizing this feeds.
+fn shown_geometry<'a>(
+    order: &'a PageOrder,
+    documents: &'a [Arc<Document>],
+) -> impl Iterator<Item = PageGeometry> + 'a {
+    (0..order.len()).filter_map(move |position| {
+        let source = order.source_of(position)?;
+        geometry_of(documents, source)
+    })
+}
+
 pub(crate) fn bucket_for(widest_page_pt: f64, pixels_per_point: f32) -> ZoomBucket {
     if !widest_page_pt.is_finite() || widest_page_pt <= 0.0 {
         return ZoomBucket::enclosing(1.0);
@@ -352,12 +384,12 @@ pub(crate) struct Drawn {
     pub(crate) mode: Option<GridMode>,
     /// The search box's text, when it changed this frame. `Some("")` is a cleared box.
     pub(crate) query: Option<String>,
-    /// Source pages the grid has on screen.
+    /// Sources the grid has on screen.
     ///
     /// Reported because the caller decides eviction and the texture cache has two
     /// consumers; see [`crate::retain`], which exists because this was not reported and
     /// the grid's own thumbnails were being evicted out from under it.
-    pub(crate) showing: Vec<usize>,
+    pub(crate) showing: Vec<Source>,
 }
 
 /// Draws the grid, reporting what it drew.
@@ -397,10 +429,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
         return drawn;
     }
 
-    let widest = grid
-        .document
-        .geometry()
-        .iter()
+    let widest = shown_geometry(grid.order, grid.documents)
         .map(|page| f64::from(page.width_pt))
         .fold(0.0_f64, f64::max);
     let bucket = bucket_for(widest, grid.pixels_per_point);
@@ -410,10 +439,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     let columns = columns_for(ui.available_width(), gap.x);
     let rows = rows_for(slots, columns);
     let box_height = box_height(
-        grid.document
-            .geometry()
-            .iter()
-            .map(|page| page.height_pt / page.width_pt),
+        shown_geometry(grid.order, grid.documents).map(|page| page.height_pt / page.width_pt),
     );
     let cell_height = row_height(box_height, gap.y);
 
@@ -522,13 +548,21 @@ fn search_box(ui: &mut egui::Ui, query: &str) -> Option<String> {
             changed = Some(typed.clone());
         }
         // Only when there is something to clear, so the row does not shift as you type.
+        // Small, because it sits beside the field rather than in a toolbar.
+        //
+        // The mark comes from [`Glyph`], which is also where the character this shipped
+        // with is recorded as one egui draws as an empty box.
         if !query.is_empty()
-            && ui
-                .small_button("✕")
-                .on_hover_text("Show every page again")
-                .clicked()
+            && let Some(cleared) = small_button(
+                ui,
+                Action {
+                    text: Glyph::ClearSearch.text(),
+                    hover: "Show every page again",
+                    produces: Some(String::new()),
+                },
+            )
         {
-            changed = Some(String::new());
+            changed = Some(cleared);
         }
     });
 
@@ -540,13 +574,19 @@ fn tabs(ui: &mut egui::Ui, current: GridMode) -> Option<GridMode> {
     let mut chosen = None;
     ui.horizontal(|ui| {
         for mode in GridMode::EVERY {
-            if ui
-                .selectable_label(mode == current, mode.label())
-                .on_hover_text(mode.hint())
-                .clicked()
-                && mode != current
+            // The tab already showing is dropped rather than greyed out: it has to stay
+            // clickable to look pressed, and re-picking it is not a mode change.
+            if let Some(asked) = toggle(
+                ui,
+                Toggle {
+                    text: mode.label(),
+                    hover: mode.hint(),
+                    on: mode == current,
+                    produces: mode,
+                },
+            ) && asked != current
             {
-                chosen = Some(mode);
+                chosen = Some(asked);
             }
         }
     });
@@ -591,10 +631,10 @@ fn cell(
     bucket: ZoomBucket,
     box_height: f32,
 ) -> CellOutcome {
-    let Some(page) = grid.order.source_of(position) else {
+    let Some(source) = grid.order.source_of(position) else {
         return CellOutcome::default();
     };
-    let geometry = grid.document.geometry().get(page).copied();
+    let geometry = geometry_of(grid.documents, source);
     // Every cell takes the same box, so the row height declared to `show_rows` is the
     // height really drawn. The page is fitted inside it, keeping its own shape.
     let size = egui::vec2(THUMBNAIL_WIDTH, box_height);
@@ -608,7 +648,7 @@ fn cell(
         _ => egui::vec2(THUMBNAIL_WIDTH, box_height),
     };
 
-    let key = CacheKey::new(page, bucket);
+    let key = CacheKey::new(source.document, source.page, bucket);
     let texture = grid.cache.get(key).map(egui::TextureHandle::id);
     if texture.is_none() {
         grid.queue.want(key, grid.pixels_per_point);

@@ -244,6 +244,9 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         "open" => RequestBody::Command(Command::Open {
             path: path_argument("path")?,
         }),
+        "insert_file" => RequestBody::Command(Command::InsertFile {
+            path: path_argument("path")?,
+        }),
         "capture" => RequestBody::Command(Command::Capture {
             path: path_argument("path")?,
         }),
@@ -693,6 +696,12 @@ mod tests {
             }
         );
         assert_eq!(command(r#"{"command":"close"}"#), Command::Close);
+        assert_eq!(
+            command(r#"{"command":"insert_file","path":"b.pdf"}"#),
+            Command::InsertFile {
+                path: PathBuf::from("b.pdf")
+            }
+        );
         assert_eq!(command(r#"{"command":"quit"}"#), Command::Quit);
     }
 

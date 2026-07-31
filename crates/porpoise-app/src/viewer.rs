@@ -56,12 +56,12 @@
 //! drives the real binary over a real pipe.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use porpoise_doc::{Document, Overwrite, PageGeometry, PageOrder};
+use porpoise_doc::{Document, Overwrite, PageGeometry, PageOrder, Source};
 use porpoise_render::{HayroRenderer, RenderPool, RenderedPage};
 use porpoise_view::{
     CacheKey, MAX_SCALE, MIN_SCALE, Outcome, PAGE_GAP_PT, PageCache, PageNumber, ScrollLayout,
@@ -82,7 +82,7 @@ use crate::input::{
     opens_the_picker, wheel_is_for_the_pages,
 };
 use crate::label::file_label;
-use crate::picker::FilePicker;
+use crate::picker::{FilePicker, Purpose};
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::queue::RenderQueue;
 use crate::retain;
@@ -130,24 +130,37 @@ const CAPTURE_WARMUP_FRAMES: u32 = 3;
 /// Frames after which a capture gives up rather than leaving a window open.
 const CAPTURE_BUDGET_FRAMES: u32 = 240;
 
+/// One document contributing pages to what is open, and where it came from.
+///
+/// A merge (`docs/goal-5-plan.md` §3) means the pages on screen can come from more
+/// than one file, so `path` and `document` — a single pair before this goal —
+/// become entries in [`OpenDocument::files`] instead of fields of it.
+struct OpenFile {
+    path: PathBuf,
+    document: Arc<Document>,
+}
+
 /// Everything that belongs to one open document.
 ///
 /// Grouped so that opening another is a single replacement rather than eight
 /// fields to remember to reset — the kind of bookkeeping that goes wrong once a
 /// ninth is added.
 struct OpenDocument {
-    path: PathBuf,
-    document: Arc<Document>,
+    /// Every contributing file, index 0 being the one the viewer was opened with.
+    /// `Source::document` in [`Self::order`] indexes this.
+    files: Vec<OpenFile>,
     /// What order the pages are shown in. Identity until somebody edits it.
     ///
     /// Everything that rasterizes, caches or measures a page goes through this to turn
-    /// a *display position* into a *source page*. The two are the same only before the
-    /// first edit; see `porpoise-doc`'s `order` module for why that distinction gets
-    /// its own crossing point.
+    /// a *display position* into a *source* — a document and a page within it. The two
+    /// are the same document only before the first insert; see `porpoise-doc`'s `order`
+    /// module for why that distinction gets its own crossing point.
     order: PageOrder,
     /// Page positions laid out in a column. Rebuilt whenever [`Self::order`] changes,
     /// because the column is in display order while geometry is in source order.
     layout: ScrollLayout,
+    /// One pool serving every contributing file, sized once regardless of how many
+    /// there are. See `docs/goal-5-plan.md` §4 for why this is not one pool per file.
     pool: RenderPool,
     cache: PageCache<egui::TextureHandle>,
     /// Requests submitted but not yet returned, so a page is not queued twice.
@@ -198,11 +211,18 @@ fn hovered_paths(ctx: &egui::Context) -> Vec<PathBuf> {
 }
 
 /// Page sizes in display order, for laying out the scrolling column.
-fn geometry_in_display_order(document: &Document, order: &PageOrder) -> Vec<PageGeometry> {
+fn geometry_in_display_order(files: &[OpenFile], order: &PageOrder) -> Vec<PageGeometry> {
     order
         .as_slice()
         .iter()
-        .filter_map(|&source| document.geometry().get(source).copied())
+        .filter_map(|source| {
+            files
+                .get(source.document)?
+                .document
+                .geometry()
+                .get(source.page)
+                .copied()
+        })
         .collect()
 }
 
@@ -210,17 +230,19 @@ impl OpenDocument {
     fn new(path: PathBuf, document: Document, bucket: ZoomBucket) -> Self {
         let document = Arc::new(document);
         let order = PageOrder::identity(document.page_count());
-        let layout =
-            ScrollLayout::vertical(&geometry_in_display_order(&document, &order), PAGE_GAP_PT);
+        let files = vec![OpenFile {
+            path,
+            document: Arc::clone(&document),
+        }];
+        let layout = ScrollLayout::vertical(&geometry_in_display_order(&files, &order), PAGE_GAP_PT);
         let pool = RenderPool::new(
-            Arc::clone(&document),
+            document,
             HayroRenderer::new(),
             RenderPool::recommended_workers(),
             JOB_TIMEOUT,
         );
         Self {
-            path,
-            document,
+            files,
             order,
             layout,
             pool,
@@ -231,17 +253,65 @@ impl OpenDocument {
         }
     }
 
+    /// The file this was opened with — what "Save" writes over, and what the window
+    /// title and the snapshot's `document` field name.
+    fn primary_path(&self) -> &Path {
+        // `files` always has at least one entry: `new` puts it there and nothing
+        // ever removes an entry, only appends.
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "files always has at least one entry; see OpenDocument::new"
+        )]
+        &self.files[0].path
+    }
+
+    /// Every contributing file's path, in the order [`PageOrder::source_lens`]
+    /// indexes them — what saving reads from.
+    fn source_paths(&self) -> Vec<PathBuf> {
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
+
+    /// Registers another file's pages as available to show, returning the document
+    /// index [`PageOrder::append`] should use for it.
+    ///
+    /// Always a new entry, never reused even if the path matches one already open:
+    /// the file may have changed on disk since it was first read, and treating it as
+    /// unchanged would be exactly the kind of quiet incorrectness this project
+    /// refuses to ship. See `docs/goal-5-plan.md` §9.
+    fn add_file(&mut self, path: PathBuf, document: Document) -> usize {
+        let document = Arc::new(document);
+        let pool_index = self.pool.add_document(Arc::clone(&document));
+        self.files.push(OpenFile { path, document });
+        // The pool and `files` are appended to together, in the same call, so their
+        // indices agree by construction — this is the one place that could drift.
+        debug_assert_eq!(
+            pool_index,
+            self.files.len() - 1,
+            "the render pool and the file list disagreed about the next index"
+        );
+        self.files.len() - 1
+    }
+
+    /// The geometry of one displayed page, resolved across whichever file it
+    /// belongs to.
+    fn geometry_of(&self, source: Source) -> Option<PageGeometry> {
+        self.files
+            .get(source.document)?
+            .document
+            .geometry()
+            .get(source.page)
+            .copied()
+    }
+
     /// Rebuilds the column after an edit.
     ///
-    /// The layout is in display order and the document's geometry is in source order,
-    /// so any change to [`Self::order`] makes the column wrong until this runs. Cached
-    /// textures are deliberately *not* touched: they are keyed by source page, so
-    /// moving page 300 to the front costs nothing to redraw.
+    /// The layout is in display order and each file's geometry is in its own source
+    /// order, so any change to [`Self::order`] makes the column wrong until this
+    /// runs. Cached textures are deliberately *not* touched: they are keyed by
+    /// source, so moving page 300 to the front costs nothing to redraw.
     fn relayout(&mut self) {
-        self.layout = ScrollLayout::vertical(
-            &geometry_in_display_order(&self.document, &self.order),
-            PAGE_GAP_PT,
-        );
+        self.layout =
+            ScrollLayout::vertical(&geometry_in_display_order(&self.files, &self.order), PAGE_GAP_PT);
     }
 
     /// Whether every requested page has arrived and nothing is outstanding.
@@ -345,7 +415,7 @@ struct Viewer {
     /// list keeping textures alive. Unlike [`Self::thumbnails_rect`], which is read *before*
     /// the grid draws and is therefore last frame's, this is written and read within one
     /// frame.
-    grid_pages: Vec<usize>,
+    grid_pages: Vec<Source>,
 
     timing: FrameTiming,
 
@@ -537,7 +607,7 @@ impl Viewer {
             document: self
                 .open
                 .as_ref()
-                .map(|open| open.path.display().to_string()),
+                .map(|open| open.primary_path().display().to_string()),
             view: self.view().snapshot(),
             pages_cached: self.open.as_ref().map_or(0, |open| open.cache.len()),
             cache_bytes: self.open.as_ref().map_or(0, |open| open.cache.used_bytes()),
@@ -754,7 +824,7 @@ impl Viewer {
         // Deliberately ahead of the busy check below, so "there is nothing to write" wins
         // over "a save is already running" when both are true. It is the more accurate of
         // the two, and it is the one that does not put an error in the status bar.
-        if open.order.is_unedited() && destination == open.path {
+        if open.order.is_unedited() && destination == open.primary_path() {
             return DispatchResult::Unchanged;
         }
         // `Saver::start` refuses only when a save is already running, so this is the one
@@ -762,7 +832,7 @@ impl Viewer {
         // the same message written out twice.
         if self
             .saver
-            .start(&open.path, &open.order, &destination, overwrite)
+            .start(&open.source_paths(), &open.order, &destination, overwrite)
         {
             DispatchResult::Saving
         } else {
@@ -782,6 +852,7 @@ impl Viewer {
             }
             Command::Open { path } => self.open_document(path),
             Command::Close => self.close_document(),
+            Command::InsertFile { path } => self.insert_file(path),
             Command::MovePage { from, to } => {
                 self.edit(|order| order.move_page(from.index(), to.index()))
             }
@@ -824,7 +895,7 @@ impl Viewer {
                 let Some(open) = &self.open else {
                     return DispatchResult::Failed(NOTHING_OPEN.to_owned());
                 };
-                let destination = open.path.clone();
+                let destination = open.primary_path().to_path_buf();
                 self.begin_save(destination, Overwrite::Allow)
             }
             Command::SaveAs { path } => self.begin_save(path, Overwrite::Refuse),
@@ -912,6 +983,31 @@ impl Viewer {
         DispatchResult::Closed
     }
 
+    /// Adds every page of another file to the end of the document that is open.
+    ///
+    /// Goes through [`Self::edit`], the same path every other page edit takes, so an
+    /// insert relayouts, clamps the scroll position and reports `PagesReordered`
+    /// exactly as a move or a delete would — an inserted page is an ordinary one from
+    /// the moment it lands. See `docs/goal-5-plan.md` §3 and §6.
+    fn insert_file(&mut self, path: PathBuf) -> DispatchResult {
+        if self.open.is_none() {
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+        }
+        let document = match Document::open(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not insert document");
+                return DispatchResult::Failed(error.to_string());
+            }
+        };
+        let page_count = document.page_count();
+        let Some(open) = &mut self.open else {
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+        };
+        let document_index = open.add_file(path, document);
+        self.edit(|order| order.append(document_index, page_count))
+    }
+
     fn quit(&mut self, ctx: &egui::Context) -> DispatchResult {
         // Set before asking, so the close request this produces is recognised as ours
         // when it arrives back next frame. Without it the guard re-fires and the window
@@ -951,7 +1047,7 @@ impl Viewer {
                     // Nothing to save, so there is nothing being protected either.
                     return self.carry_out_intent(ctx, intent);
                 };
-                let destination = open.path.clone();
+                let destination = open.primary_path().to_path_buf();
                 match self.begin_save(destination, Overwrite::Allow) {
                     DispatchResult::Saving => {
                         self.guard = Some(Guard::Saving(intent));
@@ -1037,7 +1133,7 @@ impl Viewer {
             // function's whole job is to turn a key into one, so a key that instead
             // asks a person a question does not belong in it.
             if opens_the_picker(key, modifiers) {
-                self.picker.open();
+                self.picker.open(Purpose::Open);
                 continue;
             }
             // Page edits are handled here rather than in `command_for_key` because
@@ -1177,14 +1273,23 @@ impl Viewer {
             None => {
                 self.last_error = None;
                 if let Some(open) = &mut self.open {
-                    // The file we are editing is now the one just written, so a Save As
+                    // The primary file is now the one just written, so a Save As
                     // switches to it — what every editor does, and what stops the status
-                    // bar nagging about a document that has been saved somewhere.
-                    open.path = saved.path;
+                    // bar nagging about a document that has been saved somewhere. The
+                    // other contributing files, if any, keep the paths they were
+                    // inserted from.
+                    if let Some(primary) = open.files.first_mut() {
+                        primary.path = saved.path;
+                    }
                     // The order the *write* saw, not the current one. If pages were
                     // moved while the save ran, those moves are still unsaved and this
                     // is what keeps that true.
-                    open.order.mark_saved(&saved.written);
+                    //
+                    // Document 0 always, because the primary file — just reassigned
+                    // above — is always what a save just rewrote. This is also what
+                    // lets a second save over the same path find the right pages: see
+                    // `PageOrder::on_disk`.
+                    open.order.mark_saved(0, &saved.written);
                 }
                 self.emit(|| Event::Saved { path: where_to });
 
@@ -1210,29 +1315,63 @@ impl Viewer {
         }
     }
 
-    /// Turns a chosen path into an `Open` command. Never blocks.
+    /// Turns a chosen path into an `Open` or `InsertFile` command, matching whichever
+    /// button opened the dialog. Never blocks.
     fn collect_picked_file(&mut self, ctx: &egui::Context) {
+        let purpose = self.picker.purpose();
         if let Some(path) = self.picker.poll() {
-            // Through the normal dispatch, so it emits `DocumentOpened`, reaches the
-            // control channel, and reports failure exactly like an `open` from any
-            // other producer.
-            self.dispatch(ctx, Command::Open { path });
+            // Through the normal dispatch, so it emits the same event, reaches the
+            // control channel, and reports failure exactly like either command from
+            // any other producer.
+            let command = match purpose {
+                Purpose::Open => Command::Open { path },
+                Purpose::Insert => Command::InsertFile { path },
+            };
+            self.dispatch(ctx, command);
         }
     }
 
-    /// Turns a file dropped on the window into an `Open` command.
+    /// Whether a drop landing right now would mean "insert" rather than "open".
+    ///
+    /// True only when a document is open — there is nothing to insert into
+    /// otherwise — and the pointer is over the page grid. Shared by
+    /// [`Self::collect_dropped_files`] and [`Self::draw_drop_hint`] so the hint and
+    /// the actual drop can never disagree, the same reasoning [`crate::input::
+    /// drop_action`] itself is built on.
+    ///
+    /// `thumbnails_rect` is last frame's rectangle — see the field's own docs — the
+    /// same caveat [`crate::input::wheel_is_for_the_pages`] already carries for
+    /// routing a gesture by pointer position.
+    fn drop_targets_the_grid(&self, ctx: &egui::Context) -> bool {
+        self.open.is_some()
+            && self.thumbnails
+            && ctx
+                .pointer_latest_pos()
+                .is_some_and(|pos| self.thumbnails_rect.contains(pos))
+    }
+
+    /// Turns a file dropped on the window into an `Open` or `InsertFile` command.
     ///
     /// The third producer of `Open`, after the command line and the file dialog, and a
     /// producer rather than a command for the same reason the dialog is: an agent
-    /// already has `open` with a path. See [`crate::input::DropAction`].
+    /// already has `open` with a path. Dropped on the page grid with a document
+    /// already open, the same gesture produces `InsertFile` instead — see
+    /// [`crate::input::DropAction`] and `docs/goal-5-plan.md` §6.
     fn collect_dropped_files(&mut self, ctx: &egui::Context) {
-        match drop_action(&dropped_paths(ctx)) {
+        let insert = self.drop_targets_the_grid(ctx);
+        match drop_action(&dropped_paths(ctx), insert) {
             None => {}
             Some(DropAction::Open { path, ignored }) => {
                 if ignored > 0 {
                     tracing::info!(ignored, "opened the first PDF of several dropped files");
                 }
                 self.dispatch(ctx, Command::Open { path });
+            }
+            Some(DropAction::Insert { path, ignored }) => {
+                if ignored > 0 {
+                    tracing::info!(ignored, "inserted the first PDF of several dropped files");
+                }
+                self.dispatch(ctx, Command::InsertFile { path });
             }
             // Set here rather than through `dispatch`, because nothing became a
             // command — the drop was refused before there was one. It still has to be
@@ -1256,7 +1395,7 @@ impl Viewer {
             let Ok(rung) = i16::try_from(outcome.tag) else {
                 continue;
             };
-            let key = CacheKey::new(outcome.page_index, ZoomBucket::from_rung(rung));
+            let key = CacheKey::new(outcome.document, outcome.page_index, ZoomBucket::from_rung(rung));
             if let Some(open) = &mut self.open {
                 open.in_flight.retain(|pending| *pending != key);
             }
@@ -1272,6 +1411,7 @@ impl Viewer {
                     let Some(open) = &mut self.open else { continue };
                     let failure = Failure::from_error(&error, open.failures.get(&key));
                     tracing::warn!(
+                        document = outcome.document,
                         page = outcome.page_index,
                         rung,
                         retries_left = failure.retries_left,
@@ -1298,6 +1438,7 @@ impl Viewer {
 
         let Some(image) = image else {
             tracing::warn!(
+                document = key.document,
                 page = key.page,
                 width = page.width,
                 height = page.height,
@@ -1318,7 +1459,7 @@ impl Viewer {
         };
 
         let handle = ctx.load_texture(
-            format!("page-{}-r{rung}", key.page),
+            format!("page-{}-{}-r{rung}", key.document, key.page),
             image,
             egui::TextureOptions::LINEAR,
         );
@@ -1362,12 +1503,12 @@ impl Viewer {
 
         for position in wanted {
             // `request_order` works in display positions, because that is what the
-            // layout and the viewport are in. The renderer and the cache work in source
-            // pages, so this is where the two meet.
-            let Some(page) = open.order.source_of(position) else {
+            // layout and the viewport are in. The renderer and the cache work in
+            // sources, so this is where the two meet.
+            let Some(source) = open.order.source_of(position) else {
                 continue;
             };
-            let key = CacheKey::new(page, bucket);
+            let key = CacheKey::new(source.document, source.page, bucket);
             if cache.contains(key) {
                 continue;
             }
@@ -1386,10 +1527,10 @@ impl Viewer {
     /// untouched here would make the byte budget evict pages that are on screen.
     fn texture_for(
         cache: &mut PageCache<egui::TextureHandle>,
-        page: usize,
+        source: Source,
         bucket: ZoomBucket,
     ) -> Option<egui::TextureId> {
-        let key = CacheKey::new(page, bucket);
+        let key = CacheKey::new(source.document, source.page, bucket);
         if let Some(texture) = cache.get(key) {
             return Some(texture.id());
         }
@@ -1397,19 +1538,19 @@ impl Viewer {
         // is mutable and the second is not. Slightly soft beats a grey flash while
         // the right resolution renders.
         cache
-            .best_for_page(page, bucket)
+            .best_for_page(source.document, source.page, bucket)
             .map(|(_, texture)| texture.id())
     }
 
     fn paint_page(
         open: &OpenDocument,
         painter: &egui::Painter,
-        page: usize,
+        source: Source,
         bucket: ZoomBucket,
         rect: egui::Rect,
         texture: Option<egui::TextureId>,
     ) {
-        let key = CacheKey::new(page, bucket);
+        let key = CacheKey::new(source.document, source.page, bucket);
 
         if let Some(id) = texture {
             painter.image(id, rect, FULL_UV, egui::Color32::WHITE);
@@ -1425,7 +1566,7 @@ impl Viewer {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_BOTTOM,
-                format!("page {} could not be rendered", page + 1),
+                format!("page {} could not be rendered", source.page + 1),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(230, 140, 140),
             );
@@ -1550,17 +1691,17 @@ impl Viewer {
             // Resolved in a first pass because a cache hit is a *use* and updates
             // LRU order, which needs the cache mutably — while painting needs the
             // layout and geometry immutably.
-            let tiles: Vec<(usize, egui::Rect, Option<egui::TextureId>)> = visible
+            let tiles: Vec<(Source, egui::Rect, Option<egui::TextureId>)> = visible
                 .clone()
                 .filter_map(|position| {
-                    // `position` is where the page sits in the column; `page` is which
-                    // page of the source document that is. They differ after any edit,
-                    // so the layout is asked in positions and the geometry, cache and
-                    // renderer in source pages.
-                    let page = open.order.source_of(position)?;
+                    // `position` is where the page sits in the column; `source` is which
+                    // document and page that is. They differ after any edit, so the
+                    // layout is asked in positions and the geometry, cache and renderer
+                    // in sources.
+                    let source = open.order.source_of(position)?;
                     // Relative to the column, which in paged mode starts at this page.
                     let top_pt = open.layout.page_top_pt(position)? - column_top_pt;
-                    let geometry = open.document.geometry().get(page).copied()?;
+                    let geometry = open.geometry_of(source)?;
 
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -1579,13 +1720,13 @@ impl Viewer {
                         )
                     };
 
-                    let texture = Self::texture_for(&mut open.cache, page, bucket);
-                    Some((page, rect, texture))
+                    let texture = Self::texture_for(&mut open.cache, source, bucket);
+                    Some((source, rect, texture))
                 })
                 .collect();
 
-            for (page, rect, texture) in tiles {
-                Self::paint_page(open, ui.painter(), page, bucket, rect, texture);
+            for (source, rect, texture) in tiles {
+                Self::paint_page(open, ui.painter(), source, bucket, rect, texture);
             }
         });
 
@@ -1611,7 +1752,8 @@ impl Viewer {
         let keep = retain::pages_to_keep(&visible, RETAIN_PAGES, grid, |position| {
             open.order.source_of(position)
         });
-        open.cache.retain_pages(|page| keep.contains(&page));
+        open.cache
+            .retain_pages(|document, page| keep.contains(&Source { document, page }));
     }
 
     /// Draws the page grid and dispatches whatever gesture landed in it.
@@ -1631,9 +1773,18 @@ impl Viewer {
             return;
         };
 
+        // A small, cheap-to-clone list of `Arc<Document>` handles, so the grid can
+        // resolve a `Source` to geometry across every contributing file without
+        // reaching into `OpenDocument`'s own layout, which stays private to this
+        // module.
+        let documents: Vec<Arc<Document>> = open
+            .files
+            .iter()
+            .map(|file| Arc::clone(&file.document))
+            .collect();
         let mut grid = Grid {
             order: &open.order,
-            document: &open.document,
+            documents: &documents,
             cache: &mut open.cache,
             queue: RenderQueue::new(&open.pool, &mut open.in_flight, &mut open.failures),
             current,
@@ -1721,7 +1872,8 @@ impl Viewer {
     /// Drawn from the same [`drop_action`] the drop itself uses, so the window cannot
     /// invite something it then refuses.
     fn draw_drop_hint(&self, ctx: &egui::Context) {
-        let Some(action) = drop_action(&hovered_paths(ctx)) else {
+        let insert = self.drop_targets_the_grid(ctx);
+        let Some(action) = drop_action(&hovered_paths(ctx), insert) else {
             return;
         };
         chrome::drop_hint(ctx, &action, self.unsaved_changes());
@@ -1738,12 +1890,13 @@ impl Viewer {
                 scroll_mode: self.state.scroll_mode(),
                 thumbnails: self.thumbnails,
                 picker_open: self.picker.is_open(),
+                document_open: self.open.is_some(),
             },
         );
 
         let ctx = ui.ctx().clone();
-        if clicked.open_picker {
-            self.picker.open();
+        if let Some(purpose) = clicked.open_picker {
+            self.picker.open(purpose);
         }
         for command in clicked.commands {
             self.dispatch(&ctx, command);

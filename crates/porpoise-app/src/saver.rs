@@ -16,20 +16,22 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use porpoise_doc::{Overwrite, PageOrder, save_reordered};
+use porpoise_doc::{Overwrite, PageOrder, Source, save_reordered};
 
 /// A save that has finished.
 #[derive(Debug)]
 pub(crate) struct Saved {
-    /// Where it was written.
+    /// Where the primary file was written.
     pub(crate) path: PathBuf,
     /// The page order that went into the file, in display order.
     ///
     /// Reported back rather than re-read from the document, because the order can move
     /// while the write runs — see [`Saver::start`]. This is what
     /// `PageOrder::mark_saved` needs to get "unsaved changes" right when somebody keeps
-    /// editing during a save.
-    pub(crate) written: Vec<usize>,
+    /// editing during a save, and to record what the primary document's file now
+    /// physically holds, so a second save over the same path still finds the right
+    /// pages.
+    pub(crate) written: Vec<Source>,
     /// What went wrong, if anything.
     pub(crate) error: Option<String>,
 }
@@ -55,13 +57,16 @@ impl Saver {
 
     /// Starts a save, unless one is already running.
     ///
+    /// `sources` is one path per document `order` refers to, index for index — see
+    /// `OpenDocument::source_paths` for how the viewer builds it.
+    ///
     /// Returns whether it started. The order is copied rather than borrowed so the
     /// caller can go on editing while the write runs — the saved file reflects the
     /// order as it was when the save began, which is the only interpretation that does
     /// not need a lock.
     pub(crate) fn start(
         &mut self,
-        source: &Path,
+        sources: &[PathBuf],
         order: &PageOrder,
         destination: &Path,
         overwrite: Overwrite,
@@ -70,7 +75,7 @@ impl Saver {
             return false;
         }
         let (sender, receiver) = channel();
-        let source = source.to_path_buf();
+        let sources = sources.to_vec();
         let order = order.clone();
         let destination = destination.to_path_buf();
         let reported = destination.clone();
@@ -79,7 +84,7 @@ impl Saver {
         let written = order.as_slice().to_vec();
 
         std::thread::spawn(move || {
-            let error = save_reordered(&source, &order, &destination, overwrite)
+            let error = save_reordered(&sources, &order, &destination, overwrite)
                 .err()
                 .map(|failure| failure.to_string());
             // A closed channel means the viewer exited mid-save. The file is already
@@ -165,7 +170,7 @@ mod tests {
         let mut saver = Saver::default();
         let mut order = PageOrder::identity(3);
         assert!(order.move_page(0, 2));
-        assert!(saver.start(&source, &order, &destination, Overwrite::Refuse));
+        assert!(saver.start(std::slice::from_ref(&source), &order, &destination, Overwrite::Refuse));
         assert!(saver.is_busy(), "reported idle with a save running");
         assert_eq!(saver.destination(), Some(destination.as_path()));
 
@@ -189,7 +194,7 @@ mod tests {
         let mut order = PageOrder::identity(3);
         assert!(order.move_page(0, 2));
         let expected = order.as_slice().to_vec();
-        assert!(saver.start(&source, &order, &destination, Overwrite::Refuse));
+        assert!(saver.start(std::slice::from_ref(&source), &order, &destination, Overwrite::Refuse));
 
         // Kept editing while the write ran, exactly as a person would.
         assert!(order.move_page(0, 1));
@@ -212,7 +217,7 @@ mod tests {
 
         let mut saver = Saver::default();
         assert!(saver.start(
-            &source,
+            std::slice::from_ref(&source),
             &PageOrder::identity(3),
             &destination,
             Overwrite::Refuse
@@ -235,9 +240,9 @@ mod tests {
 
         let mut saver = Saver::default();
         let order = PageOrder::identity(3);
-        assert!(saver.start(&source, &order, &first, Overwrite::Refuse));
+        assert!(saver.start(std::slice::from_ref(&source), &order, &first, Overwrite::Refuse));
         assert!(
-            !saver.start(&source, &order, &second, Overwrite::Refuse),
+            !saver.start(std::slice::from_ref(&source), &order, &second, Overwrite::Refuse),
             "started a second save while one was running"
         );
 
@@ -256,7 +261,7 @@ mod tests {
         for round in 0..2 {
             let destination = scratch(&format!("again-{round}.pdf"));
             assert!(
-                saver.start(&source, &order, &destination, Overwrite::Refuse),
+                saver.start(std::slice::from_ref(&source), &order, &destination, Overwrite::Refuse),
                 "round {round} was refused"
             );
             let saved = wait(&mut saver);

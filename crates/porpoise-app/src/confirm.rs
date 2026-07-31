@@ -102,10 +102,12 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         Command::Open { path } => Some(Intent::Open(path.clone())),
 
         // Everything below either leaves the document alone, or is how you *keep* the
-        // changes rather than lose them. `Answer` in particular must never be guarded:
-        // it is the way out of the question, so guarding it would be a trap with no
-        // exit.
+        // changes rather than lose them. `InsertFile` only adds pages, so there is
+        // nothing at risk to ask about — see `docs/goal-5-plan.md` §6. `Answer` in
+        // particular must never be guarded: it is the way out of the question, so
+        // guarding it would be a trap with no exit.
         Command::View(_)
+        | Command::InsertFile { .. }
         | Command::Capture { .. }
         | Command::MovePage { .. }
         | Command::MovePages { .. }
@@ -166,6 +168,11 @@ mod tests {
     fn saving_is_never_guarded_because_it_is_the_way_to_keep_the_changes() {
         assert_eq!(intent_of(&Command::Save), None);
         assert_eq!(intent_of(&Command::SaveAs { path: path() }), None);
+    }
+
+    #[test]
+    fn inserting_a_file_is_never_guarded_because_it_only_adds_pages() {
+        assert_eq!(intent_of(&Command::InsertFile { path: path() }), None);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! and `render` rasterizes one page to a PNG. See `docs/goal-1-plan.md`,
 //! section 4.
 
+mod button;
 mod chrome;
 mod command;
 mod confirm;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
-use porpoise_doc::Document;
+use porpoise_doc::{Document, Overwrite, PageOrder, save_reordered};
 use porpoise_render::{
     HayroRenderer, RenderError, RenderLimits, RenderRequest, render_with_timeout,
 };
@@ -102,6 +103,12 @@ enum Command {
     Render(RenderArgs),
     /// Open a window driven by commands on stdin, reporting on stdout.
     Serve(ServeArgs),
+    /// Combine several PDFs into one, in the order given.
+    ///
+    /// A thin wrapper over the same save path the viewer's `insert_file` command
+    /// uses — see `docs/goal-5-plan.md` §6 — so an agent that wants two files
+    /// combined does not have to open a window to ask for it.
+    Merge(MergeArgs),
 }
 
 #[derive(Args)]
@@ -150,6 +157,18 @@ struct RenderArgs {
     max_pixels: Option<u64>,
 }
 
+#[derive(Args)]
+struct MergeArgs {
+    /// The PDFs to combine, in the order they should appear. At least two.
+    #[arg(required = true, num_args = 2..)]
+    files: Vec<PathBuf>,
+
+    /// Where to write the combined PDF. Overwritten if it already exists, the same
+    /// convention `render`'s `--output` already uses.
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
 fn main() -> ExitCode {
     // Taken before anything else so "time to first page" includes argument
     // parsing, file reading and window creation — everything the user waits for.
@@ -161,6 +180,7 @@ fn main() -> ExitCode {
         Some(Command::Info(args)) => run_info(&args),
         Some(Command::Render(args)) => run_render(&args),
         Some(Command::Serve(args)) => run_serve(&args),
+        Some(Command::Merge(args)) => run_merge(&args),
         None => run_viewer(
             cli.file.as_deref(),
             cli.start_page,
@@ -415,6 +435,36 @@ fn run_render(args: &RenderArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Combines `args.files`, in order, into `args.output`.
+///
+/// The same primitive the viewer's `insert_file` command uses — `porpoise-doc`
+/// takes a list of source paths and an order regardless of whether that order came
+/// from a live page grid or a command line — so this is a thin wrapper, the same
+/// shape `run_info` and `run_render` already are over `Document`.
+fn run_merge(args: &MergeArgs) -> Result<(), Box<dyn Error>> {
+    let mut counts = Vec::with_capacity(args.files.len());
+    for file in &args.files {
+        counts.push(Document::open(file)?.page_count());
+    }
+
+    // `clap` enforces at least two files, so `counts` is never empty — `unwrap_or`
+    // is a safe fallback for a case that cannot arise, not a guess.
+    let mut order = PageOrder::identity(counts.first().copied().unwrap_or(0));
+    for (document, &count) in counts.iter().enumerate().skip(1) {
+        order.append(document, count);
+    }
+
+    save_reordered(&args.files, &order, &args.output, Overwrite::Allow)?;
+
+    println!(
+        "wrote {} — {} page(s) from {} file(s)",
+        args.output.display(),
+        order.len(),
+        args.files.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +591,36 @@ mod tests {
             "porpoise", "render", "f.pdf", "-o", "out.png", "--dpi", "150", "--scale", "2",
         ]);
         assert!(result.is_err(), "--dpi and --scale must conflict");
+    }
+
+    #[test]
+    fn merge_needs_at_least_two_files() {
+        let result = Cli::try_parse_from(["porpoise", "merge", "a.pdf", "-o", "out.pdf"]);
+        assert!(result.is_err(), "one file is not a merge");
+    }
+
+    #[test]
+    fn merge_needs_an_output_path() {
+        let result = Cli::try_parse_from(["porpoise", "merge", "a.pdf", "b.pdf"]);
+        assert!(result.is_err(), "--output should be required");
+    }
+
+    #[test]
+    fn merge_accepts_several_files_in_order() {
+        let cli = Cli::try_parse_from(["porpoise", "merge", "a.pdf", "b.pdf", "c.pdf", "-o", "out.pdf"])
+            .expect("should parse");
+        let Some(Command::Merge(args)) = cli.command else {
+            panic!("expected the merge subcommand");
+        };
+        assert_eq!(
+            args.files,
+            vec![
+                PathBuf::from("a.pdf"),
+                PathBuf::from("b.pdf"),
+                PathBuf::from("c.pdf")
+            ]
+        );
+        assert_eq!(args.output, PathBuf::from("out.pdf"));
     }
 
     #[test]

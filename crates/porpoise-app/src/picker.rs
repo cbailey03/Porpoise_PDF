@@ -20,6 +20,21 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
+/// What a chosen path is for.
+///
+/// The dialog itself does not care — it is one file picker either way — but the
+/// viewer needs to know which command a returned path should become. See
+/// `docs/goal-5-plan.md` §6: **Add pages…** reuses this same picker rather than
+/// growing a second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Purpose {
+    /// Becomes `Command::Open`, replacing whatever is open.
+    #[default]
+    Open,
+    /// Becomes `Command::InsertFile`, adding to the document already open.
+    Insert,
+}
+
 /// A pending request for a path.
 ///
 /// The seam for testing: everything except the `rfd` call itself goes through
@@ -30,6 +45,8 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 pub(crate) struct FilePicker {
     /// `Some` while a dialog is open and unanswered.
     pending: Option<Receiver<Option<PathBuf>>>,
+    /// What the most recently opened (or answered) dialog was for.
+    purpose: Purpose,
 }
 
 impl FilePicker {
@@ -41,23 +58,41 @@ impl FilePicker {
         self.pending.is_some()
     }
 
-    /// Opens the dialog, unless one is already open.
-    pub(crate) fn open(&mut self) {
+    /// What the path [`Self::poll`] returns should be used for.
+    ///
+    /// Valid to read once [`Self::poll`] has returned `Some` for the dialog this
+    /// purpose was recorded for — reading it before then would describe a dialog
+    /// that has not answered yet, which no caller has a reason to do.
+    pub(crate) fn purpose(&self) -> Purpose {
+        self.purpose
+    }
+
+    /// Opens the dialog for `purpose`, unless one is already open.
+    ///
+    /// A dialog already open keeps its original purpose: the second `Ctrl+O` (or
+    /// **Add pages…**) that arrives while one is up is dropped entirely, same as
+    /// today, so there is nothing to reconcile.
+    pub(crate) fn open(&mut self, purpose: Purpose) {
         if self.is_open() {
             return;
         }
         let (sender, receiver) = channel();
+        let title = match purpose {
+            Purpose::Open => "Open a PDF",
+            Purpose::Insert => "Add pages from a PDF",
+        };
         // Detached on purpose. If the viewer exits while a dialog is up, the thread
         // finds a closed channel and drops the answer, which is the correct outcome —
         // there is nothing left to open the file into.
         std::thread::spawn(move || {
             let chosen = rfd::FileDialog::new()
                 .add_filter("PDF", &["pdf"])
-                .set_title("Open a PDF")
+                .set_title(title)
                 .pick_file();
             let _ = sender.send(chosen);
         });
         self.pending = Some(receiver);
+        self.purpose = purpose;
     }
 
     /// Takes the chosen path, if the person has answered since the last poll.
@@ -88,6 +123,16 @@ impl FilePicker {
     fn with_pending(receiver: Receiver<Option<PathBuf>>) -> Self {
         Self {
             pending: Some(receiver),
+            purpose: Purpose::Open,
+        }
+    }
+
+    /// Installs a channel for a dialog opened with a specific purpose. Tests only.
+    #[cfg(test)]
+    fn with_pending_for(receiver: Receiver<Option<PathBuf>>, purpose: Purpose) -> Self {
+        Self {
+            pending: Some(receiver),
+            purpose,
         }
     }
 }
@@ -157,12 +202,37 @@ mod tests {
         // thread's own dialog call is what cannot be tested here.
         let (sender, receiver) = channel();
         let mut picker = FilePicker::with_pending(receiver);
-        picker.open();
+        picker.open(Purpose::Open);
 
         // Still the channel we installed, not a replacement: sending on it arrives.
         sender
             .send(Some(PathBuf::from("first.pdf")))
             .expect("the original channel should still be the live one");
         assert_eq!(picker.poll(), Some(PathBuf::from("first.pdf")));
+    }
+
+    #[test]
+    fn a_fresh_picker_defaults_to_opening() {
+        assert_eq!(FilePicker::default().purpose(), Purpose::Open);
+    }
+
+    #[test]
+    fn the_purpose_a_dialog_was_opened_for_is_remembered() {
+        let (_sender, receiver) = channel();
+        let picker = FilePicker::with_pending_for(receiver, Purpose::Insert);
+        assert_eq!(picker.purpose(), Purpose::Insert);
+    }
+
+    #[test]
+    fn a_second_open_while_one_is_running_does_not_change_the_purpose() {
+        // The live dialog keeps answering what it was originally asked, even if a
+        // second request — for the other purpose — arrives while it is still up.
+        let (sender, receiver) = channel();
+        let mut picker = FilePicker::with_pending_for(receiver, Purpose::Insert);
+        picker.open(Purpose::Open);
+        assert_eq!(picker.purpose(), Purpose::Insert, "a dropped request changed the purpose");
+
+        sender.send(Some(PathBuf::from("b.pdf"))).expect("still listening");
+        assert_eq!(picker.poll(), Some(PathBuf::from("b.pdf")));
     }
 }

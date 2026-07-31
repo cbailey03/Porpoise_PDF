@@ -35,6 +35,16 @@ pub(crate) enum Command {
     },
     /// Close the open document, leaving an empty window.
     Close,
+    /// Add every page of another PDF to the end of the document that is open.
+    ///
+    /// Not guarded by [`crate::confirm`]: it only adds pages, so there is nothing at
+    /// risk to ask about. Once appended, an inserted page is an ordinary entry — it
+    /// can be moved, deleted, selected and saved with the tools that already exist
+    /// for any other page. See `docs/goal-5-plan.md` §6.
+    InsertFile {
+        /// The file to bring in.
+        path: PathBuf,
+    },
     /// Write the window's current contents to a PNG.
     ///
     /// Waits for the render pipeline to settle first, so the capture shows pages
@@ -150,6 +160,7 @@ impl Command {
             Self::View(view) => view.name(),
             Self::Open { .. } => "open",
             Self::Close => "close",
+            Self::InsertFile { .. } => "insert_file",
             Self::Capture { .. } => "capture",
             Self::MovePage { .. } => "move_page",
             Self::MovePages { .. } => "move_pages",
@@ -182,6 +193,9 @@ impl Command {
                 path: placeholder(),
             },
             Self::Close,
+            Self::InsertFile {
+                path: placeholder(),
+            },
             Self::Capture {
                 path: placeholder(),
             },
@@ -253,6 +267,13 @@ mod tests {
             "open"
         );
         assert_eq!(Command::Close.name(), "close");
+        assert_eq!(
+            Command::InsertFile {
+                path: PathBuf::from("b.pdf")
+            }
+            .name(),
+            "insert_file"
+        );
         assert_eq!(Command::Quit.name(), "quit");
     }
 
@@ -275,6 +296,7 @@ mod tests {
                 Command::View(_)
                 | Command::Open { .. }
                 | Command::Close
+                | Command::InsertFile { .. }
                 | Command::Capture { .. }
                 | Command::MovePage { .. }
                 | Command::MovePages { .. }
@@ -296,7 +318,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            16,
+            17,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

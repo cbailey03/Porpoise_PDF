@@ -14,10 +14,18 @@ use std::collections::hash_map::Entry as MapEntry;
 
 use crate::ZoomBucket;
 
-/// Identifies one rasterization: a page at a particular zoom rung.
+/// Identifies one rasterization: a page of a particular document at a particular
+/// zoom rung.
+///
+/// `document` exists because a merge (`docs/goal-5-plan.md` §3) can put pages from
+/// more than one document on screen at once, and two different files can each have
+/// a "page 3" — without this they would collide in the cache and one would be
+/// offered as the other's stale-rung fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    /// Zero-based page index.
+    /// Which contributing document, matching `porpoise_doc::Source::document`.
+    pub document: usize,
+    /// Zero-based page index within that document.
     pub page: usize,
     /// The zoom rung it was rasterized for.
     pub bucket: ZoomBucket,
@@ -26,8 +34,8 @@ pub struct CacheKey {
 impl CacheKey {
     /// Convenience constructor.
     #[must_use]
-    pub fn new(page: usize, bucket: ZoomBucket) -> Self {
-        Self { page, bucket }
+    pub fn new(document: usize, page: usize, bucket: ZoomBucket) -> Self {
+        Self { document, page, bucket }
     }
 }
 
@@ -99,18 +107,27 @@ impl<T> PageCache<T> {
         Some(&entry.value)
     }
 
-    /// Any cached rasterization of `page`, preferring the closest zoom to
-    /// `desired`.
+    /// Any cached rasterization of `page` in `document`, preferring the closest
+    /// zoom to `desired`.
     ///
     /// This is what stops a zoom change from flashing grey: the previous rung's
     /// texture is drawn, slightly the wrong resolution, until the right one
     /// arrives. Does not affect LRU order, because it is a fallback rather than a
     /// real use.
+    ///
+    /// Scoped to `document` as well as `page`, or a merged document showing more
+    /// than one file at once could offer one file's page 3 as a fallback for
+    /// another's.
     #[must_use]
-    pub fn best_for_page(&self, page: usize, desired: ZoomBucket) -> Option<(CacheKey, &T)> {
+    pub fn best_for_page(
+        &self,
+        document: usize,
+        page: usize,
+        desired: ZoomBucket,
+    ) -> Option<(CacheKey, &T)> {
         self.entries
             .iter()
-            .filter(|(key, _)| key.page == page)
+            .filter(|(key, _)| key.document == document && key.page == page)
             .min_by_key(|(key, _)| key.bucket.rung().abs_diff(desired.rung()))
             .map(|(key, entry)| (*key, &entry.value))
     }
@@ -143,15 +160,19 @@ impl<T> PageCache<T> {
         self.evict_to_budget(key);
     }
 
-    /// Drops everything whose page falls outside `keep`.
+    /// Drops everything whose (document, page) falls outside `keep`.
     ///
     /// The byte budget alone would eventually do this, but only after the cache
     /// filled up. Dropping by position keeps memory proportional to the viewport
     /// even when the budget is generous.
-    pub fn retain_pages(&mut self, keep: impl Fn(usize) -> bool) {
+    ///
+    /// Takes both fields of the key, not just `page`: a merged document can show
+    /// page 3 of two different files at once, and a predicate that only saw `page`
+    /// would keep or evict them together.
+    pub fn retain_pages(&mut self, keep: impl Fn(usize, usize) -> bool) {
         let mut freed = 0_usize;
         self.entries.retain(|key, entry| {
-            let kept = keep(key.page);
+            let kept = keep(key.document, key.page);
             if !kept {
                 freed = freed.saturating_add(entry.bytes);
             }
@@ -205,7 +226,11 @@ mod tests {
     use super::*;
 
     fn key(page: usize, zoom: f32) -> CacheKey {
-        CacheKey::new(page, ZoomBucket::enclosing(zoom))
+        CacheKey::new(0, page, ZoomBucket::enclosing(zoom))
+    }
+
+    fn key_in(document: usize, page: usize, zoom: f32) -> CacheKey {
+        CacheKey::new(document, page, ZoomBucket::enclosing(zoom))
     }
 
     #[test]
@@ -295,7 +320,7 @@ mod tests {
 
         // Wanting 3.5x should reuse the 4.0x render, not the 0.5x one.
         let (found, value) = cache
-            .best_for_page(0, ZoomBucket::enclosing(3.5))
+            .best_for_page(0, 0, ZoomBucket::enclosing(3.5))
             .expect("some bucket for page 0");
         assert_eq!(*value, 40);
         assert_eq!(found.bucket, ZoomBucket::enclosing(4.0));
@@ -305,8 +330,21 @@ mod tests {
     fn best_for_page_ignores_other_pages() {
         let mut cache: PageCache<u32> = PageCache::new(10_000);
         cache.insert(key(7, 1.0), 70, 10);
-        assert!(cache.best_for_page(0, ZoomBucket::enclosing(1.0)).is_none());
-        assert!(cache.best_for_page(7, ZoomBucket::enclosing(1.0)).is_some());
+        assert!(cache.best_for_page(0, 0, ZoomBucket::enclosing(1.0)).is_none());
+        assert!(cache.best_for_page(0, 7, ZoomBucket::enclosing(1.0)).is_some());
+    }
+
+    #[test]
+    fn best_for_page_is_scoped_to_its_own_document() {
+        // A merged document can show page 3 of two different files at once. A cached
+        // page 3 from document 1 must never be offered as document 0's fallback.
+        let mut cache: PageCache<u32> = PageCache::new(10_000);
+        cache.insert(key_in(1, 3, 1.0), 13, 10);
+        assert!(
+            cache.best_for_page(0, 3, ZoomBucket::enclosing(1.0)).is_none(),
+            "offered another document's page as a fallback"
+        );
+        assert!(cache.best_for_page(1, 3, ZoomBucket::enclosing(1.0)).is_some());
     }
 
     #[test]
@@ -317,12 +355,30 @@ mod tests {
         }
         assert_eq!(cache.used_bytes(), 1000);
 
-        cache.retain_pages(|page| (4..7).contains(&page));
+        cache.retain_pages(|_document, page| (4..7).contains(&page));
 
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.used_bytes(), 300);
         assert!(cache.contains(key(5, 1.0)));
         assert!(!cache.contains(key(0, 1.0)));
+    }
+
+    #[test]
+    fn retain_pages_treats_the_same_page_number_in_different_documents_independently() {
+        // Keeping "page 3" must not be a blanket rule across every document — two
+        // files can each have a page 3, and one being on screen says nothing about
+        // the other.
+        let mut cache: PageCache<u32> = PageCache::new(10_000);
+        cache.insert(key_in(0, 3, 1.0), 3, 100);
+        cache.insert(key_in(1, 3, 1.0), 13, 100);
+
+        cache.retain_pages(|document, page| document == 0 && page == 3);
+
+        assert!(cache.contains(key_in(0, 3, 1.0)));
+        assert!(
+            !cache.contains(key_in(1, 3, 1.0)),
+            "kept the other document's page 3 alongside this one's"
+        );
     }
 
     #[test]

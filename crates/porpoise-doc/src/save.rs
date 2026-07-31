@@ -1,4 +1,4 @@
-//! Writing a reordered document back out.
+//! Writing a reordered — and possibly merged — document back out.
 //!
 //! The only part of this crate that uses `lopdf`, and the only part that writes to
 //! disk. Both facts drive the shape: guards first, then a write that cannot leave a
@@ -7,19 +7,54 @@
 //! # Why two parsers, and what keeps them honest
 //!
 //! Pages are opened and rasterized with `hayro`, which cannot write PDFs, so saving
-//! uses `lopdf`. The file is therefore parsed twice, and the two have to agree on
-//! what "page 3" is — if they disagree, a reorder moves the wrong page and writes the
-//! mistake to disk. [`save_reordered`] refuses rather than guessing.
+//! uses `lopdf`. Each contributing file is therefore parsed twice, once by each
+//! library, and the two have to agree on what "page 3" of a given file is — if they
+//! disagree, a reorder moves the wrong page and writes the mistake to disk.
+//! [`save_reordered`] refuses rather than guessing, for every contributing file.
 //!
-//! Measured on three real drawing sets before relying on it: hayro and lopdf agreed on
-//! the page count for all three, and all three had flat page trees. See
-//! `docs/goal-4-plan.md` §2.
+//! Measured on three real drawing sets before relying on it for a single document:
+//! hayro and lopdf agreed on the page count for all three, and all three had flat
+//! page trees. See `docs/goal-4-plan.md` §2.
+//!
+//! # Merging more than one document
+//!
+//! [`PageOrder`] can now name pages from more than one contributing file
+//! (`docs/goal-5-plan.md` §3), and [`save_reordered`] takes one source path per
+//! document `order` refers to. Combining them uses the recipe `lopdf` 0.44 ships as
+//! its own `examples/merge.rs`: every object of a secondary document is renumbered
+//! with [`lopdf::Document::renumber_objects_with`] so its ids cannot collide with
+//! the primary's, then folded into the primary's object table wholesale — not only
+//! the objects on retained pages. `Document::prune_objects`, which this module
+//! already calls to clean up deleted pages, is what drops everything a merge pulled
+//! in but `order` did not keep; lopdf's own reachability walk does the filtering, so
+//! nothing here has to.
+//!
+//! Bookmarks, outlines, form fields and named destinations are not carried across —
+//! `lopdf`'s own merge example drops them too, with the same reasoning: merging them
+//! correctly is real work with its own design questions, and nothing has asked for
+//! it yet. See `docs/goal-5-plan.md` §5.
+//!
+//! # Saving the same path more than once
+//!
+//! A `Source`'s `page` is fixed at open or insert time and never changes — but a
+//! save rewrites a document's file, compacted to only its retained pages and
+//! renumbered from zero, so re-reading that file afterwards no longer agrees that
+//! physical page `n` is `Source`'s page `n`. [`PageOrder::on_disk`] is what closes
+//! that gap: it names, for each document, the stable `Source` its file's physical
+//! page `n` currently is, updated only by [`PageOrder::mark_saved`]. This module
+//! looks pages up through it rather than through `source.page` directly, so saving
+//! the same path a second time — after a delete has changed its page count, or even
+//! after a plain reorder that has not — still finds the pages `order` actually
+//! means. See `docs/goal-5-plan.md` §9a, where saving twice over the same path was
+//! found to either refuse a save that should succeed, or write the wrong pages
+//! without complaint.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lopdf::{Document as LoDocument, Object, ObjectId};
 
-use crate::PageOrder;
+use crate::{PageOrder, Source};
 
 /// Why a document could not be saved.
 ///
@@ -27,7 +62,7 @@ use crate::PageOrder;
 /// from a partial write, because the whole point is that the original survives.
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    /// The source could not be read or parsed for writing.
+    /// A contributing file could not be read or parsed for writing.
     #[error("could not read {path} for saving: {detail}")]
     Source {
         /// The file we tried to read.
@@ -35,41 +70,44 @@ pub enum SaveError {
         /// The parser's complaint.
         detail: String,
     },
-    /// The two parsers disagree about how many pages the document has.
+    /// hayro and `lopdf` disagree about how many pages one contributing file has.
     ///
     /// Refused rather than guessed. If `lopdf` sees a different set of pages than
-    /// `hayro` did, then the positions being reordered do not mean what the person
-    /// reordering them saw, and the result would be scrambled in a way nobody notices
-    /// until later.
+    /// `hayro` did for this file, then the positions naming it do not mean what the
+    /// person editing saw, and the result would be scrambled in a way nobody
+    /// notices until later.
     #[error(
         "cannot edit {path} safely: it was opened with {opened} page(s) but reads as \
          {found} for writing"
     )]
     PageCountMismatch {
-        /// The file.
+        /// The file that disagreed.
         path: PathBuf,
-        /// What the viewer opened.
+        /// What the viewer opened it with.
         opened: usize,
         /// What the writer found.
         found: usize,
     },
-    /// The page tree has branches, so reordering could change what pages inherit.
+    /// A contributing file's page tree has branches, so reordering — or merging —
+    /// could change what its pages inherit.
     ///
     /// In a nested tree a page can inherit `/Resources`, `/MediaBox`, `/Rotate` or
-    /// `/CropBox` from the branch above it. Moving pages between branches changes
-    /// that, and `lopdf` 0.44 offers no inherited-attribute support, so doing it
-    /// correctly means pushing those attributes down onto each page first. Not yet
-    /// implemented; refused meanwhile, because the failure mode is a document that
-    /// renders wrong rather than one that fails to open.
+    /// `/CropBox` from the branch above it. Moving pages between branches, or into
+    /// another document entirely, changes that, and `lopdf` 0.44 offers no
+    /// inherited-attribute support, so doing it correctly means pushing those
+    /// attributes down onto each page first. Not yet implemented; refused
+    /// meanwhile, because the failure mode is a document that renders wrong rather
+    /// than one that fails to open.
     #[error("cannot edit {path} yet: its page tree is nested, which this cannot reorder safely")]
     NestedPageTree {
         /// The file.
         path: PathBuf,
     },
-    /// The page tree could not be understood at all.
+    /// A contributing file's page tree could not be understood at all.
     #[error("could not read the page tree of {path}: {detail}")]
     PageTree {
-        /// The file.
+        /// The file this is about, or the intended destination when the problem is
+        /// with the combination rather than any one input.
         path: PathBuf,
         /// What was wrong.
         detail: String,
@@ -100,59 +138,107 @@ pub enum Overwrite {
     Refuse,
 }
 
-/// Writes `source` to `destination` with its pages in the order `order` describes.
+/// Writes the documents named by `sources` to `destination`, keeping only the pages
+/// `order` names and in the order it names them.
+///
+/// `sources` must have exactly one entry per document `order` refers to, in the
+/// same order [`PageOrder::source_lens`] reports them — that is, `sources[0]` is
+/// the document the viewer was opened with, `sources[1]` is the first one inserted,
+/// and so on. Every retained page keeps the shape it had in its own file; only the
+/// document each page belongs to, and the objects that page depends on, move.
 ///
 /// The write is atomic: the new document goes to a temporary file beside the
-/// destination and is renamed into place. A rename within one directory either happens
-/// or does not, so an interrupted save leaves the original intact and a stray temp
-/// file, never a truncated PDF.
-///
-/// `opened_page_count` is what the viewer saw when it opened the document, and is
-/// checked against what the writer finds. See [`SaveError::PageCountMismatch`].
+/// destination and is renamed into place. A rename within one directory either
+/// happens or does not, so an interrupted save leaves every input intact and a
+/// stray temp file, never a truncated PDF.
 pub fn save_reordered(
-    source: &Path,
+    sources: &[PathBuf],
     order: &PageOrder,
     destination: &Path,
     overwrite: Overwrite,
 ) -> Result<(), SaveError> {
+    assert_eq!(
+        sources.len(),
+        order.document_count(),
+        "save_reordered was given {} source path(s) for an order spanning {} document(s)",
+        sources.len(),
+        order.document_count()
+    );
+
     if overwrite == Overwrite::Refuse && destination.exists() {
         return Err(SaveError::WouldOverwrite {
             path: destination.to_path_buf(),
         });
     }
 
-    let mut document = LoDocument::load(source).map_err(|error| SaveError::Source {
-        path: source.to_path_buf(),
+    // `sources` is asserted above to have one entry per document `order` names, and
+    // `PageOrder` always names at least one — but that is an invariant the type
+    // system does not see, so this is a real refusal rather than an unwrap.
+    let Some((primary_path, secondary_paths)) = sources.split_first() else {
+        return Err(SaveError::PageTree {
+            path: destination.to_path_buf(),
+            detail: "no source documents given".to_owned(),
+        });
+    };
+
+    let mut primary = LoDocument::load(primary_path).map_err(|error| SaveError::Source {
+        path: primary_path.clone(),
         detail: error.to_string(),
     })?;
+    let root = page_tree_root(&primary, primary_path)?;
+    ensure_flat(&primary, root, primary_path)?;
 
-    let pages = document.get_pages();
-    if pages.len() != order.source_len() {
-        return Err(SaveError::PageCountMismatch {
-            path: source.to_path_buf(),
-            opened: order.source_len(),
-            found: pages.len(),
-        });
+    // One object id per stable `Source`, keyed by the `Source`s `PageOrder::on_disk`
+    // says document 0's file physically holds — not by `source.page` directly, since
+    // a prior save may have already renumbered that file from zero. Filled in as
+    // each document is loaded and validated.
+    let mut pages_by_document: Vec<HashMap<Source, ObjectId>> =
+        vec![page_ids_by_source(&primary, primary_path, on_disk_pages(order, 0, primary_path)?)?];
+
+    // Every retained page has to hang off `root` in one merged object table.
+    // Secondary documents are folded in wholesale — not only their retained pages —
+    // because `lopdf` gives us no cheaper way to know what a page's `/Resources`
+    // transitively reaches, and `prune_objects` below drops what does not survive
+    // into the final tree anyway. See the module docs and `docs/goal-5-plan.md` §5.
+    let mut next_id = primary.max_id + 1;
+    for (offset, path) in secondary_paths.iter().enumerate() {
+        let document = offset + 1;
+        let mut secondary = LoDocument::load(path).map_err(|error| SaveError::Source {
+            path: path.clone(),
+            detail: error.to_string(),
+        })?;
+
+        // Renumbered before anything reads an id out of it, so every id this
+        // function sees from here on — its root, its pages, its cross-references —
+        // is already the one it will carry in the merged file.
+        secondary.renumber_objects_with(next_id);
+
+        let secondary_root = page_tree_root(&secondary, path)?;
+        ensure_flat(&secondary, secondary_root, path)?;
+        let ids = page_ids_by_source(&secondary, path, on_disk_pages(order, document, path)?)?;
+
+        next_id = secondary.max_id + 1;
+        primary.max_id = primary.max_id.max(secondary.max_id);
+        primary.objects.extend(secondary.objects);
+        pages_by_document.push(ids);
     }
 
-    let root = page_tree_root(&document, source)?;
-    ensure_flat(&document, root, source)?;
-
-    // `get_pages` is keyed by one-based page number in document order, so the source
-    // index `n` is page `n + 1`. The only place that conversion happens.
-    let ids: Vec<ObjectId> = pages.into_values().collect();
     let mut kids = Vec::with_capacity(order.len());
     for position in 0..order.len() {
-        let source_index = order
-            .source_of(position)
+        let Some(source) = order.source_of(position) else {
+            return Err(SaveError::PageTree {
+                path: destination.to_path_buf(),
+                detail: format!("no source for position {position}"),
+            });
+        };
+        let id = pages_by_document
+            .get(source.document)
+            .and_then(|pages| pages.get(&source))
+            .copied()
             .ok_or_else(|| SaveError::PageTree {
-                path: source.to_path_buf(),
-                detail: format!("no source page for position {position}"),
+                path: sources.get(source.document).cloned().unwrap_or_else(|| destination.to_path_buf()),
+                detail: format!("{source:?} is not in that document's page tree"),
             })?;
-        let id = *ids.get(source_index).ok_or_else(|| SaveError::PageTree {
-            path: source.to_path_buf(),
-            detail: format!("source page {source_index} is not in the page tree"),
-        })?;
         kids.push(Object::Reference(id));
     }
 
@@ -164,36 +250,37 @@ pub fn save_reordered(
         .filter_map(|kid| kid.as_reference().ok())
         .collect();
     for id in retained {
-        if let Ok(page) = document.get_dictionary_mut(id) {
+        if let Ok(page) = primary.get_dictionary_mut(id) {
             page.set("Parent", Object::Reference(root));
         }
     }
 
     let count = i64::try_from(kids.len()).map_err(|_| SaveError::PageTree {
-        path: source.to_path_buf(),
+        path: destination.to_path_buf(),
         detail: "impossibly many pages".to_owned(),
     })?;
-    let tree = document
+    let tree = primary
         .get_dictionary_mut(root)
         .map_err(|error| SaveError::PageTree {
-            path: source.to_path_buf(),
+            path: destination.to_path_buf(),
             detail: error.to_string(),
         })?;
     tree.set("Kids", Object::Array(kids));
     tree.set("Count", Object::Integer(count));
 
-    // Deleted pages are now unreferenced. Pruning keeps the file from carrying content
-    // the document no longer shows — which matters for more than size: a deleted page
-    // left in the file is still extractable.
-    document.prune_objects();
+    // Unreferenced now — pages left behind by a delete, and everything a merge
+    // pulled in from a secondary document that no retained page depends on. Pruning
+    // keeps the file from carrying content nobody can see any more, which matters
+    // for more than size: a page left in the file is still extractable.
+    primary.prune_objects();
 
-    write_atomically(&mut document, destination)
+    write_atomically(&mut primary, destination)
 }
 
-/// The object id of the document's root `Pages` node.
-fn page_tree_root(document: &LoDocument, source: &Path) -> Result<ObjectId, SaveError> {
+/// The object id of a document's root `Pages` node.
+fn page_tree_root(document: &LoDocument, path: &Path) -> Result<ObjectId, SaveError> {
     let complain = |detail: String| SaveError::PageTree {
-        path: source.to_path_buf(),
+        path: path.to_path_buf(),
         detail,
     };
     document
@@ -206,13 +293,13 @@ fn page_tree_root(document: &LoDocument, source: &Path) -> Result<ObjectId, Save
 }
 
 /// Refuses a page tree whose root has branches rather than pages.
-fn ensure_flat(document: &LoDocument, root: ObjectId, source: &Path) -> Result<(), SaveError> {
+fn ensure_flat(document: &LoDocument, root: ObjectId, path: &Path) -> Result<(), SaveError> {
     let kids = document
         .get_dictionary(root)
         .and_then(|dict| dict.get(b"Kids"))
         .and_then(Object::as_array)
         .map_err(|error| SaveError::PageTree {
-            path: source.to_path_buf(),
+            path: path.to_path_buf(),
             detail: error.to_string(),
         })?;
 
@@ -226,11 +313,51 @@ fn ensure_flat(document: &LoDocument, root: ObjectId, source: &Path) -> Result<(
             .is_some_and(|name| name == b"Pages");
         if is_branch {
             return Err(SaveError::NestedPageTree {
-                path: source.to_path_buf(),
+                path: path.to_path_buf(),
             });
         }
     }
     Ok(())
+}
+
+/// The stable [`Source`]s `document`'s file is expected to physically hold, per
+/// [`PageOrder::on_disk`].
+///
+/// A plain index would be just as correct — `order` is checked against `sources` by
+/// the caller's `assert_eq!` — but indexing panics on a mismatch the type system
+/// cannot rule out, and a save is exactly the place that should refuse instead.
+fn on_disk_pages<'order>(
+    order: &'order PageOrder,
+    document: usize,
+    path: &Path,
+) -> Result<&'order [Source], SaveError> {
+    order.on_disk(document).ok_or_else(|| SaveError::PageTree {
+        path: path.to_path_buf(),
+        detail: format!("no on-disk record for document {document}"),
+    })
+}
+
+/// Checks a loaded document's page count against what `on_disk` expects it to
+/// physically hold, and returns each of those `Source`s' object id.
+fn page_ids_by_source(
+    document: &LoDocument,
+    path: &Path,
+    on_disk: &[Source],
+) -> Result<HashMap<Source, ObjectId>, SaveError> {
+    let pages = document.get_pages();
+    if pages.len() != on_disk.len() {
+        return Err(SaveError::PageCountMismatch {
+            path: path.to_path_buf(),
+            opened: on_disk.len(),
+            found: pages.len(),
+        });
+    }
+    // `get_pages` is keyed by one-based page number in document order, so the
+    // physical index `n` is page `n + 1` — the only place that conversion happens.
+    // Zipped against `on_disk` rather than returned by physical index alone, because
+    // that index only means `source.page` for a document whose file has never been
+    // the destination of a save — see the module docs.
+    Ok(on_disk.iter().copied().zip(pages.into_values()).collect())
 }
 
 /// Writes beside the destination and renames into place.

@@ -653,6 +653,169 @@ fn an_agent_can_reorder_a_document_and_save_it() {
 }
 
 #[test]
+fn an_agent_can_insert_pages_from_another_document_and_save_it() {
+    let Some(_window) = e2e("an_agent_can_insert_pages_from_another_document_and_save_it") else {
+        return;
+    };
+
+    // Goal 5 through the running program rather than the library.
+    // `porpoise-render`'s merge tests prove the *bytes* are right by comparing
+    // pixels; this proves the command path reaches them — that `insert_file` grows
+    // the page count by the second file's, that the pages it added can be moved
+    // like any other, and that the saved file has the combined page count.
+    let primary = fixture_of("e2e-insert-primary.pdf", 3);
+    let inserted = fixture_of("e2e-insert-inserted.pdf", 2);
+    let saved = scratch("e2e-insert-saved.pdf");
+
+    let mut serve = Serve::start(&primary);
+    serve.wait_for_event("idle");
+
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(3)
+    );
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let id = serve.send(
+        "insert_file",
+        &[("path", Value::from(inserted.to_string_lossy().as_ref()))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "insert_file did not report an edit: {reply}"
+    );
+    // `pages_reordered`, the same event every page edit reports — see
+    // `an_agent_can_reorder_a_document_and_save_it` for why `idle` is the wrong thing
+    // to wait for here.
+    let event = serve.wait_for_event("pages_reordered");
+    assert_eq!(
+        event.get("page_count").and_then(Value::as_u64),
+        Some(5),
+        "expected 3 + 2 pages after inserting"
+    );
+
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(true),
+        "inserting pages was not counted as an unsaved change"
+    );
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(5)
+    );
+
+    // The point of the whole design: an inserted page is an ordinary one. Move the
+    // first page of the inserted document (position 4) to the front.
+    let id = serve.send(
+        "move_page",
+        &[("from", Value::from(4)), ("to", Value::from(1))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "the inserted page could not be moved like any other"
+    );
+    serve.wait_for_event("pages_reordered");
+
+    // Save As, and wait for it — the reply only means it started.
+    let id = serve.send(
+        "save_as",
+        &[("path", Value::from(saved.to_string_lossy().as_ref()))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("outcome").and_then(Value::as_str),
+        Some("saving"),
+        "a save must not claim to be finished before the file exists"
+    );
+    let event = serve.wait_for_event("saved");
+    assert!(
+        event
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.contains("e2e-insert-saved")),
+        "unexpected save event: {event}"
+    );
+
+    // The merged file exists, opens, and has the combined page count.
+    let bytes = std::fs::read(&saved).expect("the save should exist on disk");
+    assert!(bytes.starts_with(b"%PDF"), "not a PDF");
+    let reopened = Serve::start(&saved);
+    reopened.wait_for_event("idle");
+    let mut reopened = reopened;
+    assert_eq!(
+        reopened.view().get("page_count").and_then(Value::as_u64),
+        Some(5),
+        "the saved, merged document has the wrong number of pages"
+    );
+    reopened.quit();
+
+    serve.quit();
+}
+
+#[test]
+fn inserting_a_file_with_nothing_open_is_refused() {
+    let Some(_window) = e2e("inserting_a_file_with_nothing_open_is_refused") else {
+        return;
+    };
+
+    // No file argument, the same empty-window shape
+    // `an_agent_can_open_a_document_that_was_not_on_the_command_line` starts from —
+    // there is nothing to insert pages into.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("porpoise should launch");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut serve = Serve {
+        child,
+        stdin,
+        lines,
+        next_id: 1,
+        failures_seen: Cell::new(0),
+    };
+
+    let inserted = fixture_of("e2e-insert-refused.pdf", 2);
+    let id = serve.send(
+        "insert_file",
+        &[("path", Value::from(inserted.to_string_lossy().as_ref()))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "inserted pages into a window with nothing open: {reply}"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn the_page_grid_can_be_opened_and_closed_by_command() {
     let Some(_window) = e2e("the_page_grid_can_be_opened_and_closed_by_command") else {
         return;

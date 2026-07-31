@@ -407,8 +407,8 @@ pub(crate) fn run(options: ViewerOptions) -> Result<(), Box<dyn std::error::Erro
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([320.0, 240.0])
+            .with_maximized(true)
             .with_title(format!("{title} — Porpoise PDF")),
         ..Default::default()
     };

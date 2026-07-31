@@ -78,7 +78,7 @@ use crate::devtools::{
 use crate::edits::{Edits, Situation};
 use crate::failure::Failure;
 use crate::input::{
-    DropAction, EditKey, PageTurns, Wheel, command_for_key, drop_action, edit_for_key,
+    DropAction, DropZone, EditKey, PageTurns, Wheel, command_for_key, drop_action, edit_for_key,
     opens_the_picker, wheel_is_for_the_pages,
 };
 use crate::label::file_label;
@@ -89,7 +89,7 @@ use crate::retain;
 use crate::saver::Saver;
 use crate::search::PageFilter;
 use crate::selection::Selection;
-use crate::thumbnails::{self, Grid, GridMode};
+use crate::thumbnails::{self, Grid, GridMode, StagedInfo};
 use crate::tiles::{FULL_UV, to_color_image};
 
 /// Byte budget for cached page textures.
@@ -170,6 +170,15 @@ struct OpenDocument {
     failures: HashMap<CacheKey, Failure>,
     /// The rung work was last submitted for, to notice when zoom moves.
     submitted_bucket: ZoomBucket,
+    /// Which of [`Self::files`] the merge tab's staging viewport is currently
+    /// showing, if any — `docs/goal-5-plan.md` §10.7.
+    ///
+    /// A separate pointer rather than a fifth `OpenFile` field: staging never
+    /// removes an entry once added (the same reason `add_file` never reuses one —
+    /// see its own doc comment), so "which one is the *current* staging slot" needs
+    /// its own place to live. Replacing the staged document points this at a new
+    /// index; the old one is simply never referenced again.
+    staging: Option<usize>,
 }
 
 /// Refusal for a command that needs a document when none is open.
@@ -250,6 +259,7 @@ impl OpenDocument {
             in_flight: Vec::new(),
             failures: HashMap::new(),
             submitted_bucket: bucket,
+            staging: None,
         }
     }
 
@@ -301,6 +311,29 @@ impl OpenDocument {
             .geometry()
             .get(source.page)
             .copied()
+    }
+
+    /// How many pages the currently staged document has, or 0 with nothing staged —
+    /// what [`Viewer::staged_filter`] parses a query against.
+    fn staged_page_count(&self) -> usize {
+        self.staging
+            .and_then(|document| self.files.get(document))
+            .map_or(0, |file| file.document.page_count())
+    }
+
+    /// The `Source`s the merge tab's staging viewport is currently showing, if a
+    /// document is staged: `(0..page_count).map(|page| Source { document, page })`
+    /// — the same list `crate::thumbnails::draw_staged_grid` builds for itself.
+    ///
+    /// Recomputed rather than cached: it is cheap, and a cached copy would need its
+    /// own invalidation to remember whenever the staged document changes.
+    fn staged_sources(&self) -> Option<Vec<Source>> {
+        let document = self.staging?;
+        Some(
+            (0..self.staged_page_count())
+                .map(|page| Source { document, page })
+                .collect(),
+        )
     }
 
     /// Rebuilds the column after an edit.
@@ -407,6 +440,12 @@ struct Viewer {
     ///
     /// The strip rather than the pages, deliberately: see [`wheel_is_for_the_pages`].
     thumbnails_rect: egui::Rect,
+    /// Where the merge tab's staging viewport was drawn last frame, in window
+    /// coordinates — `None` whenever [`GridMode::Merge`] did not draw one.
+    ///
+    /// The same last-frame caveat [`Self::thumbnails_rect`] carries, for the same
+    /// reason: [`Self::drop_zone`] is asked before this frame's panels are laid out.
+    staging_rect: Option<egui::Rect>,
     /// One page turn per wheel gesture, in paged mode. See [`PageTurns`].
     page_turns: PageTurns,
     /// Source pages the thumbnail grid drew this frame, for [`Self::retain_textures`].
@@ -443,6 +482,17 @@ struct Viewer {
     /// Outside `open`, so it is not one of the things a reorder has to remember to fix up
     /// — it holds source pages and follows them on its own.
     selection: Selection,
+
+    /// Pages picked out in the merge tab's staging viewport. A separate instance
+    /// from [`Self::selection`], since picking a page there says nothing about the
+    /// main document — see `docs/goal-5-plan.md` §10.4.
+    ///
+    /// Purely a drag convenience, unlike `selection`: nothing else acts on "whatever
+    /// is currently staged-and-selected" the way `DeletePage` acts on `selection`,
+    /// since `InsertPages` already takes the exact pages it wants. So this is local
+    /// UI state, updated directly rather than through a command of its own — there
+    /// is nothing an agent could not already do by naming pages explicitly.
+    staging_selection: Selection,
 
     /// What is typed in the grid's search box. Empty when nothing is.
     ///
@@ -525,6 +575,7 @@ impl Viewer {
             state,
             viewport: Viewport::new(0.0, 0.0),
             thumbnails_rect: egui::Rect::NOTHING,
+            staging_rect: None,
             page_turns: PageTurns::default(),
             grid_pages: Vec::new(),
             timing: FrameTiming {
@@ -539,6 +590,7 @@ impl Viewer {
             thumbnails: false,
             grid_mode: GridMode::default(),
             selection: Selection::default(),
+            staging_selection: Selection::default(),
             page_filter: String::new(),
             guard: None,
             quitting: false,
@@ -616,8 +668,13 @@ impl Viewer {
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
             grid_mode: self.grid_mode,
+            staged: self.open.as_ref().and_then(|open| {
+                let index = open.staging?;
+                Some(open.files.get(index)?.path.display().to_string())
+            }),
             page_filter: self.page_filter.clone(),
             filtered_pages: self.filtered_pages(),
+            staged_filtered_pages: self.staged_filtered_pages(),
             selection: self.selected_pages(),
             unsaved_changes: self.unsaved_changes(),
             awaiting_answer: match &self.guard {
@@ -853,6 +910,9 @@ impl Viewer {
             Command::Open { path } => self.open_document(path),
             Command::Close => self.close_document(),
             Command::InsertFile { path } => self.insert_file(path),
+            Command::StageDocument { path } => self.stage_document(path),
+            Command::ClearStaging => self.clear_staging(),
+            Command::InsertPages { pages, at } => self.insert_pages_from_staging(&pages, at),
             Command::MovePage { from, to } => {
                 self.edit(|order| order.move_page(from.index(), to.index()))
             }
@@ -883,7 +943,7 @@ impl Viewer {
                 };
                 let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
                 let mut wanted = self.selection.clone();
-                wanted.set_positions(&open.order, &positions);
+                wanted.set_positions(open.order.as_slice(), &positions);
                 if wanted == self.selection {
                     return DispatchResult::Unchanged;
                 }
@@ -920,6 +980,12 @@ impl Viewer {
                 self.grid_mode = mode;
                 if mode != GridMode::Reorganize {
                     self.selection.clear();
+                }
+                // Same reasoning, for the staging viewport's own selection: it is a
+                // trap once nobody can see it, and Merge is the only mode that draws
+                // it.
+                if mode != GridMode::Merge {
+                    self.staging_selection.clear();
                 }
                 DispatchResult::View(Outcome::Changed)
             }
@@ -1006,6 +1072,78 @@ impl Viewer {
         };
         let document_index = open.add_file(path, document);
         self.edit(|order| order.append(document_index, page_count))
+    }
+
+    /// Opens a second document for the merge tab's staging viewport.
+    ///
+    /// Not an edit: nothing about the open document changes, so unlike
+    /// [`Self::insert_file`] this does not go through [`Self::edit`] — no relayout,
+    /// no `PagesReordered`. Replaces whatever was staged before, if anything: the
+    /// old document's `OpenDocument::files` entry is simply never referenced again,
+    /// the same as `add_file` never reusing one. See `docs/goal-5-plan.md` §10.7.
+    fn stage_document(&mut self, path: PathBuf) -> DispatchResult {
+        if self.open.is_none() {
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+        }
+        let document = match Document::open(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not stage document");
+                return DispatchResult::Failed(error.to_string());
+            }
+        };
+        let page_count = document.page_count();
+        if page_count == 0 {
+            return DispatchResult::Failed(format!("{} has no pages", path.display()));
+        }
+        let Some(open) = &mut self.open else {
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+        };
+        let document_index = open.add_file(path, document);
+        let staged = open.order.stage(document_index, page_count);
+        debug_assert!(staged, "page_count was checked non-zero above");
+        open.staging = Some(document_index);
+        // The old staged document's own selection means nothing once its pages are
+        // no longer what the staging viewport shows.
+        self.staging_selection.clear();
+        DispatchResult::View(Outcome::Changed)
+    }
+
+    /// Closes the staging viewport, forgetting whichever document was staged.
+    ///
+    /// Its pages already placed by [`Self::insert_pages_from_staging`] are
+    /// unaffected — they are ordinary pages of the open document by that point, and
+    /// this only clears the pointer to the staging slot, never `OpenDocument::files`
+    /// itself. See `docs/goal-5-plan.md` §10.6.
+    fn clear_staging(&mut self) -> DispatchResult {
+        let Some(open) = &mut self.open else {
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+        };
+        if open.staging.take().is_none() {
+            return DispatchResult::Unchanged;
+        }
+        self.staging_selection.clear();
+        DispatchResult::View(Outcome::Changed)
+    }
+
+    /// Inserts pages of the currently staged document into the open document.
+    ///
+    /// Goes through [`Self::edit`], the same path [`Self::insert_file`] and every
+    /// other page edit takes — an inserted page is an ordinary one from the moment
+    /// it lands, whichever of the two commands put it there. Refused when nothing is
+    /// staged, which is a real error rather than a no-op: an agent that calls this
+    /// without staging anything first has made a mistake worth telling it about,
+    /// unlike a move to a position a page is already at.
+    fn insert_pages_from_staging(&mut self, pages: &[PageNumber], at: PageNumber) -> DispatchResult {
+        let Some(open) = &self.open else {
+            return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+        };
+        let Some(document) = open.staging else {
+            return DispatchResult::Failed("nothing is staged".to_owned());
+        };
+        let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
+        let at = at.index();
+        self.edit(|order| order.insert_pages(document, &positions, at))
     }
 
     fn quit(&mut self, ctx: &egui::Context) -> DispatchResult {
@@ -1176,7 +1314,7 @@ impl Viewer {
     fn dispatch_selection(&mut self, ctx: &egui::Context, wanted: &Selection) {
         let Some(open) = &self.open else { return };
         let pages: Vec<PageNumber> = wanted
-            .positions(&open.order)
+            .positions(open.order.as_slice())
             .into_iter()
             .map(PageNumber::from_index)
             .collect();
@@ -1195,6 +1333,22 @@ impl Viewer {
         )
     }
 
+    /// Which pages the merge tab's staging viewport is showing, from the same text
+    /// typed in the one shared search box — `docs/goal-5-plan.md` M30.
+    ///
+    /// A second parse of the same query, not a second box: `PageFilter::parse` takes
+    /// a page count, and the staged document almost never has the same one as the
+    /// document being edited, so the *resolved* positions from [`Self::page_filter`]
+    /// cannot simply be reused — `"1-9"` against a 3-page primary clamps to its
+    /// three pages at parse time, and reusing that result would hide pages 4 through
+    /// 9 of a 10-page staged document that plainly matched.
+    fn staged_filter(&self) -> PageFilter {
+        PageFilter::parse(
+            &self.page_filter,
+            self.open.as_ref().map_or(0, OpenDocument::staged_page_count),
+        )
+    }
+
     /// The filtered pages as display page numbers, or `None` when nothing is typed.
     fn filtered_pages(&self) -> Option<Vec<PageNumber>> {
         let Some(open) = &self.open else { return None };
@@ -1210,6 +1364,27 @@ impl Viewer {
         }
     }
 
+    /// The staged document's pages the same query resolves to, as display page
+    /// numbers — `None` with nothing staged, as well as with nothing typed. See
+    /// [`Self::filtered_pages`] for the main document's equivalent, and
+    /// [`Self::staged_filter`] for why this is a second parse rather than a shared
+    /// result.
+    fn staged_filtered_pages(&self) -> Option<Vec<PageNumber>> {
+        let open = self.open.as_ref()?;
+        open.staging?;
+        let page_count = open.staged_page_count();
+        match self.staged_filter() {
+            PageFilter::All => None,
+            PageFilter::Only(positions) => Some(
+                positions
+                    .into_iter()
+                    .filter(|position| *position < page_count)
+                    .map(PageNumber::from_index)
+                    .collect(),
+            ),
+        }
+    }
+
     /// Selected pages as display page numbers, ascending. Empty with no document.
     ///
     /// The one place the selection is read out for anything other than drawing it, so
@@ -1219,7 +1394,7 @@ impl Viewer {
             return Vec::new();
         };
         self.selection
-            .positions(&open.order)
+            .positions(open.order.as_slice())
             .into_iter()
             .map(PageNumber::from_index)
             .collect()
@@ -1326,40 +1501,51 @@ impl Viewer {
             let command = match purpose {
                 Purpose::Open => Command::Open { path },
                 Purpose::Insert => Command::InsertFile { path },
+                Purpose::Stage => Command::StageDocument { path },
             };
             self.dispatch(ctx, command);
         }
     }
 
-    /// Whether a drop landing right now would mean "insert" rather than "open".
+    /// Which part of the window a drop landing right now would mean.
     ///
-    /// True only when a document is open — there is nothing to insert into
-    /// otherwise — and the pointer is over the page grid. Shared by
+    /// The staging viewport is checked first: it sits *inside* `thumbnails_rect`, so
+    /// a drop over it would otherwise also read as being over the grid. Shared by
     /// [`Self::collect_dropped_files`] and [`Self::draw_drop_hint`] so the hint and
     /// the actual drop can never disagree, the same reasoning [`crate::input::
     /// drop_action`] itself is built on.
     ///
-    /// `thumbnails_rect` is last frame's rectangle — see the field's own docs — the
-    /// same caveat [`crate::input::wheel_is_for_the_pages`] already carries for
-    /// routing a gesture by pointer position.
-    fn drop_targets_the_grid(&self, ctx: &egui::Context) -> bool {
-        self.open.is_some()
+    /// `thumbnails_rect` and `staging_rect` are last frame's rectangles — see their
+    /// own docs — the same caveat [`crate::input::wheel_is_for_the_pages`] already
+    /// carries for routing a gesture by pointer position.
+    fn drop_zone(&self, ctx: &egui::Context) -> DropZone {
+        let Some(pos) = ctx.pointer_latest_pos() else {
+            return DropZone::Elsewhere;
+        };
+        if self.open.is_some()
             && self.thumbnails
-            && ctx
-                .pointer_latest_pos()
-                .is_some_and(|pos| self.thumbnails_rect.contains(pos))
+            && self.staging_rect.is_some_and(|rect| rect.contains(pos))
+        {
+            return DropZone::Staging;
+        }
+        if self.open.is_some() && self.thumbnails && self.thumbnails_rect.contains(pos) {
+            return DropZone::Grid;
+        }
+        DropZone::Elsewhere
     }
 
-    /// Turns a file dropped on the window into an `Open` or `InsertFile` command.
+    /// Turns a file dropped on the window into an `Open`, `InsertFile` or
+    /// `StageDocument` command.
     ///
     /// The third producer of `Open`, after the command line and the file dialog, and a
     /// producer rather than a command for the same reason the dialog is: an agent
     /// already has `open` with a path. Dropped on the page grid with a document
-    /// already open, the same gesture produces `InsertFile` instead — see
-    /// [`crate::input::DropAction`] and `docs/goal-5-plan.md` §6.
+    /// already open, the same gesture produces `InsertFile` instead; dropped on the
+    /// merge tab's staging viewport specifically, it produces `StageDocument` — see
+    /// [`crate::input::DropAction`], `docs/goal-5-plan.md` §6 and §10.6.
     fn collect_dropped_files(&mut self, ctx: &egui::Context) {
-        let insert = self.drop_targets_the_grid(ctx);
-        match drop_action(&dropped_paths(ctx), insert) {
+        let zone = self.drop_zone(ctx);
+        match drop_action(&dropped_paths(ctx), zone) {
             None => {}
             Some(DropAction::Open { path, ignored }) => {
                 if ignored > 0 {
@@ -1372,6 +1558,12 @@ impl Viewer {
                     tracing::info!(ignored, "inserted the first PDF of several dropped files");
                 }
                 self.dispatch(ctx, Command::InsertFile { path });
+            }
+            Some(DropAction::Stage { path, ignored }) => {
+                if ignored > 0 {
+                    tracing::info!(ignored, "staged the first PDF of several dropped files");
+                }
+                self.dispatch(ctx, Command::StageDocument { path });
             }
             // Set here rather than through `dispatch`, because nothing became a
             // command — the drop was refused before there was one. It still has to be
@@ -1766,10 +1958,14 @@ impl Viewer {
         // All read before `open` is borrowed mutably below.
         let mode = self.grid_mode;
         let selection = self.selection.clone();
+        let staging_selection = self.staging_selection.clone();
         let filter = self.page_filter();
+        let staged_filter = self.staged_filter();
         let query = self.page_filter.clone();
         let Some(open) = &mut self.open else {
             ui.label("No document open.");
+            // Nothing drew a staging viewport this frame either.
+            self.staging_rect = None;
             return;
         };
 
@@ -1782,6 +1978,16 @@ impl Viewer {
             .iter()
             .map(|file| Arc::clone(&file.document))
             .collect();
+        // `None` until `Command::StageDocument` has set `open.staging` — until then
+        // the merge tab's right pane shows its placeholder.
+        let staged = open.staging.and_then(|document| {
+            documents.get(document).map(|doc| StagedInfo {
+                document,
+                geometries: doc.geometry(),
+                selection: &staging_selection,
+                filter: &staged_filter,
+            })
+        });
         let mut grid = Grid {
             order: &open.order,
             documents: &documents,
@@ -1793,10 +1999,13 @@ impl Viewer {
             query: &query,
             filter: &filter,
             pixels_per_point,
+            staged,
         };
         let drawn = thumbnails::draw(ui, &mut grid);
         // Kept for `retain_textures`, which runs once both panels have had their say.
         self.grid_pages = drawn.showing;
+        // Last frame's, for `Self::drop_zone` — see that field's own docs.
+        self.staging_rect = drawn.staging_rect;
 
         // Picks first: a drag that begins on an unpicked page reports both, and the
         // selection has to be right before the move reads it.
@@ -1804,7 +2013,7 @@ impl Viewer {
             let ctx = ui.ctx().clone();
             let mut wanted = self.selection.clone();
             if let Some(open) = &self.open {
-                wanted.pick(&open.order, position, pick);
+                wanted.pick(open.order.as_slice(), position, pick);
             }
             self.dispatch_selection(&ctx, &wanted);
         }
@@ -1812,9 +2021,25 @@ impl Viewer {
             let ctx = ui.ctx().clone();
             let mut wanted = self.selection.clone();
             if let Some(open) = &self.open {
-                wanted.set_positions(&open.order, &covered);
+                wanted.set_positions(open.order.as_slice(), &covered);
             }
             self.dispatch_selection(&ctx, &wanted);
+        }
+
+        // The staging viewport's own selection, updated directly rather than through
+        // a command — see the field's own docs for why nothing needs to read it back
+        // over the control channel.
+        if let Some((position, pick)) = drawn.staged_picked
+            && let Some(open) = &self.open
+            && let Some(shown) = open.staged_sources()
+        {
+            self.staging_selection.pick(&shown, position, pick);
+        }
+        if let Some(covered) = drawn.staged_marquee
+            && let Some(open) = &self.open
+            && let Some(shown) = open.staged_sources()
+        {
+            self.staging_selection.set_positions(&shown, &covered);
         }
 
         // Through the normal dispatch, so a drag is indistinguishable from an agent
@@ -1830,6 +2055,20 @@ impl Viewer {
             }
         }
 
+        // A drop from the staging viewport, the same reasoning as `moved` above: the
+        // gesture and `insert_pages` sent by hand produce the identical command.
+        if let Some((_document, pages, position)) = drawn.inserted {
+            let ctx = ui.ctx().clone();
+            let pages: Vec<PageNumber> = pages
+                .iter()
+                .filter_map(|&page| PageNumber::new(page.saturating_add(1)))
+                .collect();
+            if let (false, Some(at)) = (pages.is_empty(), PageNumber::new(position.saturating_add(1)))
+            {
+                self.dispatch(&ctx, Command::InsertPages { pages, at });
+            }
+        }
+
         // A click in navigation mode: jump the main view there, same as `go_to_page`
         // from the control channel.
         if let Some(position) = drawn.navigated {
@@ -1839,7 +2078,8 @@ impl Viewer {
             }
         }
 
-        // And the tabs and the search box, which are controls like any other.
+        // And the tabs, the search box, and the staging viewport's close control,
+        // which are controls like any other.
         if let Some(mode) = drawn.mode {
             let ctx = ui.ctx().clone();
             self.dispatch(&ctx, Command::SetGridMode { mode });
@@ -1847,6 +2087,10 @@ impl Viewer {
         if let Some(query) = drawn.query {
             let ctx = ui.ctx().clone();
             self.dispatch(&ctx, Command::SetPageFilter { query });
+        }
+        if drawn.clear_staging {
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, Command::ClearStaging);
         }
     }
 
@@ -1872,8 +2116,8 @@ impl Viewer {
     /// Drawn from the same [`drop_action`] the drop itself uses, so the window cannot
     /// invite something it then refuses.
     fn draw_drop_hint(&self, ctx: &egui::Context) {
-        let insert = self.drop_targets_the_grid(ctx);
-        let Some(action) = drop_action(&hovered_paths(ctx), insert) else {
+        let zone = self.drop_zone(ctx);
+        let Some(action) = drop_action(&hovered_paths(ctx), zone) else {
             return;
         };
         chrome::drop_hint(ctx, &action, self.unsaved_changes());
@@ -1920,7 +2164,7 @@ impl Viewer {
                     renders_in_flight: open.in_flight.len(),
                     timing: self.timing,
                     abandoned: open.abandoned(),
-                    selected: self.selection.count(&open.order),
+                    selected: self.selection.count(open.order.as_slice()),
                 }),
                 saving_to: self.saver.destination(),
                 unsaved_changes: self.unsaved_changes(),
@@ -2091,6 +2335,19 @@ impl eframe::App for Viewer {
         egui::Panel::bottom("status").show(ui, |ui| self.draw_status(ui));
         // Before the pages, so the central area is what is left over.
         if self.thumbnails {
+            // The merge tab needs room for two viewports rather than one. Widening
+            // the *allowed* range rather than the panel's actual width: egui only
+            // honours `default_size` the first time a panel opens, so there is no
+            // cheap way from here to also resize one already open — dragging it
+            // wider is left to the person, for now. See `docs/goal-5-plan.md` §10.7.
+            let (min_width, max_width) = if self.grid_mode == GridMode::Merge {
+                (
+                    thumbnails::PANEL_MERGE_MIN_WIDTH,
+                    thumbnails::PANEL_MERGE_MAX_WIDTH,
+                )
+            } else {
+                (thumbnails::PANEL_MIN_WIDTH, thumbnails::PANEL_MAX_WIDTH)
+            };
             egui::Panel::left("thumbnails")
                 .resizable(true)
                 // Derived from the thumbnail width rather than a round number, so the
@@ -2100,10 +2357,7 @@ impl eframe::App for Viewer {
                 // Bounded, because a panel grows to fit its content and one child asking
                 // for the available width is enough to swallow the page view. See
                 // [`thumbnails::PANEL_MAX_WIDTH`].
-                .size_range(egui::Rangef::new(
-                    thumbnails::PANEL_MIN_WIDTH,
-                    thumbnails::PANEL_MAX_WIDTH,
-                ))
+                .size_range(egui::Rangef::new(min_width, max_width))
                 .show(ui, |ui| self.draw_thumbnails(ui));
         }
         self.draw_pages(ui);

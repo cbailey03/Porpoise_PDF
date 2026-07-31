@@ -247,6 +247,14 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         "insert_file" => RequestBody::Command(Command::InsertFile {
             path: path_argument("path")?,
         }),
+        "stage_document" => RequestBody::Command(Command::StageDocument {
+            path: path_argument("path")?,
+        }),
+        "clear_staging" => RequestBody::Command(Command::ClearStaging),
+        "insert_pages" => RequestBody::Command(Command::InsertPages {
+            pages: pages_argument("pages")?,
+            at: page_argument("at")?,
+        }),
         "capture" => RequestBody::Command(Command::Capture {
             path: path_argument("path")?,
         }),
@@ -386,6 +394,11 @@ pub(crate) struct Snapshot {
     /// What clicking a page in the grid does. Reported whether or not the grid is
     /// showing, because it is remembered across closing and reopening the panel.
     pub(crate) grid_mode: GridMode,
+    /// Path of the document staged for the merge tab, if any. `None` until
+    /// `stage_document` succeeds, and again after `clear_staging` — see
+    /// `docs/goal-5-plan.md` §10.6.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) staged: Option<String>,
     /// What is typed in the grid's search box. Empty when nothing is.
     pub(crate) page_filter: String,
     /// The pages that query resolves to, counting from 1 — `None` when nothing is typed.
@@ -395,6 +408,13 @@ pub(crate) struct Snapshot {
     /// state from no query at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) filtered_pages: Option<Vec<PageNumber>>,
+    /// The same query, resolved against the staged document instead — `None` with
+    /// nothing staged, as well as with nothing typed. A second field rather than
+    /// reusing `filtered_pages`, because the two documents almost never share a page
+    /// count and the query can match different pages of each — see
+    /// `docs/goal-5-plan.md` M30.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) staged_filtered_pages: Option<Vec<PageNumber>>,
     /// Pages picked out in the grid, counting from 1, ascending.
     ///
     /// Display positions, like every other page number here — so after a reorder these
@@ -703,6 +723,43 @@ mod tests {
             }
         );
         assert_eq!(command(r#"{"command":"quit"}"#), Command::Quit);
+    }
+
+    #[test]
+    fn the_merge_tab_commands_decode_with_their_arguments() {
+        // Pinned individually rather than left to the general command list, for the
+        // exact reason `docs/goal-5-plan.md` §9a records: `insert_file` shipped fully
+        // wired everywhere except this hand-written decoder, and nothing caught the
+        // gap until an end-to-end test launched the real binary.
+        assert_eq!(
+            command(r#"{"command":"stage_document","path":"c.pdf"}"#),
+            Command::StageDocument {
+                path: PathBuf::from("c.pdf")
+            }
+        );
+        assert_eq!(
+            command(r#"{"command":"clear_staging"}"#),
+            Command::ClearStaging
+        );
+        assert_eq!(
+            command(r#"{"command":"insert_pages","pages":[2,1],"at":3}"#),
+            Command::InsertPages {
+                pages: vec![
+                    PageNumber::new(2).expect("page 2 exists"),
+                    PageNumber::new(1).expect("page 1 exists"),
+                ],
+                at: PageNumber::new(3).expect("page 3 exists"),
+            }
+        );
+    }
+
+    #[test]
+    fn insert_pages_needs_both_its_arguments() {
+        assert!(decode(r#"{"command":"insert_pages","at":1}"#).is_err());
+        assert!(decode(r#"{"command":"insert_pages","pages":[1]}"#).is_err());
+        // Page numbers count from 1 here too, refused by `PageNumber` itself.
+        assert!(decode(r#"{"command":"insert_pages","pages":[0],"at":1}"#).is_err());
+        assert!(decode(r#"{"command":"insert_pages","pages":[1],"at":0}"#).is_err());
     }
 
     #[test]

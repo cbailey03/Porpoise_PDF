@@ -288,7 +288,7 @@ mod tests {
         // that happens to hold one non-ASCII character, so it is checked here rather than
         // bent into the enum. Any future word label with one belongs on this list.
         let drawable = drawable();
-        for label in ["Open…", "Add pages…"] {
+        for label in ["Open…", "Add pages…", "Stage a file…"] {
             for character in label.chars() {
                 assert!(
                     drawable.contains_key(&character),

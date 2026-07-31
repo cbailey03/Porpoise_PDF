@@ -102,12 +102,16 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         Command::Open { path } => Some(Intent::Open(path.clone())),
 
         // Everything below either leaves the document alone, or is how you *keep* the
-        // changes rather than lose them. `InsertFile` only adds pages, so there is
-        // nothing at risk to ask about — see `docs/goal-5-plan.md` §6. `Answer` in
-        // particular must never be guarded: it is the way out of the question, so
-        // guarding it would be a trap with no exit.
+        // changes rather than lose them. `InsertFile`, `StageDocument`, `ClearStaging`
+        // and `InsertPages` only ever add pages or touch the staging slot, so there is
+        // nothing at risk to ask about — see `docs/goal-5-plan.md` §6 and §10.6.
+        // `Answer` in particular must never be guarded: it is the way out of the
+        // question, so guarding it would be a trap with no exit.
         Command::View(_)
         | Command::InsertFile { .. }
+        | Command::StageDocument { .. }
+        | Command::ClearStaging
+        | Command::InsertPages { .. }
         | Command::Capture { .. }
         | Command::MovePage { .. }
         | Command::MovePages { .. }
@@ -173,6 +177,21 @@ mod tests {
     #[test]
     fn inserting_a_file_is_never_guarded_because_it_only_adds_pages() {
         assert_eq!(intent_of(&Command::InsertFile { path: path() }), None);
+    }
+
+    #[test]
+    fn staging_and_inserting_pages_are_never_guarded() {
+        // Staging adds nothing to the document, and inserting only adds to it — the
+        // same reasoning `InsertFile` already gets. See `docs/goal-5-plan.md` §10.6.
+        assert_eq!(intent_of(&Command::StageDocument { path: path() }), None);
+        assert_eq!(intent_of(&Command::ClearStaging), None);
+        assert_eq!(
+            intent_of(&Command::InsertPages {
+                pages: vec![PageNumber::FIRST],
+                at: PageNumber::FIRST,
+            }),
+            None
+        );
     }
 
     #[test]

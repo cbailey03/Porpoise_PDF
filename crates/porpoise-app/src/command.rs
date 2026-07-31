@@ -45,6 +45,35 @@ pub(crate) enum Command {
         /// The file to bring in.
         path: PathBuf,
     },
+    /// Opens a second document for the merge tab's staging viewport, without
+    /// adding any of its pages to the one being edited.
+    ///
+    /// Not guarded: staging adds nothing, so there is nothing at risk. Replaces
+    /// whatever was staged before, if anything — the same as `InsertFile` never
+    /// reusing a document already known. See `docs/goal-5-plan.md` §10.6.
+    StageDocument {
+        /// The file to stage.
+        path: PathBuf,
+    },
+    /// Closes the staging viewport, forgetting whichever document was staged.
+    ///
+    /// Pages of it already placed by [`Self::InsertPages`] are unaffected — they
+    /// are ordinary pages of the open document by that point.
+    ClearStaging,
+    /// Inserts pages of the currently staged document into the open document,
+    /// landing as a contiguous block starting at `at`.
+    ///
+    /// Names pages of "the currently staged document" rather than taking a path,
+    /// the same way [`Self::MovePages`] names positions of "the document" rather
+    /// than repeating which one is open — there is exactly one staging slot.
+    /// Refused if nothing is staged. See `docs/goal-5-plan.md` §10.6.
+    InsertPages {
+        /// Which of the staged document's pages to insert, counting from 1, in
+        /// the order they should land.
+        pages: Vec<PageNumber>,
+        /// Where the block should start.
+        at: PageNumber,
+    },
     /// Write the window's current contents to a PNG.
     ///
     /// Waits for the render pipeline to settle first, so the capture shows pages
@@ -161,6 +190,9 @@ impl Command {
             Self::Open { .. } => "open",
             Self::Close => "close",
             Self::InsertFile { .. } => "insert_file",
+            Self::StageDocument { .. } => "stage_document",
+            Self::ClearStaging => "clear_staging",
+            Self::InsertPages { .. } => "insert_pages",
             Self::Capture { .. } => "capture",
             Self::MovePage { .. } => "move_page",
             Self::MovePages { .. } => "move_pages",
@@ -195,6 +227,14 @@ impl Command {
             Self::Close,
             Self::InsertFile {
                 path: placeholder(),
+            },
+            Self::StageDocument {
+                path: placeholder(),
+            },
+            Self::ClearStaging,
+            Self::InsertPages {
+                pages: vec![PageNumber::FIRST],
+                at: PageNumber::FIRST,
             },
             Self::Capture {
                 path: placeholder(),
@@ -274,6 +314,22 @@ mod tests {
             .name(),
             "insert_file"
         );
+        assert_eq!(
+            Command::StageDocument {
+                path: PathBuf::from("c.pdf")
+            }
+            .name(),
+            "stage_document"
+        );
+        assert_eq!(Command::ClearStaging.name(), "clear_staging");
+        assert_eq!(
+            Command::InsertPages {
+                pages: vec![PageNumber::FIRST],
+                at: PageNumber::FIRST,
+            }
+            .name(),
+            "insert_pages"
+        );
         assert_eq!(Command::Quit.name(), "quit");
     }
 
@@ -297,6 +353,9 @@ mod tests {
                 | Command::Open { .. }
                 | Command::Close
                 | Command::InsertFile { .. }
+                | Command::StageDocument { .. }
+                | Command::ClearStaging
+                | Command::InsertPages { .. }
                 | Command::Capture { .. }
                 | Command::MovePage { .. }
                 | Command::MovePages { .. }
@@ -318,7 +377,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            17,
+            20,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

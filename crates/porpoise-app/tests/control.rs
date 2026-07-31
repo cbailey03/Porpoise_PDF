@@ -767,6 +767,211 @@ fn an_agent_can_insert_pages_from_another_document_and_save_it() {
 }
 
 #[test]
+fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
+    // The merge tab's own command surface (`docs/goal-5-plan.md` §10.6), the same
+    // evidentiary bar `an_agent_can_insert_pages_from_another_document_and_save_it`
+    // sets for `insert_file`: this proves the command path reaches `PageOrder::
+    // stage`/`insert_pages`, that staging is visible in the snapshot, that a page
+    // can be dropped precisely mid-document rather than only at the end, that the
+    // same staged document can be drawn from twice, and that clearing it leaves
+    // already-placed pages untouched.
+    let primary = fixture_of("e2e-stage-primary.pdf", 3);
+    let staged = fixture_of("e2e-stage-staged.pdf", 3);
+    let saved = scratch("e2e-stage-saved.pdf");
+
+    let mut serve = Serve::start(&primary);
+    serve.wait_for_event("idle");
+
+    assert_eq!(
+        serve.snapshot().get("staged"),
+        None,
+        "nothing was staged yet"
+    );
+
+    let id = serve.send(
+        "stage_document",
+        &[("path", Value::from(staged.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed"),
+        "stage_document did not report a change"
+    );
+    let snapshot = serve.snapshot();
+    assert!(
+        snapshot
+            .get("staged")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.contains("e2e-stage-staged")),
+        "the staged document's path was not reported: {snapshot}"
+    );
+    // Staging adds nothing to the document being edited.
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(3),
+        "staging alone changed the open document's page count"
+    );
+    assert_eq!(
+        snapshot.get("unsaved_changes").and_then(Value::as_bool),
+        Some(false),
+        "staging alone counted as an unsaved change"
+    );
+
+    // Page 1 of the staged document, landing between the primary's pages 1 and 2 —
+    // not appended at the end, which is the whole point of this over `insert_file`.
+    let id = serve.send(
+        "insert_pages",
+        &[
+            ("pages", Value::from(vec![1])),
+            ("at", Value::from(2)),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "insert_pages did not report an edit"
+    );
+    let event = serve.wait_for_event("pages_reordered");
+    assert_eq!(
+        event.get("page_count").and_then(Value::as_u64),
+        Some(4),
+        "expected 3 + 1 pages after inserting"
+    );
+
+    // The same staged document, drawn from a second time — proof that staging
+    // survives more than one drag, per `PageOrder::insert_pages`'s own contract.
+    let id = serve.send(
+        "insert_pages",
+        &[
+            ("pages", Value::from(vec![2, 3])),
+            ("at", Value::from(1)),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "a second insert_pages from the same staged document was refused"
+    );
+    let event = serve.wait_for_event("pages_reordered");
+    assert_eq!(
+        event.get("page_count").and_then(Value::as_u64),
+        Some(6),
+        "expected 4 + 2 pages after the second insert"
+    );
+
+    // Clearing staging does not touch pages already placed.
+    let id = serve.send("clear_staging", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        snapshot.get("staged"),
+        None,
+        "clear_staging did not clear the staged path"
+    );
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(6),
+        "clearing staging discarded already-inserted pages"
+    );
+
+    // Clearing again is `unchanged`, the same convention every other toggle here
+    // follows for "already true".
+    let id = serve.send("clear_staging", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+
+    let id = serve.send(
+        "save_as",
+        &[("path", Value::from(saved.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("saving")
+    );
+    serve.wait_for_event("saved");
+
+    let bytes = std::fs::read(&saved).expect("the save should exist on disk");
+    assert!(bytes.starts_with(b"%PDF"), "not a PDF");
+    let reopened = Serve::start(&saved);
+    reopened.wait_for_event("idle");
+    let mut reopened = reopened;
+    assert_eq!(
+        reopened.view().get("page_count").and_then(Value::as_u64),
+        Some(6),
+        "the saved, merged document has the wrong number of pages"
+    );
+    reopened.quit();
+
+    serve.quit();
+}
+
+#[test]
+fn staging_a_document_with_nothing_open_is_refused() {
+    let Some(_window) = e2e("staging_a_document_with_nothing_open_is_refused") else {
+        return;
+    };
+
+    // The same empty-window shape `inserting_a_file_with_nothing_open_is_refused`
+    // checks for `insert_file` — staging needs a document to merge into, same as
+    // inserting does.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("porpoise should launch");
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut serve = Serve {
+        child,
+        stdin,
+        lines,
+        next_id: 1,
+        failures_seen: Cell::new(0),
+    };
+
+    let id = serve.send(
+        "stage_document",
+        &[("path", Value::from("does-not-matter.pdf"))],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(
+        reply.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "staged a document into a window with nothing open: {reply}"
+    );
+    assert!(
+        reply
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("nothing is open")),
+        "unexpected error: {reply}"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn inserting_a_file_with_nothing_open_is_refused() {
     let Some(_window) = e2e("inserting_a_file_with_nothing_open_is_refused") else {
         return;
@@ -1115,6 +1320,80 @@ fn the_page_grid_can_be_narrowed_to_a_few_pages() {
 }
 
 #[test]
+fn the_search_box_narrows_the_staging_viewport_independently() {
+    // `docs/goal-5-plan.md` M30: one query, two documents, almost never the same
+    // page count — so the staging viewport needs its *own* resolution of the same
+    // text rather than reusing the primary's, which `Viewer::staged_filter`'s own
+    // doc comment argues for. Proved here with a primary short enough that a query
+    // clamps against *it* while still matching more of a longer staged document.
+    let primary = fixture_of("e2e-staged-filter-primary.pdf", 3);
+    let staged = fixture_of("e2e-staged-filter-staged.pdf", 10);
+
+    let mut serve = Serve::start(&primary);
+    serve.wait_for_event("idle");
+
+    let staged_filtered = |serve: &mut Serve| -> Option<Vec<u64>> {
+        serve
+            .snapshot()
+            .get("staged_filtered_pages")
+            .and_then(Value::as_array)
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
+    };
+
+    assert_eq!(
+        staged_filtered(&mut serve),
+        None,
+        "nothing is staged yet, so there is nothing to narrow"
+    );
+
+    let id = serve.send(
+        "stage_document",
+        &[("path", Value::from(staged.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    // Staged, but nothing typed yet: still no filter on either side.
+    assert_eq!(staged_filtered(&mut serve), None);
+
+    // "1-9" against the 3-page primary clamps to all three of its pages; against
+    // the 10-page staged document it reaches every one of pages 1 through 9. Reusing
+    // the primary's resolved `[1,2,3]` for the staging viewport would wrongly hide
+    // pages 4 through 9, which is exactly the bug a shared result would cause.
+    let id = serve.send("set_page_filter", &[("query", Value::from("1-9"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(
+        serve
+            .snapshot()
+            .get("filtered_pages")
+            .and_then(Value::as_array)
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect::<Vec<_>>()),
+        Some(vec![1, 2, 3]),
+        "the 3-page primary should clamp to its own three pages"
+    );
+    assert_eq!(
+        staged_filtered(&mut serve),
+        Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        "the 10-page staged document should show pages 1 through 9, not the primary's three"
+    );
+
+    // Clearing staging drops the staged half of the filter, even with the query
+    // still typed — there is nothing left to narrow.
+    let id = serve.send("clear_staging", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(staged_filtered(&mut serve), None);
+
+    serve.quit();
+}
+
+#[test]
 fn leaving_reorganize_mode_forgets_the_selection() {
     let Some(_window) = e2e("leaving_reorganize_mode_forgets_the_selection") else {
         return;
@@ -1214,7 +1493,7 @@ fn the_page_grid_mode_can_be_set_by_command() {
         .unwrap_or_default()
         .to_owned();
     assert!(
-        error.contains("navigate") && error.contains("reorganize"),
+        error.contains("navigate") && error.contains("reorganize") && error.contains("merge"),
         "the refusal did not name the modes: {error}"
     );
 
@@ -1239,6 +1518,63 @@ fn the_page_grid_mode_can_be_set_by_command() {
         serve.snapshot().get("grid_mode").and_then(Value::as_str),
         Some("reorganize"),
         "closing the grid forgot the mode"
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn the_merge_tabs_two_viewports_render_without_a_staged_document() {
+    // The regression M20 already set the bar for: opening a new mode must not break
+    // anything that already worked, and here there is not yet a way to stage a
+    // second file (`docs/goal-5-plan.md` M28) — so the proof available *now* is that
+    // switching to the tab and capturing the window produces a real image rather
+    // than a panic or a blank one. The drag out of the staging viewport itself needs
+    // a person's hands, same as every other pointer gesture this panel has shipped
+    // — see `crate::thumbnails`'s own module docs.
+    let Some(_window) = e2e("the_merge_tabs_two_viewports_render_without_a_staged_document") else {
+        return;
+    };
+
+    let document = fixture("e2e-merge-tab.pdf");
+    let capture = scratch("e2e-merge-tab-capture.png");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
+    assert_eq!(
+        serve.reply_to(id).get("ok").and_then(Value::as_bool),
+        Some(true)
+    );
+    let id = serve.send("set_grid_mode", &[("mode", Value::from("merge"))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(
+        serve.snapshot().get("grid_mode").and_then(Value::as_str),
+        Some("merge")
+    );
+
+    let id = serve.send(
+        "capture",
+        &[("path", Value::from(capture.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("capturing")
+    );
+    serve.wait_for_event("captured");
+
+    let bytes = std::fs::read(&capture).expect("the capture should exist on disk");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = decoder.read_info().expect("should be a readable PNG");
+    let info = reader.info();
+    assert!(
+        info.width > 100 && info.height > 100,
+        "captured a {}x{} image while the merge tab was open",
+        info.width,
+        info.height
     );
 
     serve.quit();

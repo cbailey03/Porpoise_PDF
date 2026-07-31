@@ -1,6 +1,6 @@
 # Goal 5 — Merge PDFs
 
-Status: **complete**. Milestones M19–M24 below.
+Status: M19–M30 **complete**. Goal 5 is done — see §10.
 
 Goal 4 named this on its way out the door: "**Inserting pages from another file**...
 needs a second document open, which the viewer has no concept of" (`goal-4-plan.md`
@@ -470,3 +470,407 @@ than gaps in this design, and were flagged as follow-up work instead of folded i
   unlike `ViewCommand`'s. `insert_file` shipped fully wired everywhere except
   `protocol.rs`'s hand-written decoder, and nothing caught it until an end-to-end
   test launched the real binary. See §7a.
+
+## 10. Extension: a two-viewport merge tab
+
+§1 named this and deliberately left it out: "Choosing exactly where the inserted
+pages land... would need the grid to hit-test a screen position against a specific
+cell across a native OS drag, which nothing in the program does today." M19–M24
+built the append-then-reorder path instead — insert lands everything at the end,
+move it into place afterward with the tools Goal 4 already built. That is still a
+correct, complete way to merge two files; this section is a second, more direct one,
+asked for directly rather than inferred: a dedicated tab where dragging a page out of
+a second document drops it exactly where it belongs in the first, in one gesture.
+
+### 10.1 Scope
+
+**In:**
+
+- A third tab in the page grid panel, "Merge," alongside Navigation and Reorganize.
+- Left viewport: the document already open, in its current display order — the
+  existing single-grid rendering, unchanged.
+- Right viewport: a second PDF, opened with a button or dropped directly onto that
+  viewport, showing every one of *its* pages in *its own* order — a document that
+  contributes nothing to `PageOrder` until something is dragged out of it.
+- Multi-select in the right viewport — ctrl+click, shift+click, a marquee box,
+  mirroring Reorganize mode's existing gestures exactly, just authoring a drag
+  *source* instead of a drag target.
+- Dragging the selection (or a single unselected page) from right to left drops it
+  at the hovered position in the left viewport, landing as a contiguous block
+  between two existing pages, as one undo step regardless of group size.
+- The instant any of the second document's pages are placed, they are ordinary
+  `Source` entries — reorderable, deletable, selectable from the *existing*
+  Reorganize tab, exactly like anything `InsertFile` produces today. Nothing
+  downstream needs to know a page arrived this way rather than that one.
+- Placed pages stay visible and draggable in the staging viewport; nothing marks
+  them "used" or prevents dragging the same page in again. A second copy of a page
+  is unusual, not invalid — the project's own rule against defending against things
+  that are not actually wrong applies here the same as anywhere else, and a "used"
+  indicator is a cheap visual addition later if it turns out to be missed.
+- A close control on the staging viewport clears it; opening a different file for
+  staging simply replaces whatever was there. Neither touches anything already
+  placed — those pages are independent `Source`s, backed by their own file, from the
+  moment they land.
+- Every one of the above reachable by command, per GOALS.md's constitution — §10.6.
+
+**Out, deliberately, for this pass:**
+
+- Dragging from the left viewport back into the right one. One-directional, matching
+  exactly what was asked for.
+- More than one staged document at a time. Staging a second file replaces the first
+  rather than opening a third viewport.
+- A "used" marker on a placed page in the staging viewport. See above.
+- A button that inserts the current selection, as an alternative to dragging it. The
+  drag is the whole affordance; a button beside it would be a second way to do the
+  one thing, which is exactly the duplication §2 already argued against once.
+
+### 10.2 Why this needs new `PageOrder` primitives, not just new UI
+
+`append` folds a whole document's pages onto the *end*, all of them, in one call —
+it has no way to express "these particular pages, wherever the user dropped them."
+Composing it from what already exists — `append`, then `move_pages` to the drop
+position — reaches the right final state but records **two** undo steps for a
+gesture the person experienced as one: pressing undo once would leave the dropped
+pages sitting at the end rather than fully gone. That is exactly the "one drag, one
+undo" guarantee `move_pages` and `remove_pages` exist to keep (§3, and
+`goal-4-plan.md` before it), so this needs its own primitive rather than a
+composition at the call site.
+
+A second gap: `append` does two things in one call — registers a document
+(`source_lens`, `on_disk`) *and* adds every one of its pages to `order`. Staging
+needs only the first half: a document known well enough to bound-check against and
+to render in the staging viewport, contributing zero pages to `order` until
+something is actually dragged in.
+
+### 10.3 `PageOrder`: staging a document, then inserting some of its pages
+
+```rust
+/// Registers a document `PageOrder` can be asked to place pages from, without
+/// adding any of them to the display order yet.
+///
+/// The bookkeeping half of `append`, split out on its own: staging a file for
+/// browsing is not an edit — nothing shown changes — so this touches `source_lens`
+/// and `on_disk` exactly the way `append` already does, and touches neither `order`
+/// nor the undo history.
+pub fn stage(&mut self, document: usize, page_count: usize) -> bool
+
+/// Inserts `pages` of `document` — already staged, or already a contributing file
+/// — as a contiguous block landing at `position`, as one undo step.
+///
+/// What `append` cannot express: `append` always takes every page of a document and
+/// always lands at the end. This takes however many pages one drag carried and
+/// lands them wherever it was dropped, mid-document or not, one page or several,
+/// without ever costing more than one undo.
+pub fn insert_pages(&mut self, document: usize, pages: &[usize], position: usize) -> bool
+```
+
+Unlike `append`'s "always a new index" rule (deliberate there, per §3's own doc
+comment, because the file on disk may have changed since it was last read),
+`insert_pages` is *meant* to be called against the same staged `document` index
+repeatedly, once per drag, as different selections get pulled from the same staging
+viewport. `stage` establishes what a document is, once; `insert_pages` only ever
+reads that registration, never re-establishes it.
+
+Bounds: `document < document_count()`; every one of `pages` must be
+`< source_lens[document]`; `position <= order.len()`. `append` is left exactly as it
+is — not reimplemented in terms of these two. The duplication between "grow
+`source_lens`/`on_disk`" in `stage` and in `append` is a few lines, and the risk of
+a subtle regression in a method every existing call site already depends on is not
+worth trading for removing them.
+
+### 10.4 Rendering a document's pages without an order
+
+`Grid` in `thumbnails.rs` is built entirely around `order: &PageOrder`:
+`shown_geometry`, `cell`, and `Drawn.showing` all resolve a display *position* to a
+`Source` via `order.source_of`. A staged document not yet in `order` has no
+positions to resolve — its pages have to be shown by iterating `0..page_count`
+directly.
+
+Two ways to get there:
+
+(a) Generalize `Grid` to take "what to show" as an explicit `&[Source]` rather than
+deriving it from `order.len()` and `order.source_of`, keeping `order` only for what
+still genuinely needs it (`current`). The main grid passes `order.as_slice()`; the
+staging grid passes `(0..page_count).map(|page| Source { document, page }).collect()`.
+(b) A second, smaller drawing function — `draw_staging` — sharing `cell`'s geometry
+and painting helpers with the main grid, but with its own interaction: multi-select
+and drag-*out* only, no navigate, no move-within, no marquee-to-reorder.
+
+(a) removes real duplication between two nearly-identical drawing loops. (b) is more
+new code, but touches none of the existing, working Navigate/Reorganize path — whose
+marquee-versus-drag disambiguation this file's own docs already call out as
+something that took two attempts to get right. Leaning toward (b) for that reason,
+but recommend deciding once both are sketched side by side rather than pre-committing
+— see §10.9.
+
+**Selection.** The staging viewport needs its own `crate::selection::Selection` —
+already just a `BTreeSet<Source>` and an anchor, generic enough to reuse as-is —
+separate from the one Reorganize mode uses for the main document, since a page can
+be picked out in each independently and the two mean different things. The staging
+grid needs only the *pick* half of `selection.rs` (ctrl+click, shift+click, marquee-
+to-selection) and the drag-*out* half of `thumbnails.rs`'s `Dragged` mechanism,
+generalized to whichever document the group came from — it needs none of
+`PageOrder`'s move or marquee-to-*reorder* logic, because it never reorders itself.
+
+### 10.5 The drag: a new cross-viewport payload
+
+`Dragged(Vec<usize>)` carries display *positions* into the same order they came
+from — meaningful only within one grid, one `PageOrder`. A cross-viewport drag
+carries pages not yet in the target order at all, so it needs a payload that
+survives the trip: which staged document, and which of its pages (necessarily the
+same document for every page in one drag, since a selection lives in one viewport).
+
+```rust
+/// Pages from a document not yet in `PageOrder`, in flight during a drag out of the
+/// staging viewport. Distinct from `Dragged`, which carries positions *within* an
+/// order that already contains them — egui looks payloads up by type, so the two
+/// can never be mistaken for each other.
+struct Inserted { document: usize, pages: Vec<usize> }
+```
+
+The left grid's cell already paints an insertion bar (`paint_insertion`) on hover
+during a same-order drag; recognizing an `Inserted` payload alongside a `Dragged`
+one reuses that exact bar for a cross-viewport drag — the affordance being asked for
+is already built, it only needs a second payload type honored where the first is
+checked today. A drop produces a new `Drawn` field — `inserted: Option<(usize,
+Vec<usize>, usize)>` (document, pages, landing position) — the same shape `moved`
+already has, turned into the command below by the caller exactly as `moved` becomes
+`MovePages`.
+
+### 10.6 Commands
+
+Three new effects. None guarded by `crate::confirm`: staging adds nothing to the
+document, and inserting only adds to it — the same reasoning §6 already gives
+`InsertFile`.
+
+```rust
+/// Opens a second document for the merge tab's staging viewport, without adding
+/// any of its pages to the one being edited.
+StageDocument { path: PathBuf },
+
+/// Closes the staging viewport, forgetting whichever document was staged. Pages of
+/// it already placed by `InsertPages` are unaffected — they are ordinary pages of
+/// the open document by that point.
+ClearStaging,
+
+/// Inserts `pages` of the currently staged document into the open document,
+/// landing as a contiguous block starting at `at`.
+InsertPages { pages: Vec<PageNumber>, at: PageNumber },
+```
+
+`InsertPages` names pages of "the currently staged document" rather than taking a
+path, the same way `MovePages` names positions of "the document" rather than
+repeating which one is open — there is exactly one staging slot, so nothing else to
+disambiguate. An agent scripting a merge without ever touching the staging viewport
+already can, unchanged, via `InsertFile` (M22); this is a second, more precise way
+to reach a similar effect, not a replacement for the first.
+
+**Producers:** the drag itself; a "Stage a file…" button beside the toolbar's
+existing "Add pages…," reusing `FilePicker` with a third `Purpose::Stage`; a file
+dropped directly onto the staging viewport's own rectangle, a third zone for
+`drop_action` to recognize alongside "onto the grid" and "elsewhere" (the exact
+precedent §6 already set for telling `Insert` from `Open` by drop position); and a
+close control on the staging viewport for `ClearStaging`.
+
+### 10.7 Wiring
+
+- `GridMode` gains a third variant, `Merge`, alongside `Navigate` and `Reorganize` —
+  same tab row, same `SetGridMode` command, same exhaustiveness test this file's own
+  `every_mode_is_listed` already relies on to catch an unlisted variant at compile
+  time.
+- `thumbnails::draw` dispatches to a new `draw_merge` for `GridMode::Merge` rather
+  than folding a two-viewport layout into the single-grid `draw`. The tab row and
+  search box stay shared; whether the search box should narrow the staging viewport
+  too, in addition to the main one, is worth deciding once both grids exist side by
+  side rather than before — see M30.
+- Panel width: today's `PANEL_WIDTH`/`PANEL_MIN_WIDTH`/`PANEL_MAX_WIDTH` size one
+  grid up to four columns. Two side-by-side viewports need roughly double that.
+  Simplest: remember the panel's width from before entering Merge mode, widen it
+  (clamped to a new, wider maximum sized the same way today's constants are — from
+  `THUMBNAIL_WIDTH`, not guessed) while the tab is active, and restore the
+  remembered width on leaving.
+- `OpenDocument` needs somewhere to hold the staged file. Whether that is a new
+  `Option<OpenFile>` separate from `files` (promoted into `files` at the moment its
+  first page is inserted) or registered into `files` immediately at staging time
+  (since `RenderPool`/`PageOrder::stage` already tolerate a document contributing
+  zero pages to `order`) is left open — see §10.9. Both produce the same externally
+  visible behavior; the second reuses more of M20's existing plumbing.
+- `confirm.rs`: `StageDocument`, `ClearStaging`, and `InsertPages` join `InsertFile`
+  in the unguarded arm, each pinned by its own test the way
+  `inserting_a_file_is_never_guarded_because_it_only_adds_pages` already pins
+  `InsertFile`.
+- `protocol.rs`: given §9a's own finding that the hand-written decoder has no
+  exhaustive-coverage check, each new command's decoder arm gets a test pinning its
+  wire form specifically, rather than assuming the general fix (still open,
+  unstarted follow-up work) lands first.
+
+### 10.8 Milestones
+
+| | | |
+|---|---|---|
+| **M25** | `PageOrder::stage` and `PageOrder::insert_pages`; pure, extends the existing invariant tests | ✅ |
+| **M26** | A second `Selection` instance and the `Inserted` drag payload | ✅ |
+| **M27** | `draw_merge`: two viewports side by side, the cross-viewport drag, the insertion-bar hover reused from Reorganize | ✅ |
+| **M28** | `StageDocument`, `ClearStaging`, `InsertPages`; unguarded; wired to the drag, a "Stage a file…" button, a drop on the staging viewport, and its close control | ✅ |
+| **M29** | End-to-end tests over the real control channel: stage, insert one page mid-document, insert a multi-page selection, clear staging, save, reopen, verify | planned |
+| **M30** | *(optional)* the search box narrows the staging viewport as well as the main one | ✅ |
+
+**M25.** Entirely `porpoise-doc`, entirely pure, the same reason M19 was: cheapest
+place to catch a `Source`-shaped mistake, before M26–M27 build two crates' worth of
+UI on top of it. Proof is the invariant suite generalized the way M19's was —
+`insert_pages` must never lose, duplicate, or invent a page, whatever `position` and
+however many `pages`.
+
+**M26.** The interaction half without the two-viewport layout yet: `Selection`
+generalized so a second instance can pick from a staged document, and `Inserted`, the
+payload type the main grid's hover logic will tell from `Dragged` once M27 wires up
+the recognition. Provable without a window — `Selection`'s own tests already cover
+picking, extended with a staged-document fixture; `Inserted`'s only real claim, that
+`DragAndDrop` never mistakes it for `Dragged`, is a headless `egui::Context` test
+away.
+
+§10.4's claim that `Selection` was "already... generic enough to reuse as-is" was
+half right. The *storage* was — `BTreeSet<Source>` never cared which document a
+`Source` named. Every *method* was not: each took `order: &PageOrder` and called
+`order.source_of(position)` to resolve one, which only works for a position that is
+actually in that `PageOrder`'s display order — and a staged document contributes
+none until something is dragged out of it, so there was no order to hand this module
+for the staging pane at all. Fixed by taking `shown: &[Source]` instead of a
+`PageOrder`: the main grid now passes `order.as_slice()`, the staging grid will pass
+`(0..page_count).map(|page| Source { document, page })` once M27 builds it — the same
+generalization `PageOrder::on_disk` went through for a different reason
+(`docs/goal-5-plan.md` §9a), decoupling a module from a concrete `PageOrder` in favour
+of the plain slice it actually needed. Every existing call site and test changed
+mechanically (`&order` to `order.as_slice()`) with no behaviour change, confirmed by
+the full existing suite passing unmodified in substance.
+
+`Inserted` is introduced with nothing outside its own test constructing it yet,
+because its producer — the staging viewport — is M27's, not M26's. Left as ordinary
+dead code, `cargo clippy` would have caught it as `dead_code` in the non-test build
+even though the test build was satisfied; addressed with `#[cfg_attr(not(test),
+expect(dead_code, reason = "..."))]` rather than a plain `#[allow]`, so the exception
+expires loudly — a lint warning, not a silent gap — the moment M27 gives it a real
+caller and the `expect` goes unfulfilled.
+
+**M27.** The layout milestone, and the one most worth prototyping before committing:
+two viewports, sized per §10.7, with the staging one wired for pick-and-drag-out and
+the main one wired to recognize `Inserted` on hover and on drop. Proof, like M20's,
+is partly a regression check — Navigate and Reorganize must render exactly as before
+— and partly new: a drag from the right viewport lands at the hovered position in
+the left one, verified by hand the way every other pointer gesture in this file is
+(`thumbnails.rs`'s own module docs name this limitation for the gestures already
+shipped; a new one inherits it rather than escaping it).
+
+§10.9's first open decision resolved as leaned: a separate `draw_staged_grid` rather
+than generalizing `Grid` to an explicit `&[Source]`. `GridMode::Merge`'s cell behaviour
+— click navigates, and a hover/drop recognizes `Inserted` — shares nothing with
+Reorganize's click-and-drag-to-reorder, so folding both into one `cell` match arm
+would have meant a fourth kind of cell logic wedged into a function already
+choosing between two; a third top-level match arm plus a sibling function for the
+staging pane's own (pick, drag out, marquee) kept each mode's logic legible on its
+own, at the cost of the small, deliberate duplication between `draw_single_grid` and
+`draw_staged_grid`'s layout arithmetic.
+
+**A real bug found by construction, not by running anything: two grids, one memory
+slot.** `marquee`'s remembered drag-origin lives in `egui::Context` memory under a
+fixed `Id`. `GridMode::Merge` draws two grids — the main viewport and the staging
+one — in the same frame for the first time; with the old fixed `Id` a box started in
+one could have been reported as finishing in the other, since `Context` memory is
+keyed by `Id` alone and nothing before now ever drew two of these in one pass to
+expose it. Fixed by threading a `salt` through `marquee`/`marquee_origin`, pinned by
+`different_salts_give_the_marquee_different_memory_slots`.
+
+**`Inserted`'s temporary `#[expect(dead_code)]` (§9a) is gone**, exactly as its own
+doc comment promised: `staged_cell` now constructs one on every drag start, so the
+compiler would catch it going quiet again on its own.
+
+**Scope actually built, versus what the milestone table's one-liner suggested.**
+Building `draw_staged_grid` surfaced that it needs somewhere to read a document's
+geometry and page count from — `Grid.staged: Option<StagedInfo<'a>>`, added this
+milestone rather than M28. But `OpenDocument` has nowhere to *populate* one yet
+(§10.7's second open decision, still open): `StageDocument` is M28's command, so
+`grid.staged` is always `None` today and the right pane always shows its
+placeholder. That is not a gap in what M27 proves — Navigate and Reorganize are
+untouched, the merge tab's static layout renders correctly in a real window
+(confirmed by `the_merge_tabs_two_viewports_render_without_a_staged_document`,
+switching to the tab over the real control channel and capturing it), and every
+pure piece (`StagedInfo`/`Selection` wiring, the salt fix, the payload distinctness)
+is unit-tested. What is *not* provable yet, and could not be made so without pulling
+M28 forward, is the drag itself actually landing a page — there is nothing to stage
+a document from until then.
+
+**The panel does not auto-widen when the tab opens**, a simplification from §10.7's
+"remember and restore" sketch: egui only honours a panel's `default_size` the first
+time it opens, so there was no cheap way to also resize one already open from here.
+Widened the *allowed* range instead (`PANEL_MERGE_MIN_WIDTH`/`MAX_WIDTH`, roughly
+double the single-grid ones) so the tab is at least draggable to a comfortable
+width, and left auto-resize as a nice-to-have rather than blocking on it.
+
+**M28.** The commands, their producers, and the guard decisions — the milestone that
+makes M25–M27 reachable by a person or an agent, the same job M22 did for M19–M21.
+
+§10.9's second open decision resolved as leaned: `OpenDocument` gained a
+`staging: Option<usize>` pointer into `files` rather than a parallel `Option<
+OpenFile>` slot. Staging now goes through the exact same `add_file` every insert
+already uses — `RenderPool` registration and all — and `staging` only ever says
+*which* entry is the current staging slot, never holds one itself. Replacing the
+staged document points `staging` at a fresh index; the old entry is never
+referenced again, the same as an inserted file's is not.
+
+The staging viewport's own `Selection` turned out not to need a command of its
+own, unlike the main grid's. `SetSelection` exists because an agent has to be able
+to read and set *exactly* what a person is looking at — the keyboard's Delete acts
+on whatever `selection` currently holds. Nothing analogous acts on "whatever is
+selected in the staging pane": `InsertPages` already names the exact pages it
+wants, so picking several out first is a mouse convenience for one drag, not a
+piece of state anything else consults. Left as plain UI state, updated directly
+from the grid's own `picked`/`marquee` output rather than dispatched.
+
+Verified past the unit level: `an_agent_can_stage_a_document_and_insert_its_pages_
+and_save_it` drives the real control channel — stage, insert one page mid-document
+(not appended, the entire point of this over `InsertFile`), insert a second,
+multi-page selection from the *same* staged document, clear staging without
+disturbing what was already placed, save, and reopen to confirm the page count
+survived. A screenshot taken the same way confirmed the toolbar's new **Stage a
+file…** button and both live viewports render real thumbnails, not just the M27
+placeholder.
+
+Each new command's decoder arm got its own pinned test
+(`the_merge_tab_commands_decode_with_their_arguments`), per §9a's own finding
+about `insert_file` — not deferred to the general exhaustive-coverage fix, which
+is still unstarted follow-up work.
+
+**M29.** Substantially covered by M28's own verification above — the real-pipe,
+real-window proof this milestone asked for already exists. What is left, if
+anything, is judged once M28's test is read back rather than assumed: additional
+edge cases (a save immediately after staging with nothing yet inserted; clearing
+staging mid-drag) if any turn out to matter in practice.
+
+**M30.** Optional, and taken: narrowing the staging viewport by page number turned
+out to need its own resolution of the query rather than reusing the main grid's,
+which `Viewer::staged_filter`'s own doc comment argues for and
+`the_search_box_narrows_the_staging_viewport_independently` proves — a 3-page
+primary and a 10-page staged document searching `"1-9"` at once, where the
+primary clamps to its own three pages and the staged document correctly shows
+nine, not the primary's three. `Snapshot` gained `staged_filtered_pages` to match,
+mirroring `filtered_pages` exactly, so an agent can read what the staging pane
+shows the same way it already can for the main one. The narrowing warning
+("clear the search to insert pages here") already covered `GridMode::Merge` since
+M27; nothing new was needed there.
+
+No open questions remain. Goal 5's two-viewport merge tab is complete: stage a
+document, search either pane down to the pages that matter, drag a selection into
+place, and save — all reachable by hand and by an agent, over the same commands.
+
+### 10.9 Decisions made while building it
+
+1. ~~generalize `Grid` to an explicit `&[Source]`, or a second `draw_staging`
+   function?~~ **Resolved: (b), a second function.** `GridMode::Merge`'s cell
+   behaviour shares nothing with Reorganize's click-and-drag-to-reorder, so a
+   third top-level match arm plus a sibling function kept each mode's logic
+   legible on its own. See M27's retrospective.
+2. ~~where does the staged file live before its first page is placed?~~
+   **Resolved: straight into `files`, via a new `staging: Option<usize>` pointer.**
+   Staging reuses `add_file` exactly as `InsertFile` does; `staging` only ever
+   says which entry is the current slot. See M28's retrospective.
+3. **M30**, deferred rather than decided against.

@@ -67,12 +67,27 @@ pub(crate) fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bo
     (modifiers.command || modifiers.ctrl) && key == egui::Key::O
 }
 
+/// Which part of the window a drop landed on — the only thing [`drop_action`] needs
+/// to know to decide what dropping a PDF means. See [`crate::viewer::Viewer::
+/// drop_zone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropZone {
+    /// Anywhere else. A PDF here always means [`DropAction::Open`].
+    Elsewhere,
+    /// The page grid, while a document is open. A PDF here means
+    /// [`DropAction::Insert`].
+    Grid,
+    /// The merge tab's staging viewport. A PDF here means [`DropAction::Stage`].
+    Staging,
+}
+
 /// What dropping these files on the window would do.
 ///
-/// Like the file dialog, a drop is a **producer** of [`Command::Open`] or
-/// [`Command::InsertFile`] rather than a command of its own — an agent already has
-/// both, with a path, which is strictly more capable than a gesture. See
-/// `docs/goal-3-plan.md` §1 and `docs/goal-5-plan.md` §6.
+/// Like the file dialog, a drop is a **producer** of [`Command::Open`],
+/// [`Command::InsertFile`] or [`Command::StageDocument`] rather than a command of
+/// its own — an agent already has all three, with a path, which is strictly more
+/// capable than a gesture. See `docs/goal-3-plan.md` §1 and `docs/goal-5-plan.md`
+/// §6 and §10.6.
 ///
 /// One decision serves two callers: the hint painted while the drag is still in the air
 /// and the action that happens when the button is released. Computing those separately
@@ -98,6 +113,17 @@ pub(crate) enum DropAction {
         /// How many other paths came with it.
         ignored: usize,
     },
+    /// Stage this document for the merge tab, ignoring `ignored` other dropped
+    /// files.
+    ///
+    /// Only ever produced when the drop lands on the staging viewport specifically
+    /// — see `docs/goal-5-plan.md` §10.6. Dropped anywhere else, a PDF means
+    /// [`Self::Open`] or [`Self::Insert`] instead.
+    Stage {
+        path: PathBuf,
+        /// How many other paths came with it.
+        ignored: usize,
+    },
     /// Nothing dropped can be opened. Written for a person to read.
     Refuse { reason: String },
 }
@@ -107,8 +133,9 @@ impl DropAction {
     ///
     /// `unsaved_changes` says an open will be interrupted by a question, since opening a
     /// document replaces the one on screen. Worth saying while the mouse button is still
-    /// down, so the drag can be abandoned rather than answered. Inserting is never
-    /// guarded — see `docs/goal-5-plan.md` §6 — so it has nothing to say here.
+    /// down, so the drag can be abandoned rather than answered. Inserting and staging are
+    /// never guarded — see `docs/goal-5-plan.md` §6 and §10.6 — so they have nothing to
+    /// say here.
     ///
     /// This used to read *"will be lost"*, which was true when the drop hint was the
     /// only warning there was. It is not true any more — [`crate::confirm`] asks first —
@@ -132,6 +159,13 @@ impl DropAction {
                 }
                 parts.join(" — ")
             }
+            Self::Stage { path, ignored } => {
+                let mut parts = vec![format!("Merge pages from {}", file_label(path))];
+                if *ignored > 0 {
+                    parts.push(format!("ignoring {ignored} other file(s)"));
+                }
+                parts.join(" — ")
+            }
             Self::Refuse { reason } => reason.clone(),
         }
     }
@@ -141,11 +175,11 @@ impl DropAction {
 ///
 /// `None` means nothing is there — no drop, or a drop egui gave us no paths for.
 ///
-/// `insert` says whether this drop lands somewhere that means "add to what is open"
-/// rather than "replace it" — the caller works that out from where the pointer is and
-/// whether a document is open, since this function knows about neither. See
-/// [`crate::viewer::Viewer::drop_targets_the_grid`].
-pub(crate) fn drop_action(paths: &[PathBuf], insert: bool) -> Option<DropAction> {
+/// `zone` says which part of the window the drop landed on — the caller works that
+/// out from where the pointer is, whether a document is open and which grid mode is
+/// showing, since this function knows about none of those. See
+/// [`crate::viewer::Viewer::drop_zone`].
+pub(crate) fn drop_action(paths: &[PathBuf], zone: DropZone) -> Option<DropAction> {
     if paths.is_empty() {
         return None;
     }
@@ -154,16 +188,11 @@ pub(crate) fn drop_action(paths: &[PathBuf], insert: bool) -> Option<DropAction>
     match paths.iter().find(|path| is_pdf(path)) {
         Some(path) => {
             let ignored = paths.len() - 1;
-            Some(if insert {
-                DropAction::Insert {
-                    path: path.clone(),
-                    ignored,
-                }
-            } else {
-                DropAction::Open {
-                    path: path.clone(),
-                    ignored,
-                }
+            let path = path.clone();
+            Some(match zone {
+                DropZone::Elsewhere => DropAction::Open { path, ignored },
+                DropZone::Grid => DropAction::Insert { path, ignored },
+                DropZone::Staging => DropAction::Stage { path, ignored },
             })
         }
         None => Some(DropAction::Refuse {
@@ -451,7 +480,7 @@ mod tests {
     #[test]
     fn a_dropped_pdf_asks_to_open_it() {
         assert_eq!(
-            drop_action(&paths(&["plans/sheet.pdf"]), false),
+            drop_action(&paths(&["plans/sheet.pdf"]), DropZone::Elsewhere),
             Some(DropAction::Open {
                 path: PathBuf::from("plans/sheet.pdf"),
                 ignored: 0,
@@ -465,7 +494,7 @@ mod tests {
         // that came off a plotter or an email attachment.
         for name in ["sheet.PDF", "sheet.Pdf", "sheet.pDf"] {
             assert!(
-                matches!(drop_action(&paths(&[name]), false), Some(DropAction::Open { .. })),
+                matches!(drop_action(&paths(&[name]), DropZone::Elsewhere), Some(DropAction::Open { .. })),
                 "{name} was not recognised as a PDF"
             );
         }
@@ -473,8 +502,8 @@ mod tests {
 
     #[test]
     fn nothing_dropped_asks_for_nothing() {
-        assert_eq!(drop_action(&[], false), None);
-        assert_eq!(drop_action(&[], true), None);
+        assert_eq!(drop_action(&[], DropZone::Elsewhere), None);
+        assert_eq!(drop_action(&[], DropZone::Grid), None);
     }
 
     #[test]
@@ -482,7 +511,7 @@ mod tests {
         // Named, because "nothing happened" is indistinguishable from the window
         // being broken.
         let Some(DropAction::Refuse { reason }) =
-            drop_action(&paths(&["notes/minutes.docx"]), false)
+            drop_action(&paths(&["notes/minutes.docx"]), DropZone::Elsewhere)
         else {
             panic!("a .docx should be refused");
         };
@@ -495,7 +524,7 @@ mod tests {
         // A directory has no `.pdf` extension, which is all that keeps it out — worth
         // pinning, because opening one would hand a path to `Document::open`.
         assert!(matches!(
-            drop_action(&paths(&["C:/plans/gdot"]), false),
+            drop_action(&paths(&["C:/plans/gdot"]), DropZone::Elsewhere),
             Some(DropAction::Refuse { .. })
         ));
     }
@@ -505,7 +534,7 @@ mod tests {
         // Dropping a folder's worth of files that happens to contain one PDF should
         // open the PDF, not refuse everything because a README came first.
         assert_eq!(
-            drop_action(&paths(&["readme.txt", "sheet.pdf", "logo.png"]), false),
+            drop_action(&paths(&["readme.txt", "sheet.pdf", "logo.png"]), DropZone::Elsewhere),
             Some(DropAction::Open {
                 path: PathBuf::from("sheet.pdf"),
                 ignored: 2,
@@ -515,7 +544,7 @@ mod tests {
 
     #[test]
     fn refusing_several_files_says_how_many() {
-        let Some(DropAction::Refuse { reason }) = drop_action(&paths(&["a.txt", "b.png"]), false)
+        let Some(DropAction::Refuse { reason }) = drop_action(&paths(&["a.txt", "b.png"]), DropZone::Elsewhere)
         else {
             panic!("neither is a PDF");
         };
@@ -524,7 +553,7 @@ mod tests {
 
     #[test]
     fn the_hint_names_the_file_that_would_open() {
-        let action = drop_action(&paths(&["plans/ROLT14.pdf"]), false).expect("a PDF was dropped");
+        let action = drop_action(&paths(&["plans/ROLT14.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
         let hint = action.hint(false);
         assert!(hint.contains("ROLT14.pdf"), "unhelpful: {hint}");
         // Just the file name: a full path of a hundred characters would run off both
@@ -535,7 +564,7 @@ mod tests {
     #[test]
     fn the_hint_says_when_other_files_will_be_ignored() {
         let action =
-            drop_action(&paths(&["sheet.pdf", "other.pdf"]), false).expect("a PDF was dropped");
+            drop_action(&paths(&["sheet.pdf", "other.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
         let hint = action.hint(false);
         assert!(hint.contains("ignoring 1"), "unhelpful: {hint}");
     }
@@ -545,7 +574,7 @@ mod tests {
         // So the drag can be abandoned rather than answered. It must not claim they
         // *will be lost* — `crate::confirm` asks first, and a warning that overstates
         // the stakes is one people stop believing.
-        let action = drop_action(&paths(&["sheet.pdf"]), false).expect("a PDF was dropped");
+        let action = drop_action(&paths(&["sheet.pdf"]), DropZone::Elsewhere).expect("a PDF was dropped");
         assert!(!action.hint(false).contains("unsaved"));
         let warned = action.hint(true);
         assert!(warned.contains("unsaved"), "unhelpful: {warned}");
@@ -557,7 +586,7 @@ mod tests {
     #[test]
     fn a_pdf_dropped_on_the_grid_asks_to_insert_it() {
         assert_eq!(
-            drop_action(&paths(&["plans/sheet.pdf"]), true),
+            drop_action(&paths(&["plans/sheet.pdf"]), DropZone::Grid),
             Some(DropAction::Insert {
                 path: PathBuf::from("plans/sheet.pdf"),
                 ignored: 0,
@@ -569,7 +598,7 @@ mod tests {
     fn the_insert_hint_never_mentions_unsaved_changes() {
         // Inserting is never guarded — see `crate::confirm` — so nothing is at risk to
         // warn about, unlike an open that would replace the document.
-        let action = drop_action(&paths(&["sheet.pdf"]), true).expect("a PDF was dropped");
+        let action = drop_action(&paths(&["sheet.pdf"]), DropZone::Grid).expect("a PDF was dropped");
         assert!(!action.hint(true).contains("unsaved"));
     }
 
@@ -578,7 +607,37 @@ mod tests {
         // `insert` only changes what a *PDF* means; it does not relax which files count
         // as one.
         assert!(matches!(
-            drop_action(&paths(&["notes.docx"]), true),
+            drop_action(&paths(&["notes.docx"]), DropZone::Grid),
+            Some(DropAction::Refuse { .. })
+        ));
+    }
+
+    // --- Dropping onto the staging viewport: merging rather than inserting ----
+
+    #[test]
+    fn a_pdf_dropped_on_the_staging_viewport_asks_to_stage_it() {
+        assert_eq!(
+            drop_action(&paths(&["plans/sheet.pdf"]), DropZone::Staging),
+            Some(DropAction::Stage {
+                path: PathBuf::from("plans/sheet.pdf"),
+                ignored: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn the_stage_hint_never_mentions_unsaved_changes() {
+        // Staging is never guarded — see `crate::confirm` — so nothing is at risk to
+        // warn about, unlike an open that would replace the document.
+        let action =
+            drop_action(&paths(&["sheet.pdf"]), DropZone::Staging).expect("a PDF was dropped");
+        assert!(!action.hint(true).contains("unsaved"));
+    }
+
+    #[test]
+    fn a_non_pdf_is_still_refused_when_dropped_on_the_staging_viewport() {
+        assert!(matches!(
+            drop_action(&paths(&["notes.docx"]), DropZone::Staging),
             Some(DropAction::Refuse { .. })
         ));
     }
@@ -596,10 +655,10 @@ mod tests {
             paths(&["a.txt", "b.png", "c"]),
         ];
         for case in cases {
-            for insert in [false, true] {
+            for zone in [DropZone::Elsewhere, DropZone::Grid, DropZone::Staging] {
                 // Nothing there means no hint is drawn, which cannot disagree with
                 // anything.
-                let Some(action) = drop_action(&case, insert) else {
+                let Some(action) = drop_action(&case, zone) else {
                     continue;
                 };
                 let hint = action.hint(false);
@@ -612,6 +671,11 @@ mod tests {
                     DropAction::Insert { path, .. } => assert!(
                         hint.starts_with("Add pages from ") && hint.contains(&file_label(path)),
                         "{case:?} would insert {} but the hint said {hint:?}",
+                        path.display()
+                    ),
+                    DropAction::Stage { path, .. } => assert!(
+                        hint.starts_with("Merge pages from ") && hint.contains(&file_label(path)),
+                        "{case:?} would stage {} but the hint said {hint:?}",
                         path.display()
                     ),
                     DropAction::Refuse { reason } => assert_eq!(

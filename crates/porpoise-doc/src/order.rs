@@ -217,6 +217,86 @@ impl PageOrder {
         true
     }
 
+    /// Registers a document [`Self::insert_pages`] can later place pages from,
+    /// without adding any of them to the display order yet.
+    ///
+    /// `document` is the index later calls should use for it — ordinarily
+    /// [`Self::document_count`], for the same reason [`Self::append`] never reuses
+    /// one: the file on disk may have changed since it was last read, and treating
+    /// it as unchanged would be exactly the kind of quiet incorrectness this
+    /// project refuses to ship. Replacing a staged document with a different one is
+    /// done by staging the new one at a fresh index, not by re-staging over the
+    /// old one — the old index is simply never referenced again. Calling this
+    /// again on a document already contributing pages to the order is a caller
+    /// error this module does not defend against, the same as calling `append`
+    /// twice on the same index already was not.
+    ///
+    /// Not an edit: nothing about what is shown changes, so unlike [`Self::append`]
+    /// this touches neither [`Self::as_slice`] nor the undo history — only
+    /// [`Self::source_lens`] and [`Self::on_disk`], exactly the way `append`'s own
+    /// bookkeeping half already does.
+    ///
+    /// A no-op, reporting so, when `page_count` is zero: there is nothing to ever
+    /// place from an empty document.
+    pub fn stage(&mut self, document: usize, page_count: usize) -> bool {
+        if page_count == 0 {
+            return false;
+        }
+        if document >= self.source_lens.len() {
+            self.source_lens.resize(document + 1, 0);
+            self.on_disk.resize(document + 1, Vec::new());
+        }
+        if let Some(len) = self.source_lens.get_mut(document) {
+            *len = page_count;
+        }
+        let pages: Vec<Source> = (0..page_count).map(|page| Source { document, page }).collect();
+        if let Some(slot) = self.on_disk.get_mut(document) {
+            *slot = pages;
+        }
+        true
+    }
+
+    /// Inserts `pages` of `document` — already known via [`Self::stage`] or
+    /// [`Self::append`] — as a contiguous block landing at `position`, in the order
+    /// given, as one undo step.
+    ///
+    /// What [`Self::append`] cannot express: `append` always takes every page of a
+    /// document and always lands at the end. This takes however many pages one
+    /// selection carried, in whatever order they were given, and lands them
+    /// wherever asked — mid-document or not, one page or several — without ever
+    /// costing more than one undo. Calling it more than once against the same
+    /// `document` is expected: a document can be staged once and drawn from by
+    /// several separate drags.
+    ///
+    /// A no-op, reporting so, rather than inserting anything or touching history,
+    /// if `pages` is empty, if `document` is not yet known to this order, if any
+    /// page named is out of range for it, or if `position` is past the end of the
+    /// order. Refusing the whole call rather than inserting whichever entries were
+    /// valid is the same convention [`Self::move_pages`] and [`Self::remove_pages`]
+    /// already use: a caller that asked for five pages and got three inserted would
+    /// have no way to notice.
+    ///
+    /// Duplicate pages within `pages` are not rejected. Inserting the same page of
+    /// `document` more than once is unusual, not invalid — nothing stops picking it
+    /// out of the staging viewport a second time — and this module does not guess
+    /// at an intention it was not asked about.
+    pub fn insert_pages(&mut self, document: usize, pages: &[usize], position: usize) -> bool {
+        if pages.is_empty() || position > self.order.len() {
+            return false;
+        }
+        let Some(&len) = self.source_lens.get(document) else {
+            return false;
+        };
+        if pages.iter().any(|&page| page >= len) {
+            return false;
+        }
+
+        self.remember();
+        let group = pages.iter().map(|&page| Source { document, page });
+        self.order.splice(position..position, group);
+        true
+    }
+
     /// Whether this matches what is on disk.
     ///
     /// What "unsaved changes" means, and what makes saving over the file a no-op. True
@@ -768,6 +848,206 @@ mod tests {
             assert!(
                 source.page < order.source_lens()[source.document],
                 "{source:?} is out of range for its own document"
+            );
+        }
+    }
+
+    // --- Staging a document, then placing some of its pages -------------------
+
+    #[test]
+    fn staging_a_document_does_not_touch_the_order_or_history() {
+        let mut order = PageOrder::identity(3);
+        assert!(order.stage(order.document_count(), 5));
+
+        assert_eq!(order.as_slice(), primary([0, 1, 2]), "staging is not an edit");
+        assert_eq!(order.document_count(), 2, "the staged document is still known");
+        assert_eq!(order.source_lens(), &[3, 5]);
+        assert!(!order.can_undo(), "staging recorded an undo step");
+        assert!(order.is_unedited(), "staging alone should not be an edit");
+    }
+
+    #[test]
+    fn staging_zero_pages_changes_nothing() {
+        let mut order = PageOrder::identity(3);
+        assert!(!order.stage(1, 0));
+        assert_eq!(
+            order.document_count(),
+            1,
+            "a stage that did nothing still counted a document"
+        );
+    }
+
+    #[test]
+    fn a_staged_documents_pages_are_on_disk_before_any_are_placed() {
+        // So a save reads exactly as many pages as the caller registered, even
+        // though none of them are in the order yet.
+        let mut order = PageOrder::identity(2);
+        assert!(order.stage(1, 3));
+        assert_eq!(order.on_disk(1), Some(from_document(1, [0, 1, 2]).as_slice()));
+    }
+
+    #[test]
+    fn inserting_staged_pages_lands_them_at_the_requested_position() {
+        let mut order = PageOrder::identity(3); // [0,1,2]
+        assert!(order.stage(1, 2));
+        assert!(order.insert_pages(1, &[0], 1));
+
+        let mut expected = primary([0]);
+        expected.extend(from_document(1, [0]));
+        expected.extend(primary([1, 2]));
+        assert_eq!(order.as_slice(), expected);
+        assert_eq!(order.len(), 4);
+    }
+
+    #[test]
+    fn inserting_several_pages_at_once_is_one_undo_step() {
+        let mut order = PageOrder::identity(2); // [0,1]
+        assert!(order.stage(1, 3));
+        assert!(order.insert_pages(1, &[2, 0], 1));
+
+        let mut expected = primary([0]);
+        expected.extend(from_document(1, [2, 0]));
+        expected.extend(primary([1]));
+        assert_eq!(order.as_slice(), expected);
+
+        assert!(order.undo());
+        assert_eq!(order.as_slice(), primary([0, 1]), "one undo removed the whole group");
+    }
+
+    #[test]
+    fn inserted_pages_keep_the_order_they_were_given_in() {
+        // Not sorted, and not the order they sit in within their own document —
+        // exactly the order the caller (a drag out of a multi-selection) handed in.
+        let mut order = PageOrder::identity(1);
+        assert!(order.stage(1, 4));
+        assert!(order.insert_pages(1, &[3, 1, 2], 1));
+        assert_eq!(
+            order.as_slice(),
+            [p(0)].into_iter().chain(from_document(1, [3, 1, 2])).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn inserting_at_the_very_end_is_allowed() {
+        let mut order = PageOrder::identity(2);
+        assert!(order.stage(1, 1));
+        assert!(order.insert_pages(1, &[0], order.len()));
+        let mut expected = primary([0, 1]);
+        expected.extend(from_document(1, [0]));
+        assert_eq!(order.as_slice(), expected);
+    }
+
+    #[test]
+    fn inserting_into_an_unstaged_document_is_refused() {
+        let mut order = PageOrder::identity(2);
+        assert!(!order.insert_pages(1, &[0], 1), "document 1 was never staged");
+        assert_eq!(order.as_slice(), primary([0, 1]));
+        assert!(!order.can_undo());
+    }
+
+    #[test]
+    fn a_page_out_of_range_for_its_document_refuses_the_whole_insert() {
+        let mut order = PageOrder::identity(2);
+        assert!(order.stage(1, 2));
+        assert!(
+            !order.insert_pages(1, &[0, 9], 1),
+            "page 9 does not exist in a 2-page staged document"
+        );
+        assert_eq!(order.as_slice(), primary([0, 1]), "the whole call was refused");
+        assert!(!order.can_undo(), "a refused insert should not be undoable");
+    }
+
+    #[test]
+    fn inserting_past_the_end_of_the_order_is_refused() {
+        let mut order = PageOrder::identity(2);
+        assert!(order.stage(1, 2));
+        assert!(!order.insert_pages(1, &[0], 9));
+        assert_eq!(order.as_slice(), primary([0, 1]));
+    }
+
+    #[test]
+    fn inserting_zero_pages_changes_nothing() {
+        let mut order = PageOrder::identity(2);
+        assert!(order.stage(1, 2));
+        assert!(!order.insert_pages(1, &[], 0));
+        assert_eq!(order.as_slice(), primary([0, 1]));
+        assert!(!order.can_undo());
+    }
+
+    #[test]
+    fn the_same_staged_page_can_be_inserted_more_than_once() {
+        // Unusual, not invalid: nothing stops picking the same page out of the
+        // staging viewport a second time, and this module does not guess at an
+        // intention it was not asked about.
+        let mut order = PageOrder::identity(1);
+        assert!(order.stage(1, 1));
+        assert!(order.insert_pages(1, &[0], 1));
+        assert!(order.insert_pages(1, &[0], 2));
+        assert_eq!(order.as_slice(), [p(0), Source { document: 1, page: 0 }, Source {
+            document: 1,
+            page: 0
+        }]);
+    }
+
+    #[test]
+    fn a_staged_document_can_be_drawn_from_by_more_than_one_insert() {
+        // The point of splitting `stage` from `insert_pages`: one document, several
+        // separate drags, each landing wherever it was dropped.
+        let mut order = PageOrder::identity(1);
+        assert!(order.stage(1, 3));
+        assert!(order.insert_pages(1, &[0], 0));
+        assert!(order.insert_pages(1, &[2], order.len()));
+        assert_eq!(
+            order.as_slice(),
+            [Source { document: 1, page: 0 }, p(0), Source { document: 1, page: 2 }]
+        );
+    }
+
+    #[test]
+    fn an_inserted_page_is_an_ordinary_entry_afterward() {
+        // The point of the whole model, restated for `insert_pages` the way
+        // `an_inserted_page_can_be_moved_and_deleted_like_any_other` states it for
+        // `append`: no special casing anywhere else in this module.
+        let mut order = PageOrder::identity(2);
+        assert!(order.stage(1, 2));
+        assert!(order.insert_pages(1, &[0], 1));
+
+        assert!(order.move_page(1, 0));
+        assert_eq!(order.source_of(0), Some(Source { document: 1, page: 0 }));
+
+        assert!(order.remove(0));
+        assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn an_inserted_page_makes_the_order_edited() {
+        let mut order = PageOrder::identity(2);
+        let written = order.as_slice().to_vec();
+        order.mark_saved(0, &written);
+        assert!(order.is_unedited());
+
+        assert!(order.stage(1, 1));
+        assert!(order.insert_pages(1, &[0], 0));
+        assert!(!order.is_unedited(), "an inserted page is an unsaved change");
+    }
+
+    #[test]
+    fn inserted_pages_never_invent_or_duplicate_a_position() {
+        let mut order = PageOrder::identity(4);
+        assert!(order.stage(1, 3));
+        assert!(order.insert_pages(1, &[2, 0], 2));
+        assert!(order.move_page(0, 5));
+        assert!(order.remove(1));
+
+        let mut seen = order.as_slice().to_vec();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "a page appeared twice: {order:?}");
+        for &source in order.as_slice() {
+            assert!(
+                source.page < order.source_lens()[source.document],
+                "invented page {source:?}"
             );
         }
     }

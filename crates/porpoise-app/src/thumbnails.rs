@@ -110,6 +110,26 @@ pub(crate) const PANEL_MAX_WIDTH: f32 =
 /// a build that disagrees is one that should not link.
 const _: () = assert!(PANEL_MIN_WIDTH <= PANEL_WIDTH && PANEL_WIDTH <= PANEL_MAX_WIDTH);
 
+/// Room between the two viewports in [`GridMode::Merge`].
+const MERGE_DIVIDER_GAP: f32 = 12.0;
+
+/// The narrowest the panel may be while the merge tab is open: two one-column
+/// viewports side by side, each with its own scroll bar, plus the gap between them.
+///
+/// Derived from [`PANEL_MIN_WIDTH`] rather than written down separately, for the same
+/// reason that one is derived from [`THUMBNAIL_WIDTH`] — a panel sized for a number of
+/// columns that no longer fit is exactly the bug that constant was introduced to
+/// avoid.
+pub(crate) const PANEL_MERGE_MIN_WIDTH: f32 = PANEL_MIN_WIDTH * 2.0 + MERGE_DIVIDER_GAP;
+
+/// The widest the panel may be while the merge tab is open — [`PANEL_MAX_WIDTH`]
+/// doubled, since it now has to fit two viewports rather than one.
+pub(crate) const PANEL_MERGE_MAX_WIDTH: f32 = PANEL_MAX_WIDTH * 2.0 + MERGE_DIVIDER_GAP;
+
+const _: () = assert!(PANEL_MERGE_MIN_WIDTH <= PANEL_MERGE_MAX_WIDTH);
+const _: () = assert!(PANEL_MERGE_MIN_WIDTH >= PANEL_MIN_WIDTH * 2.0);
+const _: () = assert!(PANEL_MERGE_MAX_WIDTH > PANEL_MAX_WIDTH);
+
 /// How far the pointer must travel before a drag on empty space is a selection box.
 ///
 /// Without this, a *stationary* click counts as a marquee of zero size, and a click that
@@ -159,6 +179,11 @@ pub(crate) enum GridMode {
     Navigate,
     /// Pick pages out and drag them into a new order. See [`crate::selection`].
     Reorganize,
+    /// Two viewports: the open document on the left, a second one staged for merging
+    /// on the right. A click on the left still navigates, same as in
+    /// [`GridMode::Navigate`]; a drag out of the right lands its pages wherever it is
+    /// dropped on the left. See `docs/goal-5-plan.md` §10.
+    Merge,
 }
 
 impl GridMode {
@@ -167,13 +192,14 @@ impl GridMode {
     /// Kept exhaustive by `every_mode_is_listed`, which matches on each variant and so
     /// fails to compile when one is added — the same mechanism
     /// `Command::shell_commands` uses.
-    pub(crate) const EVERY: [Self; 2] = [Self::Navigate, Self::Reorganize];
+    pub(crate) const EVERY: [Self; 3] = [Self::Navigate, Self::Reorganize, Self::Merge];
 
     /// This mode's name on the wire.
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::Navigate => "navigate",
             Self::Reorganize => "reorganize",
+            Self::Merge => "merge",
         }
     }
 
@@ -191,6 +217,7 @@ impl GridMode {
         match self {
             Self::Navigate => "Navigation",
             Self::Reorganize => "Reorganize",
+            Self::Merge => "Merge",
         }
     }
 
@@ -203,6 +230,10 @@ impl GridMode {
             Self::Reorganize => {
                 "Click to pick a page, ctrl+click for several, shift+click for a range, \
                  or drag a box over empty space. Drag a page to move what is picked."
+            }
+            Self::Merge => {
+                "Open a second document on the right, then drag its pages into place \
+                 on the left."
             }
         }
     }
@@ -240,6 +271,34 @@ pub(crate) struct Grid<'a> {
     /// Physical pixels per screen point, so a thumbnail is rasterized at the size it
     /// will actually be drawn.
     pub(crate) pixels_per_point: f32,
+    /// The document staged for merging, if any. Only read in [`GridMode::Merge`],
+    /// same as [`Self::selection`] is only read in [`GridMode::Reorganize`]. `None`
+    /// until something is staged — the right viewport shows a placeholder then.
+    pub(crate) staged: Option<StagedInfo<'a>>,
+}
+
+/// Everything the staging viewport needs to show one document's own pages.
+///
+/// Deliberately narrower than [`Grid`]: geometry is all a thumbnail needs from the
+/// staged document, so this holds that directly rather than a whole `&Document` —
+/// which also means a test can build one without opening a real PDF.
+pub(crate) struct StagedInfo<'a> {
+    /// Which document this is — for the cache key, and for the `Inserted` payload a
+    /// drag out of this viewport carries.
+    pub(crate) document: usize,
+    /// The staged document's pages, in its own order. Position `n` here is page `n`
+    /// of that document — there is no `PageOrder` to cross through, because none of
+    /// these pages are in one yet.
+    pub(crate) geometries: &'a [PageGeometry],
+    /// Which of the staged document's pages are picked out. A separate instance from
+    /// [`Grid::selection`], since picking a page here says nothing about the main
+    /// document — see `docs/goal-5-plan.md` §10.4.
+    pub(crate) selection: &'a Selection,
+    /// Which of the staged document's pages the shared search box narrows this
+    /// viewport to. A second parse of the same query against a different page
+    /// count, not a second box — see `docs/goal-5-plan.md` M30 and
+    /// `Viewer::staged_filter`.
+    pub(crate) filter: &'a PageFilter,
 }
 
 /// The zoom rung thumbnails are rasterized at.
@@ -354,7 +413,10 @@ pub(crate) fn rows_for(pages: usize, columns: usize) -> usize {
 }
 
 /// What the grid did this frame.
-#[derive(Debug, Default, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: `staging_rect` holds `egui::Rect`, whose `f32` fields
+/// cannot be reflexive, the same reason `f32` itself is not `Eq`.
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct Drawn {
     /// A move, if one was dropped: which display positions, and where the group goes.
     ///
@@ -390,6 +452,26 @@ pub(crate) struct Drawn {
     /// consumers; see [`crate::retain`], which exists because this was not reported and
     /// the grid's own thumbnails were being evicted out from under it.
     pub(crate) showing: Vec<Source>,
+    /// A drop from the staging viewport, if one landed on the left in
+    /// [`GridMode::Merge`] this frame: which staged document, which of its pages, and
+    /// the display position they land at. The caller turns this into
+    /// `Command::InsertPages`, same reasoning as `moved` becoming `MovePages`.
+    pub(crate) inserted: Option<(usize, Vec<usize>, usize)>,
+    /// A click on a thumbnail in the staging viewport, and what it was asking for.
+    /// Only ever set in [`GridMode::Merge`]. See [`Self::picked`] for the main
+    /// viewport's equivalent.
+    pub(crate) staged_picked: Option<(usize, Pick)>,
+    /// Positions in the staged document a finished marquee over the staging viewport
+    /// covered, replacing its selection. See [`Self::marquee`] for the main
+    /// viewport's equivalent.
+    pub(crate) staged_marquee: Option<Vec<usize>>,
+    /// The staging viewport's own rectangle, if [`GridMode::Merge`] drew one this
+    /// frame — what [`crate::viewer::Viewer::drop_zone`] needs to tell a drop meant
+    /// for it from one meant for the grid beside it. `None` in every other mode.
+    pub(crate) staging_rect: Option<egui::Rect>,
+    /// Whether the staging viewport's close control was clicked this frame.
+    /// The caller turns this into `Command::ClearStaging`.
+    pub(crate) clear_staging: bool,
 }
 
 /// Draws the grid, reporting what it drew.
@@ -401,10 +483,16 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
         ..Drawn::default()
     };
     drawn.mode = tabs(ui, grid.mode);
-    // Said out loud, because a drag that quietly does nothing reads as a broken drag.
-    if grid.mode == GridMode::Reorganize && grid.filter.is_narrowed() {
+    // Said out loud, because a drag — or a drop — that quietly does nothing reads as
+    // broken.
+    if matches!(grid.mode, GridMode::Reorganize | GridMode::Merge) && grid.filter.is_narrowed() {
+        let message = if grid.mode == GridMode::Merge {
+            "clear the search to insert pages here"
+        } else {
+            "clear the search to drag pages"
+        };
         ui.label(
-            egui::RichText::new("clear the search to drag pages")
+            egui::RichText::new(message)
                 .small()
                 .color(ui.visuals().warn_fg_color),
         )
@@ -415,10 +503,26 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     }
     ui.separator();
 
+    match grid.mode {
+        GridMode::Navigate | GridMode::Reorganize => {
+            draw_single_grid(ui, grid, &mut drawn, "porpoise-grid-main");
+        }
+        GridMode::Merge => draw_merge(ui, grid, &mut drawn),
+    }
+
+    drawn
+}
+
+/// The single-grid body shared by [`GridMode::Navigate`], [`GridMode::Reorganize`],
+/// and the left-hand pane of [`GridMode::Merge`] — the main document's pages, laid
+/// out and scrolled the same way whatever a click or a drop on them means. `salt`
+/// tells this grid's marquee apart from the staging viewport's — see
+/// [`marquee_origin`].
+fn draw_single_grid(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn, salt: &str) {
     let pages = grid.order.len();
     if pages == 0 {
         ui.label("no pages");
-        return drawn;
+        return;
     }
 
     // Slots, not positions: with a query up the grid draws a subset, and the two stop
@@ -426,7 +530,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     let slots = grid.filter.shown(pages);
     if slots == 0 {
         ui.label(format!("no pages match “{}”", grid.query));
-        return drawn;
+        return;
     }
 
     let widest = shown_geometry(grid.order, grid.documents)
@@ -447,6 +551,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     // 400-page grid from rasterizing 400 thumbnails — and what makes `showing` a
     // viewport-sized list rather than a document-sized one.
     egui::ScrollArea::vertical()
+        .id_salt(salt)
         .auto_shrink([false; 2])
         // Drag-to-scroll would be a third meaning for a drag on empty space, and it is
         // the marquee's. Off explicitly rather than relying on the default, which only
@@ -475,6 +580,9 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
                         if let Some(dropped) = outcome.dropped {
                             drawn.moved = Some((dropped, position));
                         }
+                        if let Some((document, pages)) = outcome.inserted {
+                            drawn.inserted = Some((document, pages, position));
+                        }
                         if outcome.clicked {
                             drawn.navigated = Some(position);
                         }
@@ -491,7 +599,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
             // After the cells, because it needs their rectangles for both jobs: telling a
             // marquee from a page drag, and working out what the box covers.
             if grid.mode == GridMode::Reorganize
-                && let Some(box_) = marquee(ui, viewport, &cells)
+                && let Some(box_) = marquee(ui, salt, viewport, &cells)
             {
                 let covered = covered_by(&box_.rect, &cells);
                 paint_marquee(ui, &box_.rect, &covered, &cells);
@@ -505,8 +613,306 @@ pub(crate) fn draw(ui: &mut egui::Ui, grid: &mut Grid<'_>) -> Drawn {
     if grid.mode == GridMode::Reorganize {
         paint_drag_ghost(ui.ctx());
     }
+}
+
+/// The merge tab's body: the open document on the left, the one staged for merging
+/// on the right — `docs/goal-5-plan.md` §10. The tab row and search box above are
+/// shared with the other modes; this is only what sits below the separator.
+fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
+    // `columns` fixes both panes' rects up front, before either has drawn anything
+    // into them, so the strip between them is known before there is any content to
+    // measure. Painted after the closure rather than in the middle of it: nothing
+    // either pane draws should be able to land on top of the line marking where one
+    // ends and the other begins.
+    let mut gap = None;
+    ui.columns(2, |columns| {
+        // A slice pattern rather than `columns[0]`/`columns[1]`: `Ui::columns(2, ..)`
+        // always yields exactly two, but this is how that guarantee is expressed
+        // without indexing that could, in principle, panic.
+        let [left, right] = columns else {
+            return;
+        };
+        gap = Some(egui::Rect::from_x_y_ranges(
+            egui::Rangef::new(left.max_rect().right(), right.max_rect().left()),
+            left.max_rect().y_range(),
+        ));
+        draw_single_grid(left, grid, drawn, "porpoise-grid-main");
+
+        // The response's rect, not `right.min_rect()` taken beforehand: a `vertical`
+        // layout only knows its own extent once everything inside it has been laid
+        // out, and this is what `Viewer::drop_zone` needs to tell a drop meant for
+        // this pane from one meant for the grid beside it.
+        let response = right.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Merge from").strong());
+                // Only offered once something is staged — closing an empty pane
+                // would have nothing to close.
+                if grid.staged.is_some()
+                    && let Some(()) = small_button(
+                        ui,
+                        Action {
+                            text: Glyph::ClearSearch.text(),
+                            hover: "Stop merging from this document",
+                            produces: Some(()),
+                        },
+                    )
+                {
+                    drawn.clear_staging = true;
+                }
+            });
+            if let Some(staged) = &grid.staged {
+                let outcome = draw_staged_grid(
+                    ui,
+                    staged,
+                    grid.cache,
+                    &mut grid.queue,
+                    grid.pixels_per_point,
+                );
+                if let Some(pick) = outcome.picked {
+                    drawn.staged_picked = Some(pick);
+                }
+                if let Some(covered) = outcome.marquee {
+                    drawn.staged_marquee = Some(covered);
+                }
+                drawn.showing.extend(outcome.showing);
+            } else {
+                ui.label("Open a second PDF to merge pages from it.");
+            }
+        });
+        drawn.staging_rect = Some(response.response.rect);
+    });
+
+    // Otherwise the gap `columns` leaves is just blank space — indistinguishable
+    // from a layout accident. The same stroke `ui.separator()` already draws
+    // elsewhere in this tab, so the two documents read as separated on purpose.
+    if let Some(gap) = gap {
+        ui.painter().vline(
+            gap.center().x,
+            gap.y_range(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+
+    // Once, after both panes: a drag out of the staging viewport is a ghost floating
+    // over the whole tab, not just the pane it started in.
+    paint_drag_ghost(ui.ctx());
+}
+
+/// What the staging viewport did this frame. The equivalent of [`Drawn`], scoped to
+/// the pane where the pages have no `PageOrder` position yet.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StagedDrawn {
+    /// A click on a thumbnail, and what it was asking for. See [`Drawn::picked`].
+    picked: Option<(usize, Pick)>,
+    /// Positions a finished marquee covered, replacing the selection. See
+    /// [`Drawn::marquee`].
+    marquee: Option<Vec<usize>>,
+    /// Sources the staging viewport has on screen, for cache retention — see
+    /// [`Drawn::showing`].
+    showing: Vec<Source>,
+}
+
+/// Draws the staging viewport: every page of `staged` the shared search box has not
+/// filtered out, pickable and draggable out, never a drop target and never
+/// reordered itself — see `docs/goal-5-plan.md` §10.1, §10.4 and M30.
+///
+/// `cache` and `queue` are the same ones the main viewport uses, not a second
+/// pipeline — see the module docs' "reuses the render pipeline".
+fn draw_staged_grid(
+    ui: &mut egui::Ui,
+    staged: &StagedInfo<'_>,
+    cache: &mut PageCache<egui::TextureHandle>,
+    queue: &mut RenderQueue<'_>,
+    pixels_per_point: f32,
+) -> StagedDrawn {
+    let mut drawn = StagedDrawn::default();
+    let pages = staged.geometries.len();
+    if pages == 0 {
+        ui.label("no pages");
+        return drawn;
+    }
+
+    // Slots, not positions — see `PageFilter::position_at`, and `draw_single_grid`
+    // for the same distinction drawn against the main document.
+    let slots = staged.filter.shown(pages);
+    if slots == 0 {
+        ui.label("no pages match the search");
+        return drawn;
+    }
+
+    // Every one of the staged document's own pages, in its own order — position `n`
+    // here is page `n` of it, since none of them are in a `PageOrder` yet. Built once
+    // rather than per cell, since `Selection` needs the whole list for every lookup.
+    // Unfiltered, deliberately: `Selection::positions` walks every entry, and a
+    // search must not make an *already picked* page outside it disappear from the
+    // set — only from what is drawn.
+    let shown: Vec<Source> = (0..pages)
+        .map(|page| Source {
+            document: staged.document,
+            page,
+        })
+        .collect();
+
+    // Sized from every page, not just the shown ones, so filtering does not make the
+    // grid's rows jump around — the same choice `draw_single_grid` makes.
+    let widest = staged
+        .geometries
+        .iter()
+        .map(|page| f64::from(page.width_pt))
+        .fold(0.0_f64, f64::max);
+    let bucket = bucket_for(widest, pixels_per_point);
+    let gap = ui.spacing().item_spacing;
+    let columns = columns_for(ui.available_width(), gap.x);
+    let rows = rows_for(slots, columns);
+    let box_height = box_height(
+        staged
+            .geometries
+            .iter()
+            .map(|page| page.height_pt / page.width_pt),
+    );
+    let cell_height = row_height(box_height, gap.y);
+
+    egui::ScrollArea::vertical()
+        .id_salt("porpoise-grid-staging")
+        .auto_shrink([false; 2])
+        .scroll_source(ScrollSource {
+            drag: DragScroll::Never,
+            ..ScrollSource::default()
+        })
+        .show_rows(ui, cell_height, rows, |ui, row_range| {
+            let viewport = ui.clip_rect();
+            let mut cells: Vec<(usize, egui::Rect)> = Vec::new();
+
+            for row in row_range {
+                ui.horizontal(|ui| {
+                    for column in 0..columns {
+                        let slot = row * columns + column;
+                        // The crossing from slot to page: everything reported back
+                        // from here down is a page, so a drag out of a filtered
+                        // staging viewport carries the page that was clicked rather
+                        // than the slot it sat in.
+                        let Some(page) = staged.filter.position_at(slot, pages) else {
+                            break;
+                        };
+                        let outcome = staged_cell(
+                            ui,
+                            staged,
+                            &shown,
+                            page,
+                            bucket,
+                            box_height,
+                            cache,
+                            queue,
+                            pixels_per_point,
+                        );
+                        if let Some(pick) = outcome.picked {
+                            drawn.picked = Some((page, pick));
+                        }
+                        cells.push((page, outcome.rect));
+                        drawn.showing.push(Source {
+                            document: staged.document,
+                            page,
+                        });
+                    }
+                });
+            }
+
+            if let Some(box_) = marquee(ui, "porpoise-grid-staging", viewport, &cells) {
+                let covered = covered_by(&box_.rect, &cells);
+                paint_marquee(ui, &box_.rect, &covered, &cells);
+                if box_.finished {
+                    drawn.marquee = Some(covered);
+                }
+            }
+        });
 
     drawn
+}
+
+/// One thumbnail in the staging viewport: pickable, and draggable out as an
+/// [`Inserted`] payload. Never a drop target and never the page the main view is
+/// showing, so it needs none of `cell`'s per-mode branching.
+#[expect(clippy::too_many_arguments, reason = "mirrors cell's own parameter list, split across two structs it cannot borrow at once — see draw_merge")]
+fn staged_cell(
+    ui: &mut egui::Ui,
+    staged: &StagedInfo<'_>,
+    shown: &[Source],
+    page: usize,
+    bucket: ZoomBucket,
+    box_height: f32,
+    cache: &mut PageCache<egui::TextureHandle>,
+    queue: &mut RenderQueue<'_>,
+    pixels_per_point: f32,
+) -> CellOutcome {
+    let Some(&geometry) = staged.geometries.get(page) else {
+        return CellOutcome::default();
+    };
+    let size = egui::vec2(THUMBNAIL_WIDTH, box_height);
+    let page_size = if geometry.width_pt > 0.0 && geometry.height_pt > 0.0 {
+        let scale = (THUMBNAIL_WIDTH / geometry.width_pt).min(box_height / geometry.height_pt);
+        egui::vec2(geometry.width_pt * scale, geometry.height_pt * scale)
+    } else {
+        egui::vec2(THUMBNAIL_WIDTH, box_height)
+    };
+
+    let key = CacheKey::new(staged.document, page, bucket);
+    let texture = cache.get(key).map(egui::TextureHandle::id);
+    if texture.is_none() {
+        queue.want(key, pixels_per_point);
+    }
+
+    let selected = staged.selection.contains_position(shown, page);
+    let thumbnail = Thumbnail {
+        position: page,
+        size,
+        page_size,
+        texture,
+        // The staging viewport never shows the page the main view is on — that
+        // notion only makes sense for pages already in a `PageOrder`.
+        current: false,
+        selected,
+    };
+
+    let response = egui::Frame::default()
+        .show(ui, |ui| paint(ui, &thumbnail, egui::Sense::click_and_drag()))
+        .inner
+        .on_hover_cursor(egui::CursorIcon::Grab);
+
+    // What travels when the drag starts — a document index and which of its pages,
+    // ready for `PageOrder::insert_pages`. Same reasoning `cell`'s Reorganize arm
+    // gives for `Dragged`: an unpicked page dragged alone becomes the selection, so
+    // the highlight always matches what is moving.
+    let mut picked = None;
+    if response.drag_started() {
+        let group = if selected {
+            staged.selection.positions(shown)
+        } else {
+            picked = Some(Pick::Only);
+            vec![page]
+        };
+        egui::DragAndDrop::set_payload(
+            ui.ctx(),
+            Inserted {
+                document: staged.document,
+                pages: group,
+            },
+        );
+    }
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+
+    if response.clicked() {
+        let (toggle, range) =
+            ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
+        picked = Some(Pick::of(toggle, range));
+    }
+
+    CellOutcome {
+        rect: response.rect,
+        picked,
+        ..CellOutcome::default()
+    }
 }
 
 /// The search box. Returns the text when it changed this frame.
@@ -602,6 +1008,9 @@ struct CellOutcome {
     clicked: bool,
     /// What a click in reorganize mode was asking of the selection.
     picked: Option<Pick>,
+    /// A drop from the staging viewport, if one landed here this frame in
+    /// [`GridMode::Merge`]: which staged document, and which of its pages.
+    inserted: Option<(usize, Vec<usize>)>,
     /// Where the cell was drawn. Needed after the fact for the marquee, which has to
     /// tell a drag that began on a page from one that began on empty space.
     rect: egui::Rect,
@@ -618,6 +1027,7 @@ impl Default for CellOutcome {
             dropped: None,
             clicked: false,
             picked: None,
+            inserted: None,
             rect: egui::Rect::NOTHING,
         }
     }
@@ -655,7 +1065,7 @@ fn cell(
     }
 
     let selected =
-        grid.mode == GridMode::Reorganize && grid.selection.contains_position(grid.order, position);
+        grid.mode == GridMode::Reorganize && grid.selection.contains_position(grid.order.as_slice(), position);
     let thumbnail = Thumbnail {
         position,
         size,
@@ -709,7 +1119,7 @@ fn cell(
             let mut picked = None;
             if response.drag_started() {
                 let group = if selected {
-                    grid.selection.positions(grid.order)
+                    grid.selection.positions(grid.order.as_slice())
                 } else {
                     picked = Some(Pick::Only);
                     vec![position]
@@ -751,6 +1161,37 @@ fn cell(
                 dropped: dropped.map(|group| group.0.clone()),
                 clicked: false,
                 picked,
+                inserted: None,
+            }
+        }
+        GridMode::Merge => {
+            // Click still navigates, same as `GridMode::Navigate` — finding the spot
+            // to drop into is exactly as useful here as finding a page anywhere else.
+            let response = egui::Frame::default()
+                .show(ui, |ui| paint(ui, &thumbnail, egui::Sense::click()))
+                .inner;
+
+            // A drop is refused while a query is narrowing the grid, the same
+            // reasoning `GridMode::Reorganize`'s own `movable` check already gives:
+            // landing a page between two others that are not both on screen has no
+            // meaning anybody could predict.
+            let insertable = !grid.filter.is_narrowed();
+            let inserted = if insertable {
+                if response.dnd_hover_payload::<Inserted>().is_some() {
+                    paint_insertion(ui, response.rect);
+                }
+                response.dnd_release_payload::<Inserted>()
+            } else {
+                None
+            };
+
+            CellOutcome {
+                rect: response.rect,
+                clicked: response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked(),
+                inserted: inserted.map(|payload| (payload.document, payload.pages.clone())),
+                ..CellOutcome::default()
             }
         }
     }
@@ -760,9 +1201,33 @@ fn cell(
 ///
 /// A newtype rather than a bare `Vec<usize>` because the payload is looked up *by type*:
 /// anything else in the program that dragged a list of numbers would otherwise be
-/// accepted here as a page move.
+/// accepted here as a page move. See [`Inserted`] for the other shape a drag onto
+/// this grid can take.
 #[derive(Debug, Clone)]
 struct Dragged(Vec<usize>);
+
+/// Pages of a document not yet in `PageOrder`, in flight during a drag out of the
+/// merge tab's staging viewport (`docs/goal-5-plan.md` §10.5).
+///
+/// Kept distinct from [`Dragged`] rather than reusing its shape, because the two mean
+/// different things to whatever reads them back: `Dragged` carries *positions* within
+/// an order that already contains them, ready for `PageOrder::move_pages`. This
+/// carries pages that have no position at all yet — `document` plus which of its
+/// pages, ready for `PageOrder::insert_pages` instead — one document per drag, since a
+/// selection lives in one staging viewport. `DragAndDrop` looks payloads up by type,
+/// so a cell's hover and drop logic can tell the two apart without either one having
+/// to guess from shape alone.
+///
+/// Constructed by [`staged_cell`] when a drag starts on a staging-viewport
+/// thumbnail, and read back by [`cell`]'s `GridMode::Merge` arm.
+#[derive(Debug, Clone)]
+pub(crate) struct Inserted {
+    /// Which staged document the pages came from.
+    pub(crate) document: usize,
+    /// The pages themselves, in the order they were carried — the order
+    /// `insert_pages` should place them in.
+    pub(crate) pages: Vec<usize>,
+}
 
 /// Marks the slot a drop would land in, down the leading edge of a cell.
 ///
@@ -783,15 +1248,21 @@ fn paint_insertion(ui: &egui::Ui, cell: egui::Rect) {
 /// same mechanism that made a nested click never fire, so it is not coming back. A card
 /// saying how many pages are in the air does the job it was doing, and says something the
 /// old ghost could not: that a *group* is moving, not the one page under the cursor.
+///
+/// Checks for either payload [`cell`] can put in flight — a within-order [`Dragged`]
+/// or a cross-viewport [`Inserted`] — since the ghost reads the same regardless of
+/// which grid a drag came from, and a drag is never both at once.
 fn paint_drag_ghost(ctx: &egui::Context) {
-    let Some(carried) = egui::DragAndDrop::payload::<Dragged>(ctx) else {
+    let count = egui::DragAndDrop::payload::<Dragged>(ctx)
+        .map(|dragged| dragged.0.len())
+        .or_else(|| egui::DragAndDrop::payload::<Inserted>(ctx).map(|inserted| inserted.pages.len()));
+    let Some(count) = count else {
         return;
     };
     let Some(pointer) = ctx.pointer_latest_pos() else {
         return;
     };
 
-    let count = carried.0.len();
     let text = if count == 1 {
         "1 page".to_owned()
     } else {
@@ -836,8 +1307,13 @@ struct Marquee {
 /// one frame that has to *commit* the selection is exactly the frame that can no longer
 /// say where the drag began. Reading it fresh every frame drew the box perfectly all the
 /// way through the drag and then selected nothing at all when you let go.
-fn marquee_origin() -> egui::Id {
-    egui::Id::new("porpoise-marquee-origin")
+///
+/// `salt` tells one grid's marquee from another's. [`GridMode::Merge`] can draw two of
+/// these in one frame — the main viewport's and the staging viewport's — and without a
+/// salt they would share this one slot of `Context` memory, so a box started in one
+/// could be reported as finishing in the other.
+fn marquee_origin(salt: &str) -> egui::Id {
+    egui::Id::new("porpoise-marquee-origin").with(salt)
 }
 
 /// The selection box being dragged, if one is.
@@ -846,8 +1322,13 @@ fn marquee_origin() -> egui::Id {
 /// claimed it: raw pointer state, and then the cell rectangles to rule out a press that
 /// landed on a page. Doing it this way means the cells and the marquee never compete for
 /// the same press, so neither has to win a hit test.
-fn marquee(ui: &egui::Ui, viewport: egui::Rect, cells: &[(usize, egui::Rect)]) -> Option<Marquee> {
-    let id = marquee_origin();
+fn marquee(
+    ui: &egui::Ui,
+    salt: &str,
+    viewport: egui::Rect,
+    cells: &[(usize, egui::Rect)],
+) -> Option<Marquee> {
+    let id = marquee_origin(salt);
     let forget = || ui.ctx().data_mut(|data| data.remove_temp::<egui::Pos2>(id));
 
     // A page is in flight, so this drag is a move and not a selection.
@@ -1071,6 +1552,25 @@ fn paint(ui: &mut egui::Ui, thumbnail: &Thumbnail, sense: egui::Sense) -> egui::
 mod tests {
     use super::*;
 
+    #[test]
+    fn dragged_and_inserted_payloads_are_told_apart_by_type() {
+        // The whole reason `Inserted` is its own type rather than reusing `Dragged`'s
+        // shape: `DragAndDrop` looks a payload up by type, so the merge tab's staging
+        // viewport and the main grid's own reordering must never be confused for one
+        // another on the same drag. No window needed — `DragAndDrop`'s payload is
+        // plain `Context` state.
+        let ctx = egui::Context::default();
+        egui::DragAndDrop::set_payload(&ctx, Inserted { document: 1, pages: vec![0, 2] });
+
+        let inserted = egui::DragAndDrop::payload::<Inserted>(&ctx);
+        assert_eq!(inserted.as_deref().map(|i| i.document), Some(1));
+        assert_eq!(inserted.as_deref().map(|i| i.pages.clone()), Some(vec![0, 2]));
+        assert!(
+            egui::DragAndDrop::payload::<Dragged>(&ctx).is_none(),
+            "a Dragged payload was found where only an Inserted one was set"
+        );
+    }
+
     /// egui's default spacing, which is what the grid is laid out with.
     const GAP: f32 = 8.0;
 
@@ -1135,6 +1635,59 @@ mod tests {
                 "a {field} pt field plus a {clear_button} pt button overflows {PANEL_WIDTH}"
             );
         }
+    }
+
+    #[test]
+    fn the_merge_panels_minimum_width_fits_one_column_per_viewport() {
+        // The relationship between `PANEL_MERGE_MIN_WIDTH` and `PANEL_MIN_WIDTH` is
+        // true by construction — see the constants themselves — so what is worth
+        // exercising is `columns_for`'s real arithmetic: half the merge minimum,
+        // minus a scroll bar, still lays out one column.
+        let half = PANEL_MERGE_MIN_WIDTH / 2.0 - SCROLL_BAR_ALLOWANCE;
+        assert_eq!(
+            columns_for(half, ASSUMED_GAP),
+            1,
+            "half the merge panel's minimum width does not fit even one column"
+        );
+    }
+
+    #[test]
+    fn different_salts_give_the_marquee_different_memory_slots() {
+        // The whole reason `marquee` takes a salt: `GridMode::Merge` draws two grids
+        // in one frame, and `Context` memory is keyed by `Id` alone, so without this
+        // a box started in the main viewport could be reported as finishing in the
+        // staging one, or vice versa.
+        assert_ne!(marquee_origin("porpoise-grid-main"), marquee_origin("porpoise-grid-staging"));
+    }
+
+    #[test]
+    fn a_staged_selection_resolves_positions_the_same_way_the_staging_grid_builds_them() {
+        // `draw_staged_grid` builds `shown` as `(0..pages).map(|page| Source {
+        // document, page })` fresh each frame rather than storing it — this pins
+        // that a `Selection` built against that exact shape behaves the way
+        // `StagedInfo::selection` needs it to, independent of any window.
+        let geometries = [
+            PageGeometry { width_pt: 200.0, height_pt: 100.0 },
+            PageGeometry { width_pt: 200.0, height_pt: 100.0 },
+            PageGeometry { width_pt: 200.0, height_pt: 100.0 },
+        ];
+        let shown: Vec<Source> = (0..geometries.len())
+            .map(|page| Source { document: 1, page })
+            .collect();
+        let mut selection = Selection::default();
+        selection.pick(&shown, 0, Pick::Only);
+        selection.pick(&shown, 2, Pick::Toggle);
+
+        let staged = StagedInfo {
+            document: 1,
+            geometries: &geometries,
+            selection: &selection,
+            filter: &PageFilter::All,
+        };
+        assert!(staged.selection.contains_position(&shown, 0));
+        assert!(!staged.selection.contains_position(&shown, 1));
+        assert!(staged.selection.contains_position(&shown, 2));
+        assert_eq!(staged.selection.positions(&shown), vec![0, 2]);
     }
 
     #[test]
@@ -1361,10 +1914,10 @@ mod tests {
         // with no tab — reachable over the wire and not by hand.
         for mode in GridMode::EVERY {
             match mode {
-                GridMode::Navigate | GridMode::Reorganize => {}
+                GridMode::Navigate | GridMode::Reorganize | GridMode::Merge => {}
             }
         }
-        assert_eq!(GridMode::EVERY.len(), 2);
+        assert_eq!(GridMode::EVERY.len(), 3);
     }
 
     #[test]

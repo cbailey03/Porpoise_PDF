@@ -33,6 +33,9 @@ pub(crate) enum Purpose {
     Open,
     /// Becomes `Command::InsertFile`, adding to the document already open.
     Insert,
+    /// Becomes `Command::StageDocument`, for the merge tab's staging viewport.
+    /// See `docs/goal-5-plan.md` §10.6.
+    Stage,
 }
 
 /// A pending request for a path.
@@ -80,6 +83,7 @@ impl FilePicker {
         let title = match purpose {
             Purpose::Open => "Open a PDF",
             Purpose::Insert => "Add pages from a PDF",
+            Purpose::Stage => "Merge pages from a PDF",
         };
         // Detached on purpose. If the viewer exits while a dialog is up, the thread
         // finds a closed channel and drops the answer, which is the correct outcome —

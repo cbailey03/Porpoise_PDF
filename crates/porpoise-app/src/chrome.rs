@@ -152,6 +152,22 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         {
             open_picker = Some(Purpose::Insert);
         }
+
+        // Reuses the same dialog too. The result lands in the merge tab's staging
+        // viewport rather than at the end of the document — see
+        // `docs/goal-5-plan.md` §10.6.
+        if button(
+            ui,
+            Action {
+                text: "Stage a file…",
+                hover: "Open a second PDF in the Merge tab, to drag its pages into place",
+                produces: (state.document_open && !state.picker_open).then_some(()),
+            },
+        )
+        .is_some()
+        {
+            open_picker = Some(Purpose::Stage);
+        }
         ui.separator();
 
         commands.extend(toggle(
@@ -415,7 +431,9 @@ pub(crate) fn question(ctx: &egui::Context, what: &str) -> Option<Answer> {
 /// it — so this function has no opinion about what the sentence says, which is the point.
 pub(crate) fn drop_hint(ctx: &egui::Context, action: &DropAction, unsaved_changes: bool) {
     let colour = match action {
-        DropAction::Open { .. } | DropAction::Insert { .. } => egui::Color32::WHITE,
+        DropAction::Open { .. } | DropAction::Insert { .. } | DropAction::Stage { .. } => {
+            egui::Color32::WHITE
+        }
         DropAction::Refuse { .. } => egui::Color32::from_rgb(240, 150, 150),
     };
 

@@ -83,13 +83,14 @@ use crate::input::{
 };
 use crate::label::file_label;
 use crate::picker::{FilePicker, Purpose};
-use crate::protocol::{Event, Reply, RequestBody, Snapshot};
+use crate::protocol::{Event, Reply, RequestBody, Snapshot, StagedSnapshot};
 use crate::queue::RenderQueue;
 use crate::retain;
 use crate::saver::Saver;
 use crate::search::PageFilter;
 use crate::selection::Selection;
-use crate::thumbnails::{self, Grid, GridMode, StagedInfo};
+use crate::stage::StageId;
+use crate::thumbnails::{self, Grid, GridMode, StagedInfo, StagedTab};
 use crate::tiles::{FULL_UV, to_color_image};
 
 /// Byte budget for cached page textures.
@@ -140,6 +141,13 @@ struct OpenFile {
     document: Arc<Document>,
 }
 
+/// One currently staged document: its stable [`StageId`] and which of
+/// [`OpenDocument::files`] it points to.
+struct Staged {
+    id: StageId,
+    document: usize,
+}
+
 /// Everything that belongs to one open document.
 ///
 /// Grouped so that opening another is a single replacement rather than eight
@@ -173,15 +181,19 @@ struct OpenDocument {
     failures: HashMap<CacheKey, Failure>,
     /// The rung work was last submitted for, to notice when zoom moves.
     submitted_bucket: ZoomBucket,
-    /// Which of [`Self::files`] the merge tab's staging viewport is currently
-    /// showing, if any — `docs/goal-5-plan.md` §10.7.
+    /// Every document currently staged for the merge tab, in the order each was
+    /// staged — `docs/goal-5-plan.md` §10.7, §10.12.
     ///
-    /// A separate pointer rather than a third `OpenFile` field: staging never
-    /// removes an entry once added (the same reason `add_file` never reuses one —
-    /// see its own doc comment), so "which one is the *current* staging slot" needs
-    /// its own place to live. Replacing the staged document points this at a new
-    /// index; the old one is simply never referenced again.
-    staging: Option<usize>,
+    /// A `Vec` rather than a single pointer: staging never removes a `files`
+    /// entry once added (the same reason `add_file` never reuses one — see its
+    /// own doc comment), and more than one document can now be staged at once.
+    /// Each entry's [`StageId`] is permanent — clearing one never reassigns its
+    /// number to a different document.
+    staging: Vec<Staged>,
+    /// The [`StageId`] the next staged document will be given. Only ever
+    /// increases — see that type's own docs for why an id, once handed out, is
+    /// never handed out again.
+    next_stage_id: StageId,
 }
 
 /// Refusal for a command that needs a document when none is open.
@@ -269,7 +281,8 @@ impl OpenDocument {
             in_flight: Vec::new(),
             failures: HashMap::new(),
             submitted_bucket: bucket,
-            staging: None,
+            staging: Vec::new(),
+            next_stage_id: StageId::FIRST,
         }
     }
 
@@ -319,35 +332,74 @@ impl OpenDocument {
         geometry_of(&self.files, source)
     }
 
-    /// The path of the currently staged document, if any — what a
-    /// `Command::SetStagedSelection` naming a target has to match.
-    fn staged_path(&self) -> Option<&Path> {
-        self.files
-            .get(self.staging?)
-            .map(|file| file.path.as_path())
+    /// The `files` index `stage` points to, if it is currently staged.
+    fn staged_document(&self, stage: StageId) -> Option<usize> {
+        self.staging
+            .iter()
+            .find(|staged| staged.id == stage)
+            .map(|staged| staged.document)
     }
 
-    /// How many pages the currently staged document has, or 0 with nothing staged —
-    /// what [`Viewer::staged_filter`] parses a query against.
-    fn staged_page_count(&self) -> usize {
-        self.staging
+    /// How many pages `stage`'s document has, or 0 if it is not currently staged
+    /// — what [`Viewer::staged_filter`] parses a query against.
+    fn staged_page_count(&self, stage: StageId) -> usize {
+        self.staged_document(stage)
             .and_then(|document| self.files.get(document))
             .map_or(0, |file| file.document.page_count())
     }
 
-    /// The `Source`s the merge tab's staging viewport is currently showing, if a
-    /// document is staged: `(0..page_count).map(|page| Source { document, page })`
-    /// — the same list `crate::thumbnails::draw_staged_grid` builds for itself.
+    /// The `Source`s `stage`'s pane is currently showing, if it is staged:
+    /// `(0..page_count).map(|page| Source { document, page })` — the same list
+    /// `crate::thumbnails::draw_staged_grid` builds for itself.
     ///
     /// Recomputed rather than cached: it is cheap, and a cached copy would need its
     /// own invalidation to remember whenever the staged document changes.
-    fn staged_sources(&self) -> Option<Vec<Source>> {
-        let document = self.staging?;
+    fn staged_sources(&self, stage: StageId) -> Option<Vec<Source>> {
+        let document = self.staged_document(stage)?;
         Some(
-            (0..self.staged_page_count())
+            (0..self.staged_page_count(stage))
                 .map(|page| Source { document, page })
                 .collect(),
         )
+    }
+
+    /// Registers `document` as a newly staged file, returning its fresh
+    /// [`StageId`]. Never fails and never replaces an existing entry — every
+    /// call adds one, the same way `add_file` always adds a fresh `files`
+    /// entry rather than reusing one.
+    fn stage(&mut self, document: usize) -> StageId {
+        let id = self.next_stage_id;
+        self.next_stage_id = id.next();
+        self.staging.push(Staged { id, document });
+        id
+    }
+
+    /// Forgets `stage`, if it is currently staged. Returns whether anything
+    /// changed — never removes anything from [`Self::files`] itself, only the
+    /// pointer to it, the same as the single-slot version this generalizes.
+    fn unstage(&mut self, stage: StageId) -> bool {
+        let before = self.staging.len();
+        self.staging.retain(|staged| staged.id != stage);
+        self.staging.len() != before
+    }
+
+    /// Every currently staged document's id and path, in the order each was
+    /// staged — what the merge tab's tab strip draws, and what a snapshot lists.
+    fn staged_summaries(&self) -> impl Iterator<Item = (StageId, &Path)> {
+        self.staging
+            .iter()
+            .filter_map(|staged| Some((staged.id, self.files.get(staged.document)?.path.as_path())))
+    }
+
+    /// Which [`StageId`] a `files` index belongs to, if it is currently staged —
+    /// translates the [`crate::thumbnails::Inserted`] drag payload's raw document
+    /// index back to a stable id, since that payload stays decoupled from the
+    /// stage concept the same way [`StagedInfo::document`] already is.
+    fn stage_for_document(&self, document: usize) -> Option<StageId> {
+        self.staging
+            .iter()
+            .find(|staged| staged.document == document)
+            .map(|staged| staged.id)
     }
 
     /// Rebuilds the column after an edit.
@@ -499,16 +551,26 @@ struct Viewer {
     /// — it holds source pages and follows them on its own.
     selection: Selection,
 
-    /// Pages picked out in the merge tab's staging viewport. A separate instance
-    /// from [`Self::selection`], since picking a page there says nothing about the
-    /// main document — see `docs/goal-5-plan.md` §10.4.
+    /// Pages picked out in each staged document's own pane, keyed by
+    /// [`StageId`]. Separate from [`Self::selection`], since picking a page
+    /// there says nothing about the main document — see `docs/goal-5-plan.md`
+    /// §10.4. One entry per stage rather than one shared instance, so switching
+    /// which pane is active does not lose what was picked in another — an entry
+    /// simply does not exist yet for a stage nothing has picked in.
     ///
-    /// Purely a drag convenience, unlike `selection`: nothing else acts on "whatever
-    /// is currently staged-and-selected" the way `DeletePage` acts on `selection`,
-    /// since `InsertPages` already takes the exact pages it wants. So this is local
-    /// UI state, updated directly rather than through a command of its own — there
-    /// is nothing an agent could not already do by naming pages explicitly.
-    staging_selection: Selection,
+    /// Updated directly by a click or marquee in the pane, the same way
+    /// `Self::selection` is — but also settable explicitly over the control
+    /// channel via `Command::SetStagedSelection`, unlike `selection`'s
+    /// `SetSelection`-only path: nothing implicitly consults "whatever is
+    /// picked out" the way `DeletePage` consults `selection`, so this stayed
+    /// local state at first, but a `path`-then-`stage` key that survives more
+    /// than one simultaneously staged document made it worth exposing to an
+    /// agent too. See `docs/goal-5-plan.md` §10.11, §10.12.
+    staging_selections: HashMap<StageId, Selection>,
+    /// Which staged document's pane the merge tab's single staging viewport
+    /// currently shows. `None` only when nothing is staged at all — see
+    /// `docs/goal-5-plan.md` §10.12.
+    active_stage: Option<StageId>,
 
     /// What is typed in the grid's search box. Empty when nothing is.
     ///
@@ -606,7 +668,8 @@ impl Viewer {
             thumbnails: false,
             grid_mode: GridMode::default(),
             selection: Selection::default(),
-            staging_selection: Selection::default(),
+            staging_selections: HashMap::new(),
+            active_stage: None,
             page_filter: String::new(),
             guard: None,
             quitting: false,
@@ -684,16 +747,11 @@ impl Viewer {
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
             grid_mode: self.grid_mode,
-            staged: self
-                .open
-                .as_ref()
-                .and_then(OpenDocument::staged_path)
-                .map(|path| path.display().to_string()),
+            staged: self.staged_snapshots(),
+            active_stage: self.active_stage,
             page_filter: self.page_filter.clone(),
             filtered_pages: self.filtered_pages(),
-            staged_filtered_pages: self.staged_filtered_pages(),
             selection: self.selected_pages(),
-            staged_selection: self.staged_selected_pages(),
             unsaved_changes: self.unsaved_changes(),
             awaiting_answer: match &self.guard {
                 Some(Guard::Asking(intent)) => Some(intent.describe()),
@@ -929,8 +987,10 @@ impl Viewer {
             Command::Close => self.close_document(),
             Command::InsertFile { path } => self.insert_file(path),
             Command::StageDocument { path } => self.stage_document(path),
-            Command::ClearStaging => self.clear_staging(),
-            Command::InsertPages { pages, at } => self.insert_pages_from_staging(&pages, at),
+            Command::ClearStaging { stage } => self.clear_staging(stage),
+            Command::InsertPages { stage, pages, at } => {
+                self.insert_pages_from_staging(stage, &pages, at)
+            }
             Command::MovePage { from, to } => {
                 self.edit(|order| order.move_page(from.index(), to.index()))
             }
@@ -968,28 +1028,42 @@ impl Viewer {
                 self.selection = wanted;
                 DispatchResult::View(Outcome::Changed)
             }
-            Command::SetStagedSelection { path, pages } => {
+            Command::SetStagedSelection { stage, pages } => {
                 let Some(open) = &self.open else {
                     return DispatchResult::Failed(NOTHING_OPEN.to_owned());
                 };
-                let Some((staged_path, shown)) = open.staged_path().zip(open.staged_sources())
-                else {
-                    return DispatchResult::Failed("nothing is staged".to_owned());
-                };
-                if staged_path != path.as_path() {
+                let Some(shown) = open.staged_sources(stage) else {
                     return DispatchResult::Failed(format!(
-                        "{} is staged, not {}",
-                        staged_path.display(),
-                        path.display()
+                        "stage {stage} is not currently staged"
                     ));
-                }
+                };
                 let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
-                let mut wanted = self.staging_selection.clone();
+                let current = self
+                    .staging_selections
+                    .get(&stage)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut wanted = current.clone();
                 wanted.set_positions(&shown, &positions);
-                if wanted == self.staging_selection {
+                if wanted == current {
                     return DispatchResult::Unchanged;
                 }
-                self.staging_selection = wanted;
+                self.staging_selections.insert(stage, wanted);
+                DispatchResult::View(Outcome::Changed)
+            }
+            Command::SetActiveStage { stage } => {
+                let Some(open) = &self.open else {
+                    return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+                };
+                if open.staged_document(stage).is_none() {
+                    return DispatchResult::Failed(format!(
+                        "stage {stage} is not currently staged"
+                    ));
+                }
+                if self.active_stage == Some(stage) {
+                    return DispatchResult::Unchanged;
+                }
+                self.active_stage = Some(stage);
                 DispatchResult::View(Outcome::Changed)
             }
             Command::Undo => self.edit(PageOrder::undo),
@@ -1023,11 +1097,14 @@ impl Viewer {
                 if mode != GridMode::Reorganize {
                     self.selection.clear();
                 }
-                // Same reasoning, for the staging viewport's own selection: it is a
-                // trap once nobody can see it, and Merge is the only mode that draws
-                // it.
+                // Same reasoning, for every staged document's own selection: leaving
+                // Merge mode entirely leaves the whole staging concept behind, and a
+                // selection nobody can see in any pane is a trap the same way one in
+                // the closed page grid is. Switching *within* Merge — which tab is
+                // active — deliberately does not reach this: each stage's selection
+                // survives that, since you have not left the pane it is in.
                 if mode != GridMode::Merge {
-                    self.staging_selection.clear();
+                    self.staging_selections.clear();
                 }
                 DispatchResult::View(Outcome::Changed)
             }
@@ -1116,13 +1193,14 @@ impl Viewer {
         self.edit(|order| order.append(document_index, page_count))
     }
 
-    /// Opens a second document for the merge tab's staging viewport.
+    /// Opens another document for the merge tab, adding a new pane rather than
+    /// replacing any already staged.
     ///
     /// Not an edit: nothing about the open document changes, so unlike
     /// [`Self::insert_file`] this does not go through [`Self::edit`] — no relayout,
-    /// no `PagesReordered`. Replaces whatever was staged before, if anything: the
-    /// old document's `OpenDocument::files` entry is simply never referenced again,
-    /// the same as `add_file` never reusing one. See `docs/goal-5-plan.md` §10.7.
+    /// no `PagesReordered`. The new document's `OpenDocument::files` entry, like
+    /// every one before it, is never reused or reclaimed. See
+    /// `docs/goal-5-plan.md` §10.7, §10.12.
     fn stage_document(&mut self, path: PathBuf) -> DispatchResult {
         if self.open.is_none() {
             return DispatchResult::Failed(NOTHING_OPEN.to_owned());
@@ -1144,48 +1222,59 @@ impl Viewer {
         let document_index = open.add_file(path, document);
         let staged = open.order.stage(document_index, page_count);
         debug_assert!(staged, "page_count was checked non-zero above");
-        open.staging = Some(document_index);
-        // The old staged document's own selection means nothing once its pages are
-        // no longer what the staging viewport shows.
-        self.staging_selection.clear();
+        let id = open.stage(document_index);
+        // The newly staged document is the one the single visible pane shows,
+        // the same as when there was only ever one slot to show. A fresh
+        // `StageId` has no entry in `staging_selections` yet, so there is
+        // nothing stale to clear the way there was when one pointer stood for
+        // whichever document happened to occupy it.
+        self.active_stage = Some(id);
         DispatchResult::View(Outcome::Changed)
     }
 
-    /// Closes the staging viewport, forgetting whichever document was staged.
+    /// Closes `stage`'s pane, forgetting the document it staged.
     ///
     /// Its pages already placed by [`Self::insert_pages_from_staging`] are
     /// unaffected — they are ordinary pages of the open document by that point, and
-    /// this only clears the pointer to the staging slot, never `OpenDocument::files`
-    /// itself. See `docs/goal-5-plan.md` §10.6.
-    fn clear_staging(&mut self) -> DispatchResult {
+    /// this only forgets the pointer to the staging slot, never
+    /// `OpenDocument::files` itself. See `docs/goal-5-plan.md` §10.6, §10.12.
+    fn clear_staging(&mut self, stage: StageId) -> DispatchResult {
         let Some(open) = &mut self.open else {
             return DispatchResult::Failed(NOTHING_OPEN.to_owned());
         };
-        if open.staging.take().is_none() {
+        if !open.unstage(stage) {
             return DispatchResult::Unchanged;
         }
-        self.staging_selection.clear();
+        self.staging_selections.remove(&stage);
+        if self.active_stage == Some(stage) {
+            // Falls back to whichever remaining stage was staged most
+            // recently, rather than leaving the visible pane blank while
+            // others are still open — `StageId` only ever increases, so the
+            // highest one left is the most recent.
+            self.active_stage = open.staged_summaries().map(|(id, _)| id).max();
+        }
         DispatchResult::View(Outcome::Changed)
     }
 
-    /// Inserts pages of the currently staged document into the open document.
+    /// Inserts pages of `stage`'s document into the open document.
     ///
     /// Goes through [`Self::edit`], the same path [`Self::insert_file`] and every
     /// other page edit takes — an inserted page is an ordinary one from the moment
-    /// it lands, whichever of the two commands put it there. Refused when nothing is
-    /// staged, which is a real error rather than a no-op: an agent that calls this
-    /// without staging anything first has made a mistake worth telling it about,
-    /// unlike a move to a position a page is already at.
+    /// it lands, whichever of the two commands put it there. Refused when `stage`
+    /// is not currently staged, which is a real error rather than a no-op: an
+    /// agent that calls this without staging anything first has made a mistake
+    /// worth telling it about, unlike a move to a position a page is already at.
     fn insert_pages_from_staging(
         &mut self,
+        stage: StageId,
         pages: &[PageNumber],
         at: PageNumber,
     ) -> DispatchResult {
         let Some(open) = &self.open else {
             return DispatchResult::Failed(NOTHING_OPEN.to_owned());
         };
-        let Some(document) = open.staging else {
-            return DispatchResult::Failed("nothing is staged".to_owned());
+        let Some(document) = open.staged_document(stage) else {
+            return DispatchResult::Failed(format!("stage {stage} is not currently staged"));
         };
         let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
         let at = at.index();
@@ -1383,17 +1472,18 @@ impl Viewer {
     /// typed in the one shared search box — `docs/goal-5-plan.md` M30.
     ///
     /// A second parse of the same query, not a second box: `PageFilter::parse` takes
-    /// a page count, and the staged document almost never has the same one as the
+    /// a page count, and a staged document almost never has the same one as the
     /// document being edited, so the *resolved* positions from [`Self::page_filter`]
     /// cannot simply be reused — `"1-9"` against a 3-page primary clamps to its
     /// three pages at parse time, and reusing that result would hide pages 4 through
-    /// 9 of a 10-page staged document that plainly matched.
-    fn staged_filter(&self) -> PageFilter {
+    /// 9 of a 10-page staged document that plainly matched. One parse per stage,
+    /// since each has its own page count.
+    fn staged_filter(&self, stage: StageId) -> PageFilter {
         PageFilter::parse(
             &self.page_filter,
             self.open
                 .as_ref()
-                .map_or(0, OpenDocument::staged_page_count),
+                .map_or(0, |open| open.staged_page_count(stage)),
         )
     }
 
@@ -1412,16 +1502,18 @@ impl Viewer {
         }
     }
 
-    /// The staged document's pages the same query resolves to, as display page
-    /// numbers — `None` with nothing staged, as well as with nothing typed. See
-    /// [`Self::filtered_pages`] for the main document's equivalent, and
+    /// `stage`'s pages the same query resolves to, as display page numbers —
+    /// `None` if `stage` is not currently staged, as well as with nothing typed.
+    /// See [`Self::filtered_pages`] for the main document's equivalent, and
     /// [`Self::staged_filter`] for why this is a second parse rather than a shared
     /// result.
-    fn staged_filtered_pages(&self) -> Option<Vec<PageNumber>> {
+    fn staged_filtered_pages(&self, stage: StageId) -> Option<Vec<PageNumber>> {
         let open = self.open.as_ref()?;
-        open.staging?;
-        let page_count = open.staged_page_count();
-        match self.staged_filter() {
+        let page_count = open.staged_page_count(stage);
+        if page_count == 0 {
+            return None;
+        }
+        match self.staged_filter(stage) {
             PageFilter::All => None,
             PageFilter::Only(positions) => Some(
                 positions
@@ -1448,19 +1540,42 @@ impl Viewer {
             .collect()
     }
 
-    /// The staged document's pages currently picked out, counting from 1, ascending
-    /// — the staging pane's equivalent of [`Self::selected_pages`].
-    fn staged_selected_pages(&self) -> Vec<PageNumber> {
+    /// `stage`'s pages currently picked out, counting from 1, ascending — the
+    /// staging pane's equivalent of [`Self::selected_pages`]. Empty if `stage`
+    /// has no selection recorded yet, or is not (or no longer) staged at all.
+    fn staged_selected_pages(&self, stage: StageId) -> Vec<PageNumber> {
         let Some(open) = &self.open else {
             return Vec::new();
         };
-        let Some(shown) = open.staged_sources() else {
+        let Some(shown) = open.staged_sources(stage) else {
             return Vec::new();
         };
-        self.staging_selection
+        let Some(selection) = self.staging_selections.get(&stage) else {
+            return Vec::new();
+        };
+        selection
             .positions(&shown)
             .into_iter()
             .map(PageNumber::from_index)
+            .collect()
+    }
+
+    /// Every currently staged document, as what an agent reads over the
+    /// control channel — one entry per [`OpenDocument::staged_summaries`],
+    /// each carrying its own page count, the shared search query resolved
+    /// against it, and its own selection.
+    fn staged_snapshots(&self) -> Vec<StagedSnapshot> {
+        let Some(open) = &self.open else {
+            return Vec::new();
+        };
+        open.staged_summaries()
+            .map(|(id, path)| StagedSnapshot {
+                id,
+                path: path.display().to_string(),
+                page_count: open.staged_page_count(id),
+                filtered_pages: self.staged_filtered_pages(id),
+                selection: self.staged_selected_pages(id),
+            })
             .collect()
     }
 
@@ -2026,9 +2141,13 @@ impl Viewer {
         // All read before `open` is borrowed mutably below.
         let mode = self.grid_mode;
         let selection = self.selection.clone();
-        let staging_selection = self.staging_selection.clone();
+        let active_stage = self.active_stage;
+        let staging_selection = active_stage
+            .and_then(|stage| self.staging_selections.get(&stage))
+            .cloned()
+            .unwrap_or_default();
         let filter = self.page_filter();
-        let staged_filter = self.staged_filter();
+        let staged_filter = active_stage.map_or(PageFilter::All, |stage| self.staged_filter(stage));
         let query = self.page_filter.clone();
         let Some(open) = &mut self.open else {
             ui.label("No document open.");
@@ -2046,10 +2165,24 @@ impl Viewer {
             .iter()
             .map(|file| Arc::clone(&file.document))
             .collect();
-        // `None` until `Command::StageDocument` has set `open.staging` — until then
-        // the merge tab's right pane shows its placeholder.
-        let staged = open.staging.and_then(|document| {
+        // Every currently staged document's id and path, for the tab strip.
+        // Cloned rather than borrowed: a borrow living through this whole
+        // function would keep `open` borrowed against the `&mut open.cache`
+        // and friends `Grid` needs below, for what is only ever a handful of
+        // small paths once a frame.
+        let staged_tabs: Vec<StagedTab> = open
+            .staged_summaries()
+            .map(|(id, path)| StagedTab {
+                id,
+                path: path.to_path_buf(),
+            })
+            .collect();
+        // `None` until something is staged and active — until then the merge
+        // tab's right pane shows its placeholder.
+        let staged = active_stage.and_then(|stage| {
+            let document = open.staged_document(stage)?;
             documents.get(document).map(|doc| StagedInfo {
+                id: stage,
                 document,
                 geometries: doc.geometry(),
                 selection: &staging_selection,
@@ -2068,6 +2201,7 @@ impl Viewer {
             filter: &filter,
             pixels_per_point,
             staged,
+            staged_tabs: &staged_tabs,
             picker_open: self.picker.is_open(),
         };
         let drawn = thumbnails::draw(ui, &mut grid);
@@ -2095,20 +2229,28 @@ impl Viewer {
             self.dispatch_selection(&ctx, &wanted);
         }
 
-        // The staging viewport's own selection, updated directly rather than through
-        // a command — see the field's own docs for why nothing needs to read it back
-        // over the control channel.
+        // The active pane's own selection, updated directly rather than through a
+        // command — the same as a click or marquee in the main grid always could,
+        // even now that `Command::SetStagedSelection` also reaches it.
         if let Some((position, pick)) = drawn.staged_picked
+            && let Some(stage) = active_stage
             && let Some(open) = &self.open
-            && let Some(shown) = open.staged_sources()
+            && let Some(shown) = open.staged_sources(stage)
         {
-            self.staging_selection.pick(&shown, position, pick);
+            self.staging_selections
+                .entry(stage)
+                .or_default()
+                .pick(&shown, position, pick);
         }
         if let Some(covered) = drawn.staged_marquee
+            && let Some(stage) = active_stage
             && let Some(open) = &self.open
-            && let Some(shown) = open.staged_sources()
+            && let Some(shown) = open.staged_sources(stage)
         {
-            self.staging_selection.set_positions(&shown, &covered);
+            self.staging_selections
+                .entry(stage)
+                .or_default()
+                .set_positions(&shown, &covered);
         }
 
         // Through the normal dispatch, so a drag is indistinguishable from an agent
@@ -2126,17 +2268,24 @@ impl Viewer {
 
         // A drop from the staging viewport, the same reasoning as `moved` above: the
         // gesture and `insert_pages` sent by hand produce the identical command.
-        if let Some((_document, pages, position)) = drawn.inserted {
+        // `Inserted` carries a raw `files` index rather than a `StageId` — it stays
+        // decoupled from the stage concept the same way `StagedInfo::document`
+        // already is — so it is translated back here, the one place a drop
+        // becomes a command.
+        if let Some((document, pages, position)) = drawn.inserted {
             let ctx = ui.ctx().clone();
             let pages: Vec<PageNumber> = pages
                 .iter()
                 .filter_map(|&page| PageNumber::new(page.saturating_add(1)))
                 .collect();
-            if let (false, Some(at)) = (
+            if let (false, Some(at), Some(stage)) = (
                 pages.is_empty(),
                 PageNumber::new(position.saturating_add(1)),
+                self.open
+                    .as_ref()
+                    .and_then(|open| open.stage_for_document(document)),
             ) {
-                self.dispatch(&ctx, Command::InsertPages { pages, at });
+                self.dispatch(&ctx, Command::InsertPages { stage, pages, at });
             }
         }
 
@@ -2159,22 +2308,28 @@ impl Viewer {
             let ctx = ui.ctx().clone();
             self.dispatch(&ctx, Command::SetPageFilter { query });
         }
-        if drawn.clear_staging {
+        // Whichever stage's own close control was clicked — the active pane's,
+        // or one of the tab strip's for a stage that was not even showing.
+        if let Some(stage) = drawn.clear_staging {
             let ctx = ui.ctx().clone();
-            self.dispatch(&ctx, Command::ClearStaging);
+            self.dispatch(&ctx, Command::ClearStaging { stage });
         }
         // Through the normal dispatch, so the button and an agent sending
         // `set_staged_selection` by hand produce the identical command.
-        if drawn.select_all_staged
+        if let Some(stage) = drawn.select_all_staged
             && let Some(open) = &self.open
-            && let Some(path) = open.staged_path()
         {
-            let path = path.to_path_buf();
-            let pages: Vec<PageNumber> = (1..=open.staged_page_count())
+            let pages: Vec<PageNumber> = (1..=open.staged_page_count(stage))
                 .filter_map(PageNumber::new)
                 .collect();
             let ctx = ui.ctx().clone();
-            self.dispatch(&ctx, Command::SetStagedSelection { path, pages });
+            self.dispatch(&ctx, Command::SetStagedSelection { stage, pages });
+        }
+        // A tab clicked that was not already active, the same reasoning `mode`
+        // above gets.
+        if let Some(stage) = drawn.stage_switched {
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, Command::SetActiveStage { stage });
         }
         // Not a command, the same reason **Open…** and **Add pages…** are not one
         // either — see `crate::picker`.

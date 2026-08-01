@@ -793,8 +793,12 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
     serve.wait_for_event("idle");
 
     assert_eq!(
-        serve.snapshot().get("staged"),
-        None,
+        serve
+            .snapshot()
+            .get("staged")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
         "nothing was staged yet"
     );
 
@@ -808,9 +812,20 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
         "stage_document did not report a change"
     );
     let snapshot = serve.snapshot();
+    let staged_list = snapshot
+        .get("staged")
+        .and_then(Value::as_array)
+        .expect("a staged list");
+    assert_eq!(
+        staged_list.len(),
+        1,
+        "expected exactly one staged document: {snapshot}"
+    );
+    let first = staged_list.first().expect("the entry just asserted above");
+    let stage = first.get("id").and_then(Value::as_u64).expect("a stage id");
     assert!(
-        snapshot
-            .get("staged")
+        first
+            .get("path")
             .and_then(Value::as_str)
             .is_some_and(|path| path.contains("e2e-stage-staged")),
         "the staged document's path was not reported: {snapshot}"
@@ -834,7 +849,11 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
     // not appended at the end, which is the whole point of this over `insert_file`.
     let id = serve.send(
         "insert_pages",
-        &[("pages", Value::from(vec![1])), ("at", Value::from(2))],
+        &[
+            ("stage", Value::from(stage)),
+            ("pages", Value::from(vec![1])),
+            ("at", Value::from(2)),
+        ],
     );
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
@@ -852,7 +871,11 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
     // survives more than one drag, per `PageOrder::insert_pages`'s own contract.
     let id = serve.send(
         "insert_pages",
-        &[("pages", Value::from(vec![2, 3])), ("at", Value::from(1))],
+        &[
+            ("stage", Value::from(stage)),
+            ("pages", Value::from(vec![2, 3])),
+            ("at", Value::from(1)),
+        ],
     );
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
@@ -867,16 +890,19 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
     );
 
     // Clearing staging does not touch pages already placed.
-    let id = serve.send("clear_staging", &[]);
+    let id = serve.send("clear_staging", &[("stage", Value::from(stage))]);
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("changed")
     );
     let snapshot = serve.snapshot();
     assert_eq!(
-        snapshot.get("staged"),
-        None,
-        "clear_staging did not clear the staged path"
+        snapshot
+            .get("staged")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "clear_staging did not clear the staged document"
     );
     assert_eq!(
         snapshot
@@ -889,7 +915,7 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
 
     // Clearing again is `unchanged`, the same convention every other toggle here
     // follows for "already true".
-    let id = serve.send("clear_staging", &[]);
+    let id = serve.send("clear_staging", &[("stage", Value::from(stage))]);
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("unchanged")
@@ -921,23 +947,232 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
 }
 
 #[test]
+fn an_agent_can_stage_and_merge_from_more_than_one_document_at_once() {
+    // The point of the whole rework (`docs/goal-5-plan.md` §10.12): more than
+    // one document can be staged simultaneously, each addressed by its own
+    // permanent `stage` id, independently of which one the merge tab's single
+    // visible pane happens to be showing.
+    let primary = fixture_of("e2e-multi-stage-primary.pdf", 2);
+    let a = fixture_of("e2e-multi-stage-a.pdf", 2);
+    let b = fixture_of("e2e-multi-stage-b.pdf", 3);
+    let saved = scratch("e2e-multi-stage-saved.pdf");
+
+    let mut serve = Serve::start(&primary);
+    serve.wait_for_event("idle");
+
+    let stage_ids = |serve: &mut Serve| -> Vec<u64> {
+        serve
+            .snapshot()
+            .get("staged")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|entry| entry.get("id").and_then(Value::as_u64))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let selection_of = |serve: &mut Serve, stage: u64| -> Vec<u64> {
+        serve
+            .snapshot()
+            .get("staged")
+            .and_then(Value::as_array)
+            .and_then(|list| {
+                list.iter()
+                    .find(|entry| entry.get("id").and_then(Value::as_u64) == Some(stage))
+            })
+            .and_then(|entry| entry.get("selection"))
+            .and_then(Value::as_array)
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+
+    let id = serve.send(
+        "stage_document",
+        &[("path", Value::from(a.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    let id = serve.send(
+        "stage_document",
+        &[("path", Value::from(b.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+
+    let ids = stage_ids(&mut serve);
+    assert_eq!(
+        ids.len(),
+        2,
+        "expected both documents to be staged at once: {ids:?}"
+    );
+    let stage_a = *ids.first().expect("the first staged id");
+    let stage_b = *ids.get(1).expect("the second staged id");
+    assert_ne!(stage_a, stage_b, "two staged documents shared one id");
+
+    // The document just staged is the one showing, without having to ask.
+    assert_eq!(
+        serve.snapshot().get("active_stage").and_then(Value::as_u64),
+        Some(stage_b),
+        "the most recently staged document should be the active one"
+    );
+
+    // Insert from A — not the active pane — and then from B, independently:
+    // addressing by id does not care which pane happens to be visible.
+    let id = serve.send(
+        "insert_pages",
+        &[
+            ("stage", Value::from(stage_a)),
+            ("pages", Value::from(vec![1, 2])),
+            ("at", Value::from(3)),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "insert from the non-active stage A was refused"
+    );
+    serve.wait_for_event("pages_reordered");
+
+    let id = serve.send(
+        "insert_pages",
+        &[
+            ("stage", Value::from(stage_b)),
+            ("pages", Value::from(vec![1, 2, 3])),
+            ("at", Value::from(1)),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("edited"),
+        "insert from stage B was refused"
+    );
+    let event = serve.wait_for_event("pages_reordered");
+    assert_eq!(
+        event.get("page_count").and_then(Value::as_u64),
+        Some(7),
+        "expected 2 (primary) + 2 (A) + 3 (B) pages"
+    );
+
+    // Switching the active pane to A does not need A to be re-staged — it
+    // never stopped being staged just because a page was drawn from it.
+    let id = serve.send("set_active_stage", &[("stage", Value::from(stage_a))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(
+        serve.snapshot().get("active_stage").and_then(Value::as_u64),
+        Some(stage_a)
+    );
+
+    // Picking out pages in each stage's own pane is independent of the other,
+    // and of which one is currently active.
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("stage", Value::from(stage_a)),
+            ("pages", Value::from(vec![1])),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("stage", Value::from(stage_b)),
+            ("pages", Value::from(vec![2, 3])),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert_eq!(selection_of(&mut serve, stage_a), vec![1]);
+    assert_eq!(selection_of(&mut serve, stage_b), vec![2, 3]);
+
+    // Clearing A does not disturb B's own selection, its pages already placed,
+    // or its own entry in the staged list — and the active pane falls back to
+    // whichever stage is left rather than going blank.
+    let id = serve.send("clear_staging", &[("stage", Value::from(stage_a))]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    let snapshot = serve.snapshot();
+    assert_eq!(
+        stage_ids(&mut serve),
+        vec![stage_b],
+        "clearing A should not have touched B's own entry"
+    );
+    assert_eq!(
+        snapshot.get("active_stage").and_then(Value::as_u64),
+        Some(stage_b),
+        "the pane should fall back to the only stage left rather than go blank"
+    );
+    assert_eq!(selection_of(&mut serve, stage_b), vec![2, 3]);
+    assert_eq!(
+        snapshot
+            .get("view")
+            .and_then(|view| view.get("page_count"))
+            .and_then(Value::as_u64),
+        Some(7),
+        "clearing A discarded pages already placed from A or B"
+    );
+
+    let id = serve.send(
+        "save_as",
+        &[("path", Value::from(saved.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("saving")
+    );
+    serve.wait_for_event("saved");
+
+    let reopened = Serve::start(&saved);
+    reopened.wait_for_event("idle");
+    let mut reopened = reopened;
+    assert_eq!(
+        reopened.view().get("page_count").and_then(Value::as_u64),
+        Some(7),
+        "the saved, merged document has the wrong number of pages"
+    );
+    reopened.quit();
+
+    serve.quit();
+}
+
+#[test]
 fn an_agent_can_select_all_of_the_staged_documents_pages() {
-    // `set_staged_selection` (`docs/goal-5-plan.md` §10.6): the merge tab's
-    // "Select All" button and an agent's equivalent request go through the
-    // identical command. Named by `path` rather than left implicit the way
-    // `insert_pages` is — see the command's own doc comment — so this also
-    // proves a request naming the wrong document is refused rather than
-    // silently picking out whatever happens to be staged.
+    // `set_staged_selection` (`docs/goal-5-plan.md` §10.6, §10.12): the merge
+    // tab's "Select All" button and an agent's equivalent request go through
+    // the identical command. Named by `stage` rather than left implicit the
+    // way `insert_pages` used to be — see the command's own doc comment — so
+    // this also proves a request naming the wrong stage is refused rather
+    // than silently picking out whatever happens to be staged.
     let primary = fixture_of("e2e-select-all-primary.pdf", 2);
     let staged = fixture_of("e2e-select-all-staged.pdf", 3);
 
     let mut serve = Serve::start(&primary);
     serve.wait_for_event("idle");
 
-    let staged_selection = |serve: &mut Serve| -> Vec<u64> {
+    let staged_selection = |serve: &mut Serve, stage: u64| -> Vec<u64> {
         serve
             .snapshot()
-            .get("staged_selection")
+            .get("staged")
+            .and_then(Value::as_array)
+            .and_then(|list| {
+                list.iter()
+                    .find(|entry| entry.get("id").and_then(Value::as_u64) == Some(stage))
+            })
+            .and_then(|entry| entry.get("selection"))
             .and_then(Value::as_array)
             .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
             .unwrap_or_default()
@@ -951,17 +1186,26 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("changed")
     );
+    let snapshot = serve.snapshot();
+    let stage = snapshot
+        .get("staged")
+        .and_then(Value::as_array)
+        .and_then(|list| list.first())
+        .and_then(|entry| entry.get("id"))
+        .and_then(Value::as_u64)
+        .expect("a stage id");
     assert!(
-        staged_selection(&mut serve).is_empty(),
+        staged_selection(&mut serve, stage).is_empty(),
         "something was picked out right after staging"
     );
 
-    // Naming a document other than the one actually staged is refused, not
+    // Naming a stage other than the one actually staged is refused, not
     // silently applied to whatever is staged instead.
+    let wrong_stage = stage + 1;
     let id = serve.send(
         "set_staged_selection",
         &[
-            ("path", Value::from(primary.to_string_lossy().as_ref())),
+            ("stage", Value::from(wrong_stage)),
             ("pages", Value::from(vec![1])),
         ],
     );
@@ -971,18 +1215,18 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
         reply
             .get("error")
             .and_then(Value::as_str)
-            .is_some_and(|error| error.contains("is staged")),
+            .is_some_and(|error| error.contains("not currently staged")),
         "unexpected error: {reply}"
     );
     assert!(
-        staged_selection(&mut serve).is_empty(),
+        staged_selection(&mut serve, stage).is_empty(),
         "the refused request still picked something out"
     );
 
     let id = serve.send(
         "set_staged_selection",
         &[
-            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("stage", Value::from(stage)),
             ("pages", Value::from(vec![1, 2, 3])),
         ],
     );
@@ -992,7 +1236,7 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
         "set_staged_selection did not report a change"
     );
     assert_eq!(
-        staged_selection(&mut serve),
+        staged_selection(&mut serve, stage),
         vec![1, 2, 3],
         "every staged page should be picked out"
     );
@@ -1002,7 +1246,7 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
     let id = serve.send(
         "set_staged_selection",
         &[
-            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("stage", Value::from(stage)),
             ("pages", Value::from(vec![1, 2, 3])),
         ],
     );
@@ -1015,7 +1259,7 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
     let id = serve.send(
         "set_staged_selection",
         &[
-            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("stage", Value::from(stage)),
             ("pages", Value::from(Vec::<i64>::new())),
         ],
     );
@@ -1023,10 +1267,10 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("changed")
     );
-    assert!(staged_selection(&mut serve).is_empty());
+    assert!(staged_selection(&mut serve, stage).is_empty());
 
-    // Nothing staged at all is refused too, not just a mismatched path.
-    let id = serve.send("clear_staging", &[]);
+    // Nothing staged at all is refused too, not just an unstaged id.
+    let id = serve.send("clear_staging", &[("stage", Value::from(stage))]);
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("changed")
@@ -1034,7 +1278,7 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
     let id = serve.send(
         "set_staged_selection",
         &[
-            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("stage", Value::from(stage)),
             ("pages", Value::from(vec![1])),
         ],
     );
@@ -1044,7 +1288,7 @@ fn an_agent_can_select_all_of_the_staged_documents_pages() {
         reply
             .get("error")
             .and_then(Value::as_str)
-            .is_some_and(|error| error.contains("nothing is staged")),
+            .is_some_and(|error| error.contains("not currently staged")),
         "unexpected error: {reply}"
     );
 
@@ -1424,7 +1668,10 @@ fn the_search_box_narrows_the_staging_viewport_independently() {
     let staged_filtered = |serve: &mut Serve| -> Option<Vec<u64>> {
         serve
             .snapshot()
-            .get("staged_filtered_pages")
+            .get("staged")
+            .and_then(Value::as_array)
+            .and_then(|list| list.first())
+            .and_then(|entry| entry.get("filtered_pages"))
             .and_then(Value::as_array)
             .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
     };
@@ -1443,6 +1690,14 @@ fn the_search_box_narrows_the_staging_viewport_independently() {
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("changed")
     );
+    let stage = serve
+        .snapshot()
+        .get("staged")
+        .and_then(Value::as_array)
+        .and_then(|list| list.first())
+        .and_then(|entry| entry.get("id"))
+        .and_then(Value::as_u64)
+        .expect("a stage id");
     // Staged, but nothing typed yet: still no filter on either side.
     assert_eq!(staged_filtered(&mut serve), None);
 
@@ -1472,7 +1727,7 @@ fn the_search_box_narrows_the_staging_viewport_independently() {
 
     // Clearing staging drops the staged half of the filter, even with the query
     // still typed — there is nothing left to narrow.
-    let id = serve.send("clear_staging", &[]);
+    let id = serve.send("clear_staging", &[("stage", Value::from(stage))]);
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
         Some("changed")

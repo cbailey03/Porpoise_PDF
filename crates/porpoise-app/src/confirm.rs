@@ -110,7 +110,7 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         Command::View(_)
         | Command::InsertFile { .. }
         | Command::StageDocument { .. }
-        | Command::ClearStaging
+        | Command::ClearStaging { .. }
         | Command::InsertPages { .. }
         | Command::Capture { .. }
         | Command::MovePage { .. }
@@ -120,6 +120,7 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         | Command::SetPageFilter { .. }
         | Command::SetSelection { .. }
         | Command::SetStagedSelection { .. }
+        | Command::SetActiveStage { .. }
         | Command::Undo
         | Command::Save
         | Command::SaveAs { .. }
@@ -133,6 +134,8 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
 mod tests {
     use super::*;
     use porpoise_view::{PageNumber, ViewCommand};
+
+    use crate::stage::StageId;
 
     fn path() -> PathBuf {
         PathBuf::from("plans/sheet.pdf")
@@ -185,9 +188,15 @@ mod tests {
         // Staging adds nothing to the document, and inserting only adds to it — the
         // same reasoning `InsertFile` already gets. See `docs/goal-5-plan.md` §10.6.
         assert_eq!(intent_of(&Command::StageDocument { path: path() }), None);
-        assert_eq!(intent_of(&Command::ClearStaging), None);
+        assert_eq!(
+            intent_of(&Command::ClearStaging {
+                stage: StageId::FIRST
+            }),
+            None
+        );
         assert_eq!(
             intent_of(&Command::InsertPages {
+                stage: StageId::FIRST,
                 pages: vec![PageNumber::FIRST],
                 at: PageNumber::FIRST,
             }),
@@ -201,8 +210,20 @@ mod tests {
         // the main grid's selection.
         assert_eq!(
             intent_of(&Command::SetStagedSelection {
-                path: path(),
+                stage: StageId::FIRST,
                 pages: vec![PageNumber::FIRST],
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_the_active_stage_is_never_guarded() {
+        // Which tab is showing, not a page edit — the same reasoning
+        // `SetGridMode` gets.
+        assert_eq!(
+            intent_of(&Command::SetActiveStage {
+                stage: StageId::FIRST
             }),
             None
         );

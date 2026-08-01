@@ -236,6 +236,48 @@ fn a_staged_but_never_inserted_document_does_not_block_saving() {
 }
 
 #[test]
+fn two_staged_but_never_inserted_documents_do_not_block_saving() {
+    // Generalizes the test above to more than one simultaneously-unused staged
+    // document — the merge tab can now stage several files at once, and every
+    // one of them has to be just as harmless to leave untouched as a single one.
+    let a = fixture("merge-stage-only-multi-a.pdf", 2);
+    let b = fixture("merge-stage-only-multi-b.pdf", 2);
+    let c = fixture("merge-stage-only-multi-c.pdf", 3);
+    let before_a: Vec<RenderedPage> = (0..2).map(|page| render(&a, page)).collect();
+
+    let mut order = PageOrder::identity(2);
+    assert!(order.stage(1, 2));
+    assert!(order.stage(2, 3));
+    assert_eq!(
+        order.as_slice().len(),
+        2,
+        "staging alone must not add pages to the order"
+    );
+
+    // Both gone by the time of the save.
+    std::fs::remove_file(&b).expect("should remove the first staged file");
+    std::fs::remove_file(&c).expect("should remove the second staged file");
+
+    let saved = scratch("merge-stage-only-multi-out.pdf");
+    save_reordered(&[a, b, c], &order, &saved, Overwrite::Refuse)
+        .expect("documents that were only ever staged must not be read at save time");
+
+    let document = Document::open(&saved).expect("should open");
+    assert_eq!(
+        document.page_count(),
+        2,
+        "only the primary document's pages should be saved"
+    );
+    for (position, expected) in before_a.iter().enumerate() {
+        assert_same(
+            &render(&saved, position),
+            expected,
+            &format!("position {position} should be unchanged"),
+        );
+    }
+}
+
+#[test]
 fn a_mismatched_source_list_is_refused_rather_than_panicking() {
     // `sources` and `order` falling out of sync is a caller bug this module cannot
     // rule out at the type level (see `save_reordered`'s own doc comment) — and it

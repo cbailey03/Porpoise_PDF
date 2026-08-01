@@ -41,6 +41,7 @@
 //! [`GridMode`]. Which pages are picked is [`crate::selection`]'s decision, not this
 //! module's; all that happens here is turning rectangles into positions.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
@@ -49,9 +50,11 @@ use porpoise_doc::{Document, PageGeometry, PageOrder, Source};
 use porpoise_view::{CacheKey, PageCache, PageNumber, ZoomBucket};
 
 use crate::button::{Action, Glyph, Toggle, button, small_button, toggle};
+use crate::label::file_label;
 use crate::queue::RenderQueue;
 use crate::search::PageFilter;
 use crate::selection::{Pick, Selection};
+use crate::stage::StageId;
 use crate::tiles::FULL_UV;
 
 /// How wide a thumbnail should be, in points of screen space.
@@ -271,10 +274,15 @@ pub(crate) struct Grid<'a> {
     /// Physical pixels per screen point, so a thumbnail is rasterized at the size it
     /// will actually be drawn.
     pub(crate) pixels_per_point: f32,
-    /// The document staged for merging, if any. Only read in [`GridMode::Merge`],
-    /// same as [`Self::selection`] is only read in [`GridMode::Reorganize`]. `None`
-    /// until something is staged — the right viewport shows a placeholder then.
+    /// The staged document whose pane is currently shown, if any. Only read in
+    /// [`GridMode::Merge`], same as [`Self::selection`] is only read in
+    /// [`GridMode::Reorganize`]. `None` until something is staged — the right
+    /// viewport shows a placeholder then.
     pub(crate) staged: Option<StagedInfo<'a>>,
+    /// Every currently staged document's id and path, in the order each was
+    /// staged — what the tab strip above [`Self::staged`]'s pane draws. Always
+    /// includes the one [`Self::staged`] is showing, plus any others.
+    pub(crate) staged_tabs: &'a [StagedTab],
     /// Whether a file dialog is already up, so the staging viewport's own **Stage a
     /// file…** button cannot stack a second one. Only read in [`GridMode::Merge`]
     /// while nothing is staged yet — the same reason the toolbar's buttons read it.
@@ -287,6 +295,9 @@ pub(crate) struct Grid<'a> {
 /// staged document, so this holds that directly rather than a whole `&Document` —
 /// which also means a test can build one without opening a real PDF.
 pub(crate) struct StagedInfo<'a> {
+    /// Which stage this is — what the tab strip's own controls, and a click or
+    /// drag in this pane, report back so the caller knows which one to act on.
+    pub(crate) id: StageId,
     /// Which document this is — for the cache key, and for the `Inserted` payload a
     /// drag out of this viewport carries.
     pub(crate) document: usize,
@@ -303,6 +314,20 @@ pub(crate) struct StagedInfo<'a> {
     /// count, not a second box — see `docs/goal-5-plan.md` M30 and
     /// `Viewer::staged_filter`.
     pub(crate) filter: &'a PageFilter,
+}
+
+/// One tab in the merge viewport's strip — deliberately narrower than
+/// [`StagedInfo`], the same reasoning that one gives for being narrower than
+/// [`Grid`]: a tab only ever needs an id and a label, never geometry.
+///
+/// Owns its path rather than borrowing one: built fresh from
+/// `OpenDocument::staged_summaries` each frame, and a borrow living that long
+/// would keep the rest of `OpenDocument` — the cache, the render queue —
+/// borrowed alongside it. A handful of small clones once a frame is cheaper
+/// than fighting that.
+pub(crate) struct StagedTab {
+    pub(crate) id: StageId,
+    pub(crate) path: PathBuf,
 }
 
 /// The zoom rung thumbnails are rasterized at.
@@ -511,17 +536,22 @@ pub(crate) struct Drawn {
     /// frame — what [`crate::viewer::Viewer::drop_zone`] needs to tell a drop meant
     /// for it from one meant for the grid beside it. `None` in every other mode.
     pub(crate) staging_rect: Option<egui::Rect>,
-    /// Whether the staging viewport's close control was clicked this frame.
-    /// The caller turns this into `Command::ClearStaging`.
-    pub(crate) clear_staging: bool,
+    /// Which staged document's close control was clicked this frame, whether the
+    /// active pane's own or one of the tab strip's — one meaning regardless of
+    /// which button drew it. The caller turns this into `Command::ClearStaging`.
+    pub(crate) clear_staging: Option<StageId>,
     /// Whether the staging viewport's own **Stage a file…** button was clicked this
     /// frame. The caller turns this into opening the file dialog with
     /// `Purpose::Stage`, the same as the toolbar's button used to.
     pub(crate) stage_requested: bool,
-    /// Whether the staging viewport's **Select All** button was clicked this frame.
-    /// The caller turns this into `Command::SetStagedSelection` naming every page
-    /// of the staged document, the same command an agent would send.
-    pub(crate) select_all_staged: bool,
+    /// Which staged document's **Select All** button was clicked this frame. The
+    /// caller turns this into `Command::SetStagedSelection` naming every page of
+    /// that document, the same command an agent would send.
+    pub(crate) select_all_staged: Option<StageId>,
+    /// A tab clicked that was not already the active one. The caller turns this
+    /// into `Command::SetActiveStage` — the same reason [`Self::mode`] drops the
+    /// case of clicking the mode tab already showing.
+    pub(crate) stage_switched: Option<StageId>,
 }
 
 /// Draws the grid, reporting what it drew.
@@ -692,11 +722,29 @@ fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
         // out, and this is what `Viewer::drop_zone` needs to tell a drop meant for
         // this pane from one meant for the grid beside it.
         let response = right.vertical(|ui| {
+            let tabs_drawn = stage_tabs(
+                ui,
+                grid.staged_tabs,
+                grid.staged.as_ref().map(|staged| staged.id),
+                grid.picker_open,
+            );
+            if let Some(switched) = tabs_drawn.switched {
+                drawn.stage_switched = Some(switched);
+            }
+            if let Some(closed) = tabs_drawn.closed {
+                drawn.clear_staging = Some(closed);
+            }
+            if tabs_drawn.plus_clicked {
+                drawn.stage_requested = true;
+            }
+
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Merge from").strong());
-                // Both offered only once something is staged — nothing to select or
-                // close before then.
-                if grid.staged.is_some()
+                // Only offered once something is staged — nothing to select
+                // out before then. Closing a stage is the tab strip's job now,
+                // above, so it acts on whichever one is clicked rather than
+                // only ever the active pane.
+                if let Some(staged) = &grid.staged
                     && let Some(()) = small_button(
                         ui,
                         Action {
@@ -707,19 +755,7 @@ fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
                         },
                     )
                 {
-                    drawn.select_all_staged = true;
-                }
-                if grid.staged.is_some()
-                    && let Some(()) = small_button(
-                        ui,
-                        Action {
-                            text: Glyph::ClearSearch.text(),
-                            hover: "Stop merging from this document",
-                            produces: Some(()),
-                        },
-                    )
-                {
-                    drawn.clear_staging = true;
+                    drawn.select_all_staged = Some(staged.id);
                 }
             });
             if let Some(staged) = &grid.staged {
@@ -739,21 +775,6 @@ fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
                 drawn.showing.extend(outcome.showing);
             } else {
                 ui.label("Open a second PDF to merge pages from it.");
-                // Beside the placeholder rather than on the toolbar: staging is only
-                // ever meaningful from inside the merge tab, so the button that
-                // starts it belongs where the pages it stages will appear.
-                if button(
-                    ui,
-                    Action {
-                        text: "Stage a file…",
-                        hover: "Open a second PDF, to drag its pages into place on the left",
-                        produces: (!grid.picker_open).then_some(()),
-                    },
-                )
-                .is_some()
-                {
-                    drawn.stage_requested = true;
-                }
             }
         });
         drawn.staging_rect = Some(response.response.rect);
@@ -773,6 +794,82 @@ fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
     // Once, after both panes: a drag out of the staging viewport is a ghost floating
     // over the whole tab, not just the pane it started in.
     paint_drag_ghost(ui.ctx());
+}
+
+/// What the tab strip did this frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StageTabsDrawn {
+    /// A tab clicked that was not already the active one.
+    switched: Option<StageId>,
+    /// A tab's own close control, clicked.
+    closed: Option<StageId>,
+    /// The trailing **+** was clicked.
+    plus_clicked: bool,
+}
+
+/// The merge tab's own tab strip: one toggle per staged document, each with its
+/// own close control, plus a trailing **+** to stage another.
+///
+/// Not a generalization of [`tabs`]: that one is fixedly typed to
+/// [`GridMode::EVERY`], a closed, compile-time-checked set, so the same
+/// toggle-per-variant loop cannot draw a list whose length only the run-time
+/// staging state knows.
+fn stage_tabs(
+    ui: &mut egui::Ui,
+    tabs: &[StagedTab],
+    active: Option<StageId>,
+    picker_open: bool,
+) -> StageTabsDrawn {
+    let mut drawn = StageTabsDrawn::default();
+    ui.horizontal(|ui| {
+        for tab in tabs {
+            ui.horizontal(|ui| {
+                let label = file_label(&tab.path);
+                let hover = format!("Stage {} — {}", tab.id, tab.path.display());
+                // The tab already showing is dropped rather than greyed out, the
+                // same reason `tabs` itself drops it — it has to stay clickable to
+                // look pressed, and re-picking it is not a switch.
+                if let Some(asked) = toggle(
+                    ui,
+                    Toggle {
+                        text: &label,
+                        hover: &hover,
+                        on: Some(tab.id) == active,
+                        produces: tab.id,
+                    },
+                ) && Some(asked) != active
+                {
+                    drawn.switched = Some(asked);
+                }
+                if let Some(()) = small_button(
+                    ui,
+                    Action {
+                        text: Glyph::ClearSearch.text(),
+                        hover: "Stop merging from this document",
+                        produces: Some(()),
+                    },
+                ) {
+                    drawn.closed = Some(tab.id);
+                }
+            });
+        }
+        // Always present, even with nothing staged yet: it is the only way left
+        // to stage a first document, now that the placeholder's own button has
+        // moved here — one producer of `StageDocument` instead of two.
+        if button(
+            ui,
+            Action {
+                text: "+",
+                hover: "Stage another PDF, to drag its pages into place on the left",
+                produces: (!picker_open).then_some(()),
+            },
+        )
+        .is_some()
+        {
+            drawn.plus_clicked = true;
+        }
+    });
+    drawn
 }
 
 /// What the staging viewport did this frame. The equivalent of [`Drawn`], scoped to
@@ -1782,6 +1879,7 @@ mod tests {
         selection.pick(&shown, 2, Pick::Toggle);
 
         let staged = StagedInfo {
+            id: StageId::FIRST,
             document: 1,
             geometries: &geometries,
             selection: &selection,

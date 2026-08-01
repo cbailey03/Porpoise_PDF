@@ -39,6 +39,7 @@ use serde::Serialize;
 
 use crate::command::Command;
 use crate::confirm::Answer;
+use crate::stage::StageId;
 use crate::thumbnails::GridMode;
 
 /// Longest line we will accept, so a client cannot exhaust memory by never
@@ -207,6 +208,26 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         PageNumber::new(number).ok_or_else(|| complain("page numbers start at 1".to_owned()))
     };
 
+    // Which staged document a command means, on the same "positive integer" gate
+    // `page_argument` uses — stages count from 1 too, and `{"stage":0}` is
+    // refused here rather than by a bounds check further in.
+    let stage_argument = |field: &str| -> Result<StageId, DecodeFailure> {
+        let complain = |detail: String| {
+            DecodeError::BadArguments {
+                command: name.to_owned(),
+                detail,
+            }
+            .at(id)
+        };
+        let raw = object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| complain(format!("expected a positive integer \"{field}\"")))?;
+        let number =
+            usize::try_from(raw).map_err(|_| complain(format!("\"{field}\" is too big")))?;
+        StageId::new(number).ok_or_else(|| complain("stages start at 1".to_owned()))
+    };
+
     // A list of page numbers, for the group edits and the selection. Every element goes
     // through the same `PageNumber` gate a single `page` does, so `[0]` and `[-1]` are
     // refused here rather than deeper in.
@@ -250,8 +271,11 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         "stage_document" => RequestBody::Command(Command::StageDocument {
             path: path_argument("path")?,
         }),
-        "clear_staging" => RequestBody::Command(Command::ClearStaging),
+        "clear_staging" => RequestBody::Command(Command::ClearStaging {
+            stage: stage_argument("stage")?,
+        }),
         "insert_pages" => RequestBody::Command(Command::InsertPages {
+            stage: stage_argument("stage")?,
             pages: pages_argument("pages")?,
             at: page_argument("at")?,
         }),
@@ -277,8 +301,11 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
             pages: pages_argument("pages")?,
         }),
         "set_staged_selection" => RequestBody::Command(Command::SetStagedSelection {
-            path: path_argument("path")?,
+            stage: stage_argument("stage")?,
             pages: pages_argument("pages")?,
+        }),
+        "set_active_stage" => RequestBody::Command(Command::SetActiveStage {
+            stage: stage_argument("stage")?,
         }),
         "set_page_filter" => RequestBody::Command(Command::SetPageFilter {
             // A missing "query" is the empty one, which clears the filter — the same
@@ -372,6 +399,30 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
     Ok(Some(Request { id, body }))
 }
 
+/// One document staged for the merge tab, as reported in a [`Snapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct StagedSnapshot {
+    /// Which staged document this is — what `insert_pages`/`set_staged_selection`/
+    /// `clear_staging`/`set_active_stage` all name it by.
+    pub(crate) id: StageId,
+    /// Path of this staged document.
+    pub(crate) path: String,
+    /// How many pages this staged document has. No round trip needed to learn
+    /// it before, say, asking to select every one of them.
+    pub(crate) page_count: usize,
+    /// The shared search query resolved against this document's own page
+    /// count, counting from 1 — `None` with nothing typed. A second parse per
+    /// stage, not a shared result: two staged documents almost never share a
+    /// page count, so the same query can match different pages of each — see
+    /// `docs/goal-5-plan.md` M30, §10.12.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) filtered_pages: Option<Vec<PageNumber>>,
+    /// This document's own pages picked out, counting from 1, ascending —
+    /// this staged document's equivalent of [`Snapshot::selection`]. Empty
+    /// when nothing is picked.
+    pub(crate) selection: Vec<PageNumber>,
+}
+
 /// Everything readable about the program's state.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Snapshot {
@@ -398,11 +449,15 @@ pub(crate) struct Snapshot {
     /// What clicking a page in the grid does. Reported whether or not the grid is
     /// showing, because it is remembered across closing and reopening the panel.
     pub(crate) grid_mode: GridMode,
-    /// Path of the document staged for the merge tab, if any. `None` until
-    /// `stage_document` succeeds, and again after `clear_staging` — see
-    /// `docs/goal-5-plan.md` §10.6.
+    /// Every document currently staged for the merge tab, in the order each was
+    /// staged. Empty until `stage_document` succeeds; an entry is removed by
+    /// `clear_staging`, not merely emptied. See `docs/goal-5-plan.md` §10.6,
+    /// §10.12.
+    pub(crate) staged: Vec<StagedSnapshot>,
+    /// Which staged document's pane the merge tab's single staging viewport
+    /// currently shows. `None` only when [`Self::staged`] is empty.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) staged: Option<String>,
+    pub(crate) active_stage: Option<StageId>,
     /// What is typed in the grid's search box. Empty when nothing is.
     pub(crate) page_filter: String,
     /// The pages that query resolves to, counting from 1 — `None` when nothing is typed.
@@ -412,23 +467,12 @@ pub(crate) struct Snapshot {
     /// state from no query at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) filtered_pages: Option<Vec<PageNumber>>,
-    /// The same query, resolved against the staged document instead — `None` with
-    /// nothing staged, as well as with nothing typed. A second field rather than
-    /// reusing `filtered_pages`, because the two documents almost never share a page
-    /// count and the query can match different pages of each — see
-    /// `docs/goal-5-plan.md` M30.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) staged_filtered_pages: Option<Vec<PageNumber>>,
     /// Pages picked out in the grid, counting from 1, ascending.
     ///
     /// Display positions, like every other page number here — so after a reorder these
     /// are where the selected pages are *now*. Empty when nothing is picked, which is
     /// also when **Delete** falls back to acting on the page in view.
     pub(crate) selection: Vec<PageNumber>,
-    /// The staged document's pages picked out, counting from 1, ascending — the
-    /// staging pane's equivalent of [`Self::selection`]. Empty with nothing
-    /// picked, as well as with nothing staged at all.
-    pub(crate) staged_selection: Vec<PageNumber>,
     /// Whether the page order differs from the file on disk.
     ///
     /// False again once a save of that exact order reports success — so a document that
@@ -746,12 +790,15 @@ mod tests {
             }
         );
         assert_eq!(
-            command(r#"{"command":"clear_staging"}"#),
-            Command::ClearStaging
+            command(r#"{"command":"clear_staging","stage":1}"#),
+            Command::ClearStaging {
+                stage: StageId::new(1).expect("stage 1 exists")
+            }
         );
         assert_eq!(
-            command(r#"{"command":"insert_pages","pages":[2,1],"at":3}"#),
+            command(r#"{"command":"insert_pages","stage":1,"pages":[2,1],"at":3}"#),
             Command::InsertPages {
+                stage: StageId::new(1).expect("stage 1 exists"),
                 pages: vec![
                     PageNumber::new(2).expect("page 2 exists"),
                     PageNumber::new(1).expect("page 1 exists"),
@@ -760,34 +807,47 @@ mod tests {
             }
         );
         assert_eq!(
-            command(r#"{"command":"set_staged_selection","path":"d.pdf","pages":[1,2]}"#),
+            command(r#"{"command":"set_staged_selection","stage":2,"pages":[1,2]}"#),
             Command::SetStagedSelection {
-                path: PathBuf::from("d.pdf"),
+                stage: StageId::new(2).expect("stage 2 exists"),
                 pages: vec![
                     PageNumber::new(1).expect("page 1 exists"),
                     PageNumber::new(2).expect("page 2 exists"),
                 ],
             }
         );
+        assert_eq!(
+            command(r#"{"command":"set_active_stage","stage":2}"#),
+            Command::SetActiveStage {
+                stage: StageId::new(2).expect("stage 2 exists")
+            }
+        );
     }
 
     #[test]
-    fn insert_pages_needs_both_its_arguments() {
-        assert!(decode(r#"{"command":"insert_pages","at":1}"#).is_err());
-        assert!(decode(r#"{"command":"insert_pages","pages":[1]}"#).is_err());
-        // Page numbers count from 1 here too, refused by `PageNumber` itself.
-        assert!(decode(r#"{"command":"insert_pages","pages":[0],"at":1}"#).is_err());
-        assert!(decode(r#"{"command":"insert_pages","pages":[1],"at":0}"#).is_err());
+    fn insert_pages_needs_all_three_of_its_arguments() {
+        assert!(decode(r#"{"command":"insert_pages","pages":[1],"at":1}"#).is_err());
+        assert!(decode(r#"{"command":"insert_pages","stage":1,"at":1}"#).is_err());
+        assert!(decode(r#"{"command":"insert_pages","stage":1,"pages":[1]}"#).is_err());
+        // Both stages and page numbers count from 1, refused by their own types.
+        assert!(decode(r#"{"command":"insert_pages","stage":0,"pages":[1],"at":1}"#).is_err());
+        assert!(decode(r#"{"command":"insert_pages","stage":1,"pages":[0],"at":1}"#).is_err());
+        assert!(decode(r#"{"command":"insert_pages","stage":1,"pages":[1],"at":0}"#).is_err());
     }
 
     #[test]
     fn set_staged_selection_needs_both_its_arguments() {
         assert!(decode(r#"{"command":"set_staged_selection","pages":[1]}"#).is_err());
-        assert!(decode(r#"{"command":"set_staged_selection","path":"d.pdf"}"#).is_err());
-        // Page numbers count from 1 here too, refused by `PageNumber` itself.
-        assert!(
-            decode(r#"{"command":"set_staged_selection","path":"d.pdf","pages":[0]}"#).is_err()
-        );
+        assert!(decode(r#"{"command":"set_staged_selection","stage":1}"#).is_err());
+        // Both stages and page numbers count from 1, refused by their own types.
+        assert!(decode(r#"{"command":"set_staged_selection","stage":0,"pages":[1]}"#).is_err());
+        assert!(decode(r#"{"command":"set_staged_selection","stage":1,"pages":[0]}"#).is_err());
+    }
+
+    #[test]
+    fn set_active_stage_needs_its_stage() {
+        assert!(decode(r#"{"command":"set_active_stage"}"#).is_err());
+        assert!(decode(r#"{"command":"set_active_stage","stage":0}"#).is_err());
     }
 
     #[test]

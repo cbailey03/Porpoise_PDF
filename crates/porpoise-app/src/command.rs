@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use porpoise_view::{PageNumber, ViewCommand};
 
 use crate::confirm::Answer;
+use crate::stage::StageId;
 use crate::thumbnails::GridMode;
 
 /// Anything an operator — a person at the keyboard, or an agent — can ask of the
@@ -45,31 +46,44 @@ pub(crate) enum Command {
         /// The file to bring in.
         path: PathBuf,
     },
-    /// Opens a second document for the merge tab's staging viewport, without
-    /// adding any of its pages to the one being edited.
+    /// Opens another document for the merge tab, adding a new staging pane
+    /// without adding any of its pages to the one being edited.
     ///
-    /// Not guarded: staging adds nothing, so there is nothing at risk. Replaces
-    /// whatever was staged before, if anything — the same as `InsertFile` never
-    /// reusing a document already known. See `docs/goal-5-plan.md` §10.6.
+    /// Not guarded: staging adds nothing, so there is nothing at risk. Adds a
+    /// new pane rather than replacing one already staged — more than one
+    /// document can be staged at once. The new pane's [`StageId`] is not
+    /// returned directly; read it back from a `snapshot`'s `staged` list, where
+    /// it is the entry with the highest id (deterministic, since commands are
+    /// carried out one at a time). See `docs/goal-5-plan.md` §10.6, §10.12.
     StageDocument {
         /// The file to stage.
         path: PathBuf,
     },
-    /// Closes the staging viewport, forgetting whichever document was staged.
+    /// Closes one staged document's pane, forgetting it.
     ///
     /// Pages of it already placed by [`Self::InsertPages`] are unaffected — they
-    /// are ordinary pages of the open document by that point.
-    ClearStaging,
-    /// Inserts pages of the currently staged document into the open document,
-    /// landing as a contiguous block starting at `at`.
+    /// are ordinary pages of the open document by that point. Refused with
+    /// nothing, not `Unchanged`, only when nothing is open at all; naming a
+    /// `stage` that is not (or no longer) staged is `Unchanged`, the same
+    /// convention every other "already true" toggle here follows.
+    ClearStaging {
+        /// Which staged document to forget.
+        stage: StageId,
+    },
+    /// Inserts pages of one staged document into the open document, landing as
+    /// a contiguous block starting at `at`.
     ///
-    /// Names pages of "the currently staged document" rather than taking a path,
-    /// the same way [`Self::MovePages`] names positions of "the document" rather
-    /// than repeating which one is open — there is exactly one staging slot.
-    /// Refused if nothing is staged. See `docs/goal-5-plan.md` §10.6.
+    /// Names the document by `stage` rather than leaving it implicit the way
+    /// [`Self::MovePages`] names positions of "the document" rather than
+    /// repeating which one is open: more than one document can be staged at
+    /// once now, so there is no longer a single implicit one to mean. Refused
+    /// if `stage` is not currently staged. See `docs/goal-5-plan.md` §10.6,
+    /// §10.12.
     InsertPages {
-        /// Which of the staged document's pages to insert, counting from 1, in
-        /// the order they should land.
+        /// Which staged document to insert from.
+        stage: StageId,
+        /// Which of that document's pages to insert, counting from 1, in the
+        /// order they should land.
         pages: Vec<PageNumber>,
         /// Where the block should start.
         at: PageNumber,
@@ -139,22 +153,31 @@ pub(crate) enum Command {
         /// The pages to pick out, counting from 1.
         pages: Vec<PageNumber>,
     },
-    /// Pick out pages of the staged document, replacing whatever was picked there
-    /// before — the staging pane's own equivalent of [`Self::SetSelection`]. An
-    /// empty list clears it.
+    /// Pick out pages of one staged document, replacing whatever was picked
+    /// there before — the staging pane's own equivalent of
+    /// [`Self::SetSelection`]. An empty list clears it.
     ///
-    /// Names the staged document by `path` rather than leaving it implicit the way
-    /// [`Self::InsertPages`] does: today there is exactly one staging slot, so the
-    /// two are equivalent in practice, but a stale request naming the wrong
-    /// document is refused rather than silently picking whatever happens to be
-    /// staged now — and the same shape keeps working if staging more than one
-    /// document at a time is ever supported. See `docs/goal-5-plan.md` §10.6.
+    /// Names the document by `stage`, the same reason [`Self::InsertPages`]
+    /// does: more than one document can be staged at once, so there is no
+    /// longer a single implicit one to mean. Refused if `stage` is not
+    /// currently staged. See `docs/goal-5-plan.md` §10.11, §10.12.
     SetStagedSelection {
-        /// The staged document this is about. Refused if it does not match what
-        /// is actually staged.
-        path: PathBuf,
+        /// Which staged document this is about.
+        stage: StageId,
         /// The pages to pick out, counting from 1.
         pages: Vec<PageNumber>,
+    },
+    /// Choose which staged document's pane the merge tab's single staging
+    /// viewport shows.
+    ///
+    /// A command for the same reason [`Self::SetGridMode`] is: it changes
+    /// what is on screen, so an agent that reads a snapshot can tell what a
+    /// person is looking at, and there is no click-only path to switch tabs
+    /// that an agent cannot also take. Refused if `stage` is not currently
+    /// staged. See `docs/goal-5-plan.md` §10.12.
+    SetActiveStage {
+        /// Which staged document's pane to show.
+        stage: StageId,
     },
     /// Undo the last page edit.
     Undo,
@@ -208,7 +231,7 @@ impl Command {
             Self::Close => "close",
             Self::InsertFile { .. } => "insert_file",
             Self::StageDocument { .. } => "stage_document",
-            Self::ClearStaging => "clear_staging",
+            Self::ClearStaging { .. } => "clear_staging",
             Self::InsertPages { .. } => "insert_pages",
             Self::Capture { .. } => "capture",
             Self::MovePage { .. } => "move_page",
@@ -218,6 +241,7 @@ impl Command {
             Self::SetPageFilter { .. } => "set_page_filter",
             Self::SetSelection { .. } => "set_selection",
             Self::SetStagedSelection { .. } => "set_staged_selection",
+            Self::SetActiveStage { .. } => "set_active_stage",
             Self::Undo => "undo",
             Self::Save => "save",
             Self::SaveAs { .. } => "save_as",
@@ -249,8 +273,11 @@ impl Command {
             Self::StageDocument {
                 path: placeholder(),
             },
-            Self::ClearStaging,
+            Self::ClearStaging {
+                stage: StageId::FIRST,
+            },
             Self::InsertPages {
+                stage: StageId::FIRST,
                 pages: vec![PageNumber::FIRST],
                 at: PageNumber::FIRST,
             },
@@ -278,8 +305,11 @@ impl Command {
                 pages: vec![PageNumber::FIRST],
             },
             Self::SetStagedSelection {
-                path: placeholder(),
+                stage: StageId::FIRST,
                 pages: vec![PageNumber::FIRST],
+            },
+            Self::SetActiveStage {
+                stage: StageId::FIRST,
             },
             Self::Undo,
             Self::Save,
@@ -343,9 +373,16 @@ mod tests {
             .name(),
             "stage_document"
         );
-        assert_eq!(Command::ClearStaging.name(), "clear_staging");
+        assert_eq!(
+            Command::ClearStaging {
+                stage: StageId::FIRST
+            }
+            .name(),
+            "clear_staging"
+        );
         assert_eq!(
             Command::InsertPages {
+                stage: StageId::FIRST,
                 pages: vec![PageNumber::FIRST],
                 at: PageNumber::FIRST,
             }
@@ -354,11 +391,18 @@ mod tests {
         );
         assert_eq!(
             Command::SetStagedSelection {
-                path: PathBuf::from("d.pdf"),
+                stage: StageId::FIRST,
                 pages: vec![PageNumber::FIRST],
             }
             .name(),
             "set_staged_selection"
+        );
+        assert_eq!(
+            Command::SetActiveStage {
+                stage: StageId::FIRST
+            }
+            .name(),
+            "set_active_stage"
         );
         assert_eq!(Command::Quit.name(), "quit");
     }
@@ -384,7 +428,7 @@ mod tests {
                 | Command::Close
                 | Command::InsertFile { .. }
                 | Command::StageDocument { .. }
-                | Command::ClearStaging
+                | Command::ClearStaging { .. }
                 | Command::InsertPages { .. }
                 | Command::Capture { .. }
                 | Command::MovePage { .. }
@@ -394,6 +438,7 @@ mod tests {
                 | Command::SetPageFilter { .. }
                 | Command::SetSelection { .. }
                 | Command::SetStagedSelection { .. }
+                | Command::SetActiveStage { .. }
                 | Command::Undo
                 | Command::Save
                 | Command::SaveAs { .. }
@@ -408,7 +453,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            21,
+            22,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

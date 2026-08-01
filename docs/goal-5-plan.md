@@ -959,3 +959,103 @@ clear the selection with an empty list, and confirm `nothing is staged` once
 `clear_staging` runs. A screenshot taken the same way as every other milestone
 here confirmed the button's placement and the selection highlight rendering
 across all three staged pages.
+
+### 10.12 Multiple simultaneous stages
+
+§10.11's closing paragraph predicted this: staging more than one document at
+once was "explicitly on the table for later." This is that later.
+
+**What changed.** `OpenDocument.staging` went from `Option<usize>` — one
+pointer, replaced by every new `stage_document` — to `Vec<Staged>`, one entry
+per currently staged document, each carrying a new `StageId`: a small,
+permanent, 1-based label (mirroring `PageNumber`'s validated-newtype pattern,
+minus an `index()` — it is never used to index anything) assigned by a
+`next_stage_id` counter that only ever increases. The same "never reuse an
+index" discipline `add_file` and `PageOrder::stage`/`append` already held to,
+applied to a second counter: clearing a stage never lets its number mean a
+different document later.
+
+Four commands changed shape as a direct consequence. `ClearStaging` and
+`InsertPages` gained a required `stage: StageId` — there is no longer a single
+implicit "the staged document" to mean. `SetStagedSelection`'s `path` field,
+added in §10.11 specifically so this day would not need a second migration, is
+`stage` instead now: the same file can be staged twice at once (to drag
+different page ranges from each, or after re-staging following an external
+edit), so `path` stopped being a unique key the moment more than one slot
+existed. A new `SetActiveStage { stage }` joined them, for the same reason
+`SetGridMode` is a command rather than a click-only tab: switching which pane
+is visible changes what is on screen, and this codebase does not have a
+control an agent cannot also drive.
+
+**What did not change.** `porpoise-doc`'s `PageOrder::stage`/`insert_pages`
+already took an explicit `document: usize` and already had tests proving three
+simultaneously-registered documents work — the single-slot limit turned out to
+live entirely in the app layer, never in the pure logic underneath it.
+`save_reordered`'s fix from §10.10 (skip a document that contributes no
+retained page) already generalized to any count; only its regression test
+covered exactly one, so a new sibling test in `porpoise-render/tests/merge.rs`
+(`two_staged_but_never_inserted_documents_do_not_block_saving`) closes that gap
+now that it matters for real. `Inserted`'s drag payload kept its plain
+`document: usize` — it stays decoupled from the stage concept the same way
+`StagedInfo.document` already was, and `Viewer::draw_thumbnails` is the one
+place that translates it back to a `StageId`, right before a drop becomes a
+command.
+
+**The UI decision.** Two shapes were on the table: every staged pane visible
+at once (a real multi-column layout, new width-budget math, N-way divider
+painting, N-way drop-zone hit-testing), or one visible pane switched by a
+small tab strip, addressed by `stage` regardless of which tab is showing.
+Chose the tab strip — the merge tab's existing two-column layout, its width
+constants, its divider and its drop zone are all completely unaffected, and
+every command already names a specific stage, so an agent never has to care
+which tab a person is looking at. `Grid` gained `staged_tabs: &[StagedTab]`
+(id and path, deliberately narrower than `StagedInfo`, the same reasoning that
+one gives for being narrower than `Grid`) alongside its existing
+`staged: Option<StagedInfo>`, now understood as "the *active* stage's info."
+`stage_tabs()` is its own function rather than a generalization of the
+existing `GridMode`-specific `tabs()`, because that one is fixedly typed to a
+closed, compile-time-checked set (`GridMode::EVERY`) and a runtime-sized list
+of stages needs its own loop.
+
+Each tab carries its own close control, so a non-active stage can be cleared
+without switching to it first — the "Merge from" header's old close button was
+retired in favor of it, one producer of `ClearStaging` instead of two doing
+the same thing. The trailing **+** is the relocated **Stage a file…** button,
+always present — even with nothing staged yet, since it is now the only way
+to stage a first document — rather than conditional the way the header's
+Select All still is.
+
+**Selection and the active pane.** `Viewer.staging_selection: Selection`
+became `staging_selections: HashMap<StageId, Selection>` — one entry per
+stage, created lazily on the first pick or marquee in that pane, so switching
+tabs never loses what was picked in another. A new
+`active_stage: Option<StageId>` tracks which one the single visible pane
+shows: a freshly staged document becomes active automatically (matching what
+one slot always did), and clearing the active stage falls back to whichever
+remaining stage was staged most recently — `StageId` only ever increases, so
+the highest one left is the most recent — rather than leaving the pane blank
+while others are still open. Leaving `GridMode::Merge` entirely still clears
+every stage's selection at once, the same reasoning that already governs the
+main grid's on leaving Reorganize; switching *tabs within* Merge deliberately
+does not reach this, since a stage's own pane is never out of reach the way
+the whole tab is.
+
+**`Snapshot`.** The three singular fields (`staged: Option<String>`,
+`staged_filtered_pages`, `staged_selection`) collapsed into one
+`staged: Vec<StagedSnapshot>`, each entry carrying `id`, `path`, `page_count`
+(a small genuinely new capability — there was previously no way to learn a
+staged document's page count without a round trip), the shared query resolved
+against that document specifically, and that document's own selection. A
+top-level `active_stage` mirrors `grid_mode` — the same shape this codebase
+already chose for "which tab is showing."
+
+**Verified** past the unit level by
+`an_agent_can_stage_and_merge_from_more_than_one_document_at_once`: stage two
+documents, confirm distinct ids and that the second becomes active unasked,
+insert from the non-active one first (proving addressing by id does not care
+what is visible), switch the active pane, pick out different pages in each
+stage's own selection, clear one and confirm the other's entry, selection and
+already-placed pages are untouched and the active pane falls back rather than
+going blank, then save, reopen and confirm the combined page count. A
+screenshot confirmed the tab strip's own rendering and that switching tabs
+actually redraws the correct document.

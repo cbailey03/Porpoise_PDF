@@ -21,6 +21,7 @@ mod retain;
 mod saver;
 mod search;
 mod selection;
+mod stage;
 mod thumbnails;
 mod tiles;
 mod viewer;

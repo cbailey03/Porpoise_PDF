@@ -119,6 +119,7 @@ pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
         | Command::DeletePages { .. }
         | Command::SetPageFilter { .. }
         | Command::SetSelection { .. }
+        | Command::SetStagedSelection { .. }
         | Command::Undo
         | Command::Save
         | Command::SaveAs { .. }
@@ -189,6 +190,19 @@ mod tests {
             intent_of(&Command::InsertPages {
                 pages: vec![PageNumber::FIRST],
                 at: PageNumber::FIRST,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn setting_the_staged_selection_is_never_guarded() {
+        // UI state, not a page edit — the same reasoning `SetSelection` gets for
+        // the main grid's selection.
+        assert_eq!(
+            intent_of(&Command::SetStagedSelection {
+                path: path(),
+                pages: vec![PageNumber::FIRST],
             }),
             None
         );

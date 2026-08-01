@@ -276,6 +276,10 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         "set_selection" => RequestBody::Command(Command::SetSelection {
             pages: pages_argument("pages")?,
         }),
+        "set_staged_selection" => RequestBody::Command(Command::SetStagedSelection {
+            path: path_argument("path")?,
+            pages: pages_argument("pages")?,
+        }),
         "set_page_filter" => RequestBody::Command(Command::SetPageFilter {
             // A missing "query" is the empty one, which clears the filter — the same
             // reading the search box's ✕ has. Only a non-string is an error, because that
@@ -421,6 +425,10 @@ pub(crate) struct Snapshot {
     /// are where the selected pages are *now*. Empty when nothing is picked, which is
     /// also when **Delete** falls back to acting on the page in view.
     pub(crate) selection: Vec<PageNumber>,
+    /// The staged document's pages picked out, counting from 1, ascending — the
+    /// staging pane's equivalent of [`Self::selection`]. Empty with nothing
+    /// picked, as well as with nothing staged at all.
+    pub(crate) staged_selection: Vec<PageNumber>,
     /// Whether the page order differs from the file on disk.
     ///
     /// False again once a save of that exact order reports success — so a document that
@@ -751,6 +759,16 @@ mod tests {
                 at: PageNumber::new(3).expect("page 3 exists"),
             }
         );
+        assert_eq!(
+            command(r#"{"command":"set_staged_selection","path":"d.pdf","pages":[1,2]}"#),
+            Command::SetStagedSelection {
+                path: PathBuf::from("d.pdf"),
+                pages: vec![
+                    PageNumber::new(1).expect("page 1 exists"),
+                    PageNumber::new(2).expect("page 2 exists"),
+                ],
+            }
+        );
     }
 
     #[test]
@@ -760,6 +778,16 @@ mod tests {
         // Page numbers count from 1 here too, refused by `PageNumber` itself.
         assert!(decode(r#"{"command":"insert_pages","pages":[0],"at":1}"#).is_err());
         assert!(decode(r#"{"command":"insert_pages","pages":[1],"at":0}"#).is_err());
+    }
+
+    #[test]
+    fn set_staged_selection_needs_both_its_arguments() {
+        assert!(decode(r#"{"command":"set_staged_selection","pages":[1]}"#).is_err());
+        assert!(decode(r#"{"command":"set_staged_selection","path":"d.pdf"}"#).is_err());
+        // Page numbers count from 1 here too, refused by `PageNumber` itself.
+        assert!(
+            decode(r#"{"command":"set_staged_selection","path":"d.pdf","pages":[0]}"#).is_err()
+        );
     }
 
     #[test]

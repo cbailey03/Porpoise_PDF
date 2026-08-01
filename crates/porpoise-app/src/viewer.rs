@@ -319,6 +319,14 @@ impl OpenDocument {
         geometry_of(&self.files, source)
     }
 
+    /// The path of the currently staged document, if any — what a
+    /// `Command::SetStagedSelection` naming a target has to match.
+    fn staged_path(&self) -> Option<&Path> {
+        self.files
+            .get(self.staging?)
+            .map(|file| file.path.as_path())
+    }
+
     /// How many pages the currently staged document has, or 0 with nothing staged —
     /// what [`Viewer::staged_filter`] parses a query against.
     fn staged_page_count(&self) -> usize {
@@ -676,14 +684,16 @@ impl Viewer {
             last_error: self.last_error.clone(),
             thumbnails: self.thumbnails,
             grid_mode: self.grid_mode,
-            staged: self.open.as_ref().and_then(|open| {
-                let index = open.staging?;
-                Some(open.files.get(index)?.path.display().to_string())
-            }),
+            staged: self
+                .open
+                .as_ref()
+                .and_then(OpenDocument::staged_path)
+                .map(|path| path.display().to_string()),
             page_filter: self.page_filter.clone(),
             filtered_pages: self.filtered_pages(),
             staged_filtered_pages: self.staged_filtered_pages(),
             selection: self.selected_pages(),
+            staged_selection: self.staged_selected_pages(),
             unsaved_changes: self.unsaved_changes(),
             awaiting_answer: match &self.guard {
                 Some(Guard::Asking(intent)) => Some(intent.describe()),
@@ -956,6 +966,30 @@ impl Viewer {
                     return DispatchResult::Unchanged;
                 }
                 self.selection = wanted;
+                DispatchResult::View(Outcome::Changed)
+            }
+            Command::SetStagedSelection { path, pages } => {
+                let Some(open) = &self.open else {
+                    return DispatchResult::Failed(NOTHING_OPEN.to_owned());
+                };
+                let Some((staged_path, shown)) = open.staged_path().zip(open.staged_sources())
+                else {
+                    return DispatchResult::Failed("nothing is staged".to_owned());
+                };
+                if staged_path != path.as_path() {
+                    return DispatchResult::Failed(format!(
+                        "{} is staged, not {}",
+                        staged_path.display(),
+                        path.display()
+                    ));
+                }
+                let positions: Vec<usize> = pages.iter().map(|page| page.index()).collect();
+                let mut wanted = self.staging_selection.clone();
+                wanted.set_positions(&shown, &positions);
+                if wanted == self.staging_selection {
+                    return DispatchResult::Unchanged;
+                }
+                self.staging_selection = wanted;
                 DispatchResult::View(Outcome::Changed)
             }
             Command::Undo => self.edit(PageOrder::undo),
@@ -1409,6 +1443,22 @@ impl Viewer {
         };
         self.selection
             .positions(open.order.as_slice())
+            .into_iter()
+            .map(PageNumber::from_index)
+            .collect()
+    }
+
+    /// The staged document's pages currently picked out, counting from 1, ascending
+    /// — the staging pane's equivalent of [`Self::selected_pages`].
+    fn staged_selected_pages(&self) -> Vec<PageNumber> {
+        let Some(open) = &self.open else {
+            return Vec::new();
+        };
+        let Some(shown) = open.staged_sources() else {
+            return Vec::new();
+        };
+        self.staging_selection
+            .positions(&shown)
             .into_iter()
             .map(PageNumber::from_index)
             .collect()
@@ -2018,6 +2068,7 @@ impl Viewer {
             filter: &filter,
             pixels_per_point,
             staged,
+            picker_open: self.picker.is_open(),
         };
         let drawn = thumbnails::draw(ui, &mut grid);
         // Kept for `retain_textures`, which runs once both panels have had their say.
@@ -2111,6 +2162,24 @@ impl Viewer {
         if drawn.clear_staging {
             let ctx = ui.ctx().clone();
             self.dispatch(&ctx, Command::ClearStaging);
+        }
+        // Through the normal dispatch, so the button and an agent sending
+        // `set_staged_selection` by hand produce the identical command.
+        if drawn.select_all_staged
+            && let Some(open) = &self.open
+            && let Some(path) = open.staged_path()
+        {
+            let path = path.to_path_buf();
+            let pages: Vec<PageNumber> = (1..=open.staged_page_count())
+                .filter_map(PageNumber::new)
+                .collect();
+            let ctx = ui.ctx().clone();
+            self.dispatch(&ctx, Command::SetStagedSelection { path, pages });
+        }
+        // Not a command, the same reason **Open…** and **Add pages…** are not one
+        // either — see `crate::picker`.
+        if drawn.stage_requested {
+            self.picker.open(Purpose::Stage);
         }
     }
 

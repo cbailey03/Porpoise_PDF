@@ -48,7 +48,7 @@ use eframe::egui::containers::scroll_area::{DragScroll, ScrollSource};
 use porpoise_doc::{Document, PageGeometry, PageOrder, Source};
 use porpoise_view::{CacheKey, PageCache, PageNumber, ZoomBucket};
 
-use crate::button::{Action, Glyph, Toggle, small_button, toggle};
+use crate::button::{Action, Glyph, Toggle, button, small_button, toggle};
 use crate::queue::RenderQueue;
 use crate::search::PageFilter;
 use crate::selection::{Pick, Selection};
@@ -275,6 +275,10 @@ pub(crate) struct Grid<'a> {
     /// same as [`Self::selection`] is only read in [`GridMode::Reorganize`]. `None`
     /// until something is staged — the right viewport shows a placeholder then.
     pub(crate) staged: Option<StagedInfo<'a>>,
+    /// Whether a file dialog is already up, so the staging viewport's own **Stage a
+    /// file…** button cannot stack a second one. Only read in [`GridMode::Merge`]
+    /// while nothing is staged yet — the same reason the toolbar's buttons read it.
+    pub(crate) picker_open: bool,
 }
 
 /// Everything the staging viewport needs to show one document's own pages.
@@ -510,6 +514,14 @@ pub(crate) struct Drawn {
     /// Whether the staging viewport's close control was clicked this frame.
     /// The caller turns this into `Command::ClearStaging`.
     pub(crate) clear_staging: bool,
+    /// Whether the staging viewport's own **Stage a file…** button was clicked this
+    /// frame. The caller turns this into opening the file dialog with
+    /// `Purpose::Stage`, the same as the toolbar's button used to.
+    pub(crate) stage_requested: bool,
+    /// Whether the staging viewport's **Select All** button was clicked this frame.
+    /// The caller turns this into `Command::SetStagedSelection` naming every page
+    /// of the staged document, the same command an agent would send.
+    pub(crate) select_all_staged: bool,
 }
 
 /// Draws the grid, reporting what it drew.
@@ -682,8 +694,21 @@ fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
         let response = right.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Merge from").strong());
-                // Only offered once something is staged — closing an empty pane
-                // would have nothing to close.
+                // Both offered only once something is staged — nothing to select or
+                // close before then.
+                if grid.staged.is_some()
+                    && let Some(()) = small_button(
+                        ui,
+                        Action {
+                            text: "Select All",
+                            hover: "Pick out every page of the staged document, \
+                                    ready to drag into place on the left",
+                            produces: Some(()),
+                        },
+                    )
+                {
+                    drawn.select_all_staged = true;
+                }
                 if grid.staged.is_some()
                     && let Some(()) = small_button(
                         ui,
@@ -714,6 +739,21 @@ fn draw_merge(ui: &mut egui::Ui, grid: &mut Grid<'_>, drawn: &mut Drawn) {
                 drawn.showing.extend(outcome.showing);
             } else {
                 ui.label("Open a second PDF to merge pages from it.");
+                // Beside the placeholder rather than on the toolbar: staging is only
+                // ever meaningful from inside the merge tab, so the button that
+                // starts it belongs where the pages it stages will appear.
+                if button(
+                    ui,
+                    Action {
+                        text: "Stage a file…",
+                        hover: "Open a second PDF, to drag its pages into place on the left",
+                        produces: (!grid.picker_open).then_some(()),
+                    },
+                )
+                .is_some()
+                {
+                    drawn.stage_requested = true;
+                }
             }
         });
         drawn.staging_rect = Some(response.response.rect);

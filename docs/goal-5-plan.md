@@ -668,12 +668,15 @@ disambiguate. An agent scripting a merge without ever touching the staging viewp
 already can, unchanged, via `InsertFile` (M22); this is a second, more precise way
 to reach a similar effect, not a replacement for the first.
 
-**Producers:** the drag itself; a "Stage a file…" button beside the toolbar's
-existing "Add pages…," reusing `FilePicker` with a third `Purpose::Stage`; a file
-dropped directly onto the staging viewport's own rectangle, a third zone for
-`drop_action` to recognize alongside "onto the grid" and "elsewhere" (the exact
-precedent §6 already set for telling `Insert` from `Open` by drop position); and a
-close control on the staging viewport for `ClearStaging`.
+**Producers:** the drag itself; a "Stage a file…" button, reusing `FilePicker`
+with a third `Purpose::Stage` — placed in the staging viewport's own placeholder
+rather than on the toolbar (moved there after M28 shipped it beside "Add pages…";
+staging is only ever meaningful from inside the merge tab, so the button that
+starts it belongs where the pages it stages will appear); a file dropped directly
+onto the staging viewport's own rectangle, a third zone for `drop_action` to
+recognize alongside "onto the grid" and "elsewhere" (the exact precedent §6
+already set for telling `Insert` from `Open` by drop position); and a close
+control on the staging viewport for `ClearStaging`.
 
 ### 10.7 Wiring
 
@@ -919,3 +922,40 @@ test" claims corrected above) and two small duplications (`PageOrder::append`/
 `draw_single_grid`/`draw_staged_grid`) — none behavior-changing, recorded here
 because a plan document going stale the moment a review looks past it is the
 same problem in miniature.
+
+### 10.11 Select All, and a deliberate break from §10.6's own precedent
+
+Added after "done": a **Select All** button in the staging viewport, next to its
+close control, picking out every page of the staged document at once — the
+mouse convenience for what was previously only reachable one page (or one
+marquee) at a time.
+
+Unlike `staging_selection` itself, this shipped as a real command,
+`Command::SetStagedSelection { path, pages }`, decided against the option of
+leaving it a click-only UI update. The reasoning §10.6 gave for
+`staging_selection` staying outside the command model — "nothing else consults
+what is currently selected in the staging pane" — still holds; what changed is
+that a person clicking **Select All** and an agent asking for the same thing
+are, this time, the same request, so the button dispatches the command rather
+than writing `staging_selection` directly.
+
+It also breaks `InsertPages`'s own precedent of naming no document at all,
+because "there is exactly one staging slot, so nothing else to disambiguate."
+`SetStagedSelection` takes `path` anyway: staging more than one document at a
+time is explicitly on the table for later, and a command whose shape already
+names *which* staged document it means keeps meaning the same thing once there
+is more than one to choose from — where `InsertPages`'s implicit "the staged
+document" would need to change shape or grow ambiguous. Today, with exactly one
+slot, `path` is validated against it and a mismatch is refused rather than
+silently applied to whatever happens to be staged — which also catches a stale
+request left over from before a `clear_staging`/`stage_document` swap.
+
+`Snapshot` gained `staged_selection`, mirroring `selection`, so an agent can
+read back what **Select All** — or its own `set_staged_selection` call — left
+picked out. Verified past the unit level by
+`an_agent_can_select_all_of_the_staged_documents_pages`: stage, refuse a
+mismatched path, select all three pages, confirm `unchanged` on repeating it,
+clear the selection with an empty list, and confirm `nothing is staged` once
+`clear_staging` runs. A screenshot taken the same way as every other milestone
+here confirmed the button's placement and the selection highlight rendering
+across all three staged pages.

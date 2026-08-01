@@ -139,6 +139,23 @@ pub(crate) enum Command {
         /// The pages to pick out, counting from 1.
         pages: Vec<PageNumber>,
     },
+    /// Pick out pages of the staged document, replacing whatever was picked there
+    /// before — the staging pane's own equivalent of [`Self::SetSelection`]. An
+    /// empty list clears it.
+    ///
+    /// Names the staged document by `path` rather than leaving it implicit the way
+    /// [`Self::InsertPages`] does: today there is exactly one staging slot, so the
+    /// two are equivalent in practice, but a stale request naming the wrong
+    /// document is refused rather than silently picking whatever happens to be
+    /// staged now — and the same shape keeps working if staging more than one
+    /// document at a time is ever supported. See `docs/goal-5-plan.md` §10.6.
+    SetStagedSelection {
+        /// The staged document this is about. Refused if it does not match what
+        /// is actually staged.
+        path: PathBuf,
+        /// The pages to pick out, counting from 1.
+        pages: Vec<PageNumber>,
+    },
     /// Undo the last page edit.
     Undo,
     /// Write the edited document over the file it came from.
@@ -200,6 +217,7 @@ impl Command {
             Self::DeletePages { .. } => "delete_pages",
             Self::SetPageFilter { .. } => "set_page_filter",
             Self::SetSelection { .. } => "set_selection",
+            Self::SetStagedSelection { .. } => "set_staged_selection",
             Self::Undo => "undo",
             Self::Save => "save",
             Self::SaveAs { .. } => "save_as",
@@ -257,6 +275,10 @@ impl Command {
                 query: String::new(),
             },
             Self::SetSelection {
+                pages: vec![PageNumber::FIRST],
+            },
+            Self::SetStagedSelection {
+                path: placeholder(),
                 pages: vec![PageNumber::FIRST],
             },
             Self::Undo,
@@ -330,6 +352,14 @@ mod tests {
             .name(),
             "insert_pages"
         );
+        assert_eq!(
+            Command::SetStagedSelection {
+                path: PathBuf::from("d.pdf"),
+                pages: vec![PageNumber::FIRST],
+            }
+            .name(),
+            "set_staged_selection"
+        );
         assert_eq!(Command::Quit.name(), "quit");
     }
 
@@ -363,6 +393,7 @@ mod tests {
                 | Command::DeletePages { .. }
                 | Command::SetPageFilter { .. }
                 | Command::SetSelection { .. }
+                | Command::SetStagedSelection { .. }
                 | Command::Undo
                 | Command::Save
                 | Command::SaveAs { .. }
@@ -377,7 +408,7 @@ mod tests {
         // slip through, so count them.
         assert_eq!(
             listed.len(),
-            20,
+            21,
             "shell_commands has {} entries; update this count deliberately",
             listed.len()
         );

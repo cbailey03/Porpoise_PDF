@@ -152,22 +152,6 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         {
             open_picker = Some(Purpose::Insert);
         }
-
-        // Reuses the same dialog too. The result lands in the merge tab's staging
-        // viewport rather than at the end of the document — see
-        // `docs/goal-5-plan.md` §10.6.
-        if button(
-            ui,
-            Action {
-                text: "Stage a file…",
-                hover: "Open a second PDF in the Merge tab, to drag its pages into place",
-                produces: (state.document_open && !state.picker_open).then_some(()),
-            },
-        )
-        .is_some()
-        {
-            open_picker = Some(Purpose::Stage);
-        }
         ui.separator();
 
         commands.extend(toggle(

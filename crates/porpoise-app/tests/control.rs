@@ -921,6 +921,137 @@ fn an_agent_can_stage_a_document_and_insert_its_pages_and_save_it() {
 }
 
 #[test]
+fn an_agent_can_select_all_of_the_staged_documents_pages() {
+    // `set_staged_selection` (`docs/goal-5-plan.md` §10.6): the merge tab's
+    // "Select All" button and an agent's equivalent request go through the
+    // identical command. Named by `path` rather than left implicit the way
+    // `insert_pages` is — see the command's own doc comment — so this also
+    // proves a request naming the wrong document is refused rather than
+    // silently picking out whatever happens to be staged.
+    let primary = fixture_of("e2e-select-all-primary.pdf", 2);
+    let staged = fixture_of("e2e-select-all-staged.pdf", 3);
+
+    let mut serve = Serve::start(&primary);
+    serve.wait_for_event("idle");
+
+    let staged_selection = |serve: &mut Serve| -> Vec<u64> {
+        serve
+            .snapshot()
+            .get("staged_selection")
+            .and_then(Value::as_array)
+            .map(|pages| pages.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+
+    let id = serve.send(
+        "stage_document",
+        &[("path", Value::from(staged.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert!(
+        staged_selection(&mut serve).is_empty(),
+        "something was picked out right after staging"
+    );
+
+    // Naming a document other than the one actually staged is refused, not
+    // silently applied to whatever is staged instead.
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("path", Value::from(primary.to_string_lossy().as_ref())),
+            ("pages", Value::from(vec![1])),
+        ],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(false));
+    assert!(
+        reply
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("is staged")),
+        "unexpected error: {reply}"
+    );
+    assert!(
+        staged_selection(&mut serve).is_empty(),
+        "the refused request still picked something out"
+    );
+
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("pages", Value::from(vec![1, 2, 3])),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed"),
+        "set_staged_selection did not report a change"
+    );
+    assert_eq!(
+        staged_selection(&mut serve),
+        vec![1, 2, 3],
+        "every staged page should be picked out"
+    );
+
+    // Asking for the same selection again is `unchanged`, the same convention
+    // every other toggle here follows for "already true".
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("pages", Value::from(vec![1, 2, 3])),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("unchanged")
+    );
+
+    // An empty list clears it, the same as `set_selection` does for the main grid.
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("pages", Value::from(Vec::<i64>::new())),
+        ],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    assert!(staged_selection(&mut serve).is_empty());
+
+    // Nothing staged at all is refused too, not just a mismatched path.
+    let id = serve.send("clear_staging", &[]);
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("changed")
+    );
+    let id = serve.send(
+        "set_staged_selection",
+        &[
+            ("path", Value::from(staged.to_string_lossy().as_ref())),
+            ("pages", Value::from(vec![1])),
+        ],
+    );
+    let reply = serve.reply_to(id);
+    assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(false));
+    assert!(
+        reply
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("nothing is staged")),
+        "unexpected error: {reply}"
+    );
+
+    serve.quit();
+}
+
+#[test]
 fn staging_a_document_with_nothing_open_is_refused() {
     let Some(_window) = e2e("staging_a_document_with_nothing_open_is_refused") else {
         return;

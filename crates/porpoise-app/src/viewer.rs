@@ -82,6 +82,7 @@ use crate::input::{
     opens_the_picker, wheel_is_for_the_pages,
 };
 use crate::label::file_label;
+use crate::navigation::Navigation;
 use crate::picker::FilePicker;
 use crate::protocol::{Event, Reply, RequestBody, Snapshot};
 use crate::queue::RenderQueue;
@@ -1071,6 +1072,18 @@ impl Viewer {
         })
     }
 
+    /// Where the reader is, and which moves from there are possible.
+    ///
+    /// Read from the same two values [`Self::edits`] already takes, one frame at a time.
+    /// See [`crate::navigation`] for why the toolbar is handed this rather than the page
+    /// count itself.
+    fn navigation(&self) -> Navigation {
+        Navigation::available(
+            PageNumber::from_index(self.view().current_page()),
+            self.open.as_ref().map_or(0, |open| open.order.len()),
+        )
+    }
+
     /// Sends a gesture's intended selection through the command channel.
     ///
     /// The gestures work out *which* pages they want by asking [`Selection`], then hand
@@ -1730,10 +1743,12 @@ impl Viewer {
     /// Draws the toolbar and dispatches whatever was clicked.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         let edits = self.edits();
+        let navigation = self.navigation();
         let clicked = chrome::toolbar(
             ui,
             &chrome::Toolbar {
                 edits: &edits,
+                navigation: &navigation,
                 zoom_target: self.state.zoom_target(),
                 scroll_mode: self.state.scroll_mode(),
                 thumbnails: self.thumbnails,

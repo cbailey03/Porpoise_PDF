@@ -12,7 +12,8 @@
 //! # Nothing here decides anything
 //!
 //! Each function is handed a decision made elsewhere and paints it. The toolbar is given
-//! [`Edits`]; the question box is given the sentence [`crate::confirm::Intent`] wrote; the
+//! [`Edits`] and [`Navigation`], never the page count it would have to reason about
+//! itself; the question box is given the sentence [`crate::confirm::Intent`] wrote; the
 //! drop hint is given the [`DropAction`] that the drop itself will use. That last one is
 //! load-bearing rather than tidy: the hint and the drop come from one decision, so the
 //! window cannot invite something it then refuses.
@@ -36,6 +37,7 @@ use crate::devtools::FrameTiming;
 use crate::edits::Edits;
 use crate::input::DropAction;
 use crate::label::file_label;
+use crate::navigation::Navigation;
 
 /// Point size of the text in the two overlays.
 const OVERLAY_TEXT_PT: f32 = 20.0;
@@ -46,6 +48,10 @@ pub(crate) struct Toolbar<'a> {
     /// enabled state *and* the command, so a lit button cannot mean something a key
     /// press does not. See [`crate::edits`].
     pub(crate) edits: &'a Edits,
+    /// Where the reader is and which moves that allows. Read the same way as `edits`,
+    /// and it carries the page number and count for any control that needs to show
+    /// them. See [`crate::navigation`].
+    pub(crate) navigation: &'a Navigation,
     pub(crate) zoom_target: ZoomTarget,
     pub(crate) scroll_mode: ScrollMode,
     /// Whether the page grid is showing, for the toggle's pressed look.
@@ -127,32 +133,56 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         }
         ui.separator();
 
-        // These two glyphs are in egui's bundled fonts. U+2191/U+2193 are not, and render
-        // as empty boxes, so check any new glyph against a capture of the real toolbar.
-        if ui.button("⏮").on_hover_text("First page (Home)").clicked() {
-            commands.push(ViewCommand::FirstPage.into());
-        }
-        if ui.button("⏭").on_hover_text("Last page (End)").clicked() {
-            commands.push(ViewCommand::LastPage.into());
-        }
+        // Navigation, in the order the four arrow keys sit on a keyboard: the ends
+        // outside, one page in. These glyphs are in egui's bundled fonts. U+2191/U+2193
+        // are not, and render as empty boxes, so check any new glyph against a capture
+        // of the real toolbar.
+        command_button(
+            ui,
+            &mut commands,
+            "⏮",
+            "First page (Home or Up)",
+            state.navigation.first.as_ref(),
+        );
+        command_button(
+            ui,
+            &mut commands,
+            "◀",
+            "Previous page (Left)",
+            state.navigation.previous.as_ref(),
+        );
+        command_button(
+            ui,
+            &mut commands,
+            "▶",
+            "Next page (Right)",
+            state.navigation.next.as_ref(),
+        );
+        command_button(
+            ui,
+            &mut commands,
+            "⏭",
+            "Last page (End or Down)",
+            state.navigation.last.as_ref(),
+        );
         ui.separator();
 
         // Page editing.
-        edit_button(
+        command_button(
             ui,
             &mut commands,
             "Delete",
             "Delete this page",
             state.edits.delete.as_ref(),
         );
-        edit_button(
+        command_button(
             ui,
             &mut commands,
             "Undo",
             "Undo the last page edit (Ctrl+Z)",
             state.edits.undo.as_ref(),
         );
-        edit_button(
+        command_button(
             ui,
             &mut commands,
             "Save",
@@ -215,11 +245,14 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
     }
 }
 
-/// One page-edit button, enabled exactly when there is a command for it.
+/// One toolbar button, enabled exactly when there is a command for it.
 ///
-/// The whole point of taking the command as the enabled state: a lit button and a live
-/// key binding cannot disagree, because they are the same `Option`.
-fn edit_button(
+/// The whole point of taking the command as the enabled state: for the page edits, a lit
+/// button and a live key binding cannot disagree, because they are the same `Option`.
+/// The navigation buttons share the helper but not that guarantee, on purpose — see
+/// [`crate::navigation`] for why the keyboard is allowed to fire a move this would grey
+/// out.
+fn command_button(
     ui: &mut egui::Ui,
     commands: &mut Vec<Command>,
     text: &str,

@@ -12,6 +12,7 @@ mod edits;
 mod failure;
 mod input;
 mod label;
+mod navigation;
 mod picker;
 mod protocol;
 mod queue;

@@ -42,9 +42,10 @@ driving the program from another process.
 | `Ctrl` `S` | Save over the original |
 | `PageDown` / `Space` | Next page, or next screenful in free mode |
 | `PageUp` / `Shift+Space` | Previous |
-| `Home` / `End` | First / last page |
-| `↑` / `↓` | Small scroll step, or the next page in paged mode |
-| `←` / `→` | Pan sideways, once zoomed in past the window's width |
+| `←` / `→` | Previous / next page, in either mode |
+| `Home` / `End`, or `↑` / `↓` | First / last page |
+| `Shift` `↑` / `Shift` `↓` | Small scroll step |
+| `Shift` `←` / `Shift` `→` | Pan sideways, once zoomed in past the window's width |
 | `Ctrl` + wheel, or pinch | Zoom |
 | `Ctrl` `+` / `Ctrl` `-` | Zoom by one step |
 | `Ctrl` `0` / `Ctrl` `1` / `Ctrl` `2` | Fit width / 100% / fit page |

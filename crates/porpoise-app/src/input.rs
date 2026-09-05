@@ -19,7 +19,10 @@ use crate::label::file_label;
 /// obvious nothing was skipped.
 pub(crate) const VIEWPORT_STEP_FRACTION: f64 = 0.9;
 
-/// How far an arrow key scrolls or pans, in PDF points.
+/// How far a shifted arrow key scrolls or pans, in PDF points.
+///
+/// Shifted because the bare arrows navigate between pages. This is the nudge for
+/// reading a page that is taller or wider than the window.
 pub(crate) const ARROW_STEP_PT: f64 = 48.0;
 
 /// A page edit asked for by a key press.
@@ -198,20 +201,29 @@ pub(crate) fn command_for_key(
         egui::Key::Space => advance(!modifiers.shift),
         egui::Key::Home => ViewCommand::FirstPage,
         egui::Key::End => ViewCommand::LastPage,
-        egui::Key::ArrowDown => ViewCommand::ScrollBy {
+        // Shift keeps what the bare arrows used to mean. The guarded arms come first:
+        // a bare `ArrowDown` below would otherwise shadow them.
+        egui::Key::ArrowDown if modifiers.shift => ViewCommand::ScrollBy {
             points: ARROW_STEP_PT,
         },
-        egui::Key::ArrowUp => ViewCommand::ScrollBy {
+        egui::Key::ArrowUp if modifiers.shift => ViewCommand::ScrollBy {
             points: -ARROW_STEP_PT,
         },
         // Rejected as `Unchanged` when the document fits the window, so these are
         // harmless at fit-width and useful the moment anyone zooms in.
-        egui::Key::ArrowRight => ViewCommand::PanBy {
+        egui::Key::ArrowRight if modifiers.shift => ViewCommand::PanBy {
             points: ARROW_STEP_PT,
         },
-        egui::Key::ArrowLeft => ViewCommand::PanBy {
+        egui::Key::ArrowLeft if modifiers.shift => ViewCommand::PanBy {
             points: -ARROW_STEP_PT,
         },
+        // The four bare arrows are the four toolbar buttons: sideways for one page,
+        // upright for the ends. Page-granular in both modes, unlike PageDown, which is
+        // why free mode gains a way to turn exactly one page.
+        egui::Key::ArrowRight => ViewCommand::NextPage,
+        egui::Key::ArrowLeft => ViewCommand::PreviousPage,
+        egui::Key::ArrowUp => ViewCommand::FirstPage,
+        egui::Key::ArrowDown => ViewCommand::LastPage,
         _ => return None,
     };
     Some(command.into())
@@ -380,6 +392,10 @@ mod tests {
 
     fn ctrl() -> egui::Modifiers {
         egui::Modifiers::CTRL
+    }
+
+    fn shift() -> egui::Modifiers {
+        egui::Modifiers::SHIFT
     }
 
     fn key(key: egui::Key, modifiers: egui::Modifiers, mode: ScrollMode) -> Option<Command> {
@@ -609,9 +625,39 @@ mod tests {
     }
 
     #[test]
-    fn arrows_scroll_a_small_fixed_step() {
+    fn sideways_arrows_turn_one_page_in_either_mode() {
+        // The only page-granular move free mode has from the keyboard: PageDown there
+        // is a screenful.
+        for mode in [ScrollMode::Free, ScrollMode::Paged] {
+            assert_eq!(
+                key(egui::Key::ArrowRight, none(), mode),
+                Some(ViewCommand::NextPage.into())
+            );
+            assert_eq!(
+                key(egui::Key::ArrowLeft, none(), mode),
+                Some(ViewCommand::PreviousPage.into())
+            );
+        }
+    }
+
+    #[test]
+    fn upright_arrows_are_a_second_spelling_of_home_and_end() {
+        for mode in [ScrollMode::Free, ScrollMode::Paged] {
+            assert_eq!(
+                key(egui::Key::ArrowUp, none(), mode),
+                key(egui::Key::Home, none(), mode)
+            );
+            assert_eq!(
+                key(egui::Key::ArrowDown, none(), mode),
+                key(egui::Key::End, none(), mode)
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_arrows_keep_the_small_scroll_step() {
         assert_eq!(
-            key(egui::Key::ArrowDown, none(), ScrollMode::Free),
+            key(egui::Key::ArrowDown, shift(), ScrollMode::Free),
             Some(
                 ViewCommand::ScrollBy {
                     points: ARROW_STEP_PT
@@ -620,7 +666,7 @@ mod tests {
             )
         );
         assert_eq!(
-            key(egui::Key::ArrowUp, none(), ScrollMode::Free),
+            key(egui::Key::ArrowUp, shift(), ScrollMode::Free),
             Some(
                 ViewCommand::ScrollBy {
                     points: -ARROW_STEP_PT
@@ -628,6 +674,42 @@ mod tests {
                 .into()
             )
         );
+    }
+
+    #[test]
+    fn shifted_sideways_arrows_keep_the_sideways_pan() {
+        assert_eq!(
+            key(egui::Key::ArrowRight, shift(), ScrollMode::Free),
+            Some(
+                ViewCommand::PanBy {
+                    points: ARROW_STEP_PT
+                }
+                .into()
+            )
+        );
+        assert_eq!(
+            key(egui::Key::ArrowLeft, shift(), ScrollMode::Free),
+            Some(
+                ViewCommand::PanBy {
+                    points: -ARROW_STEP_PT
+                }
+                .into()
+            )
+        );
+    }
+
+    #[test]
+    fn ctrl_arrows_belong_to_the_page_moves_and_produce_no_view_command() {
+        // Ctrl+Up and Ctrl+Down are `edit_for_key`'s. Ctrl+Left and Ctrl+Right are
+        // nobody's, and must not fall through to turning a page.
+        for k in [
+            egui::Key::ArrowUp,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+        ] {
+            assert_eq!(key(k, ctrl(), ScrollMode::Free), None, "{k:?} is bound");
+        }
     }
 
     #[test]
@@ -697,6 +779,12 @@ mod tests {
             (egui::Key::End, none()),
             (egui::Key::ArrowDown, none()),
             (egui::Key::ArrowUp, none()),
+            (egui::Key::ArrowLeft, none()),
+            (egui::Key::ArrowRight, none()),
+            (egui::Key::ArrowDown, shift()),
+            (egui::Key::ArrowUp, shift()),
+            (egui::Key::ArrowLeft, shift()),
+            (egui::Key::ArrowRight, shift()),
             (egui::Key::Plus, ctrl()),
             (egui::Key::Minus, ctrl()),
             (egui::Key::Num0, ctrl()),

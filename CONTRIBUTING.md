@@ -8,7 +8,16 @@ See [README.md](README.md) for what Porpoise PDF is and how to build and run it.
 checked as whoever made it. Removed deliberately while the commit rate is high; the workflow is in
 git history if it earns its place back.
 
-Run all of them before a commit that matters:
+Run all of them before a commit that matters. One command does that:
+
+```bash
+./scripts/check.sh
+```
+
+It keeps going after a failure and summarizes at the end, so one run tells you everything that is
+wrong instead of only the first thing. A check whose tool is not installed is reported as a failure
+with the command that installs it, never skipped quietly. The individual checks follow, in the order
+the script runs them.
 
 ```bash
 cargo fmt --all --check

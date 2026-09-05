@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 There is no CI: none of this runs automatically. Run what's relevant before a commit that matters.
 
 ```bash
+./scripts/check.sh                                                         # every check below, in one pass
+
 cargo build --workspace                                                    # build
 cargo run -p porpoise-app -- path/to/file.pdf                              # open the viewer
 cargo run -p porpoise-app -- info path/to/file.pdf                         # page count / geometry

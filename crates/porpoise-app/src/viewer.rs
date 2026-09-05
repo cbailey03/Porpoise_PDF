@@ -79,7 +79,7 @@ use crate::edits::{Edits, Situation};
 use crate::failure::Failure;
 use crate::input::{
     DropAction, EditKey, PageTurns, Wheel, command_for_key, drop_action, edit_for_key,
-    opens_the_picker, wheel_is_for_the_pages,
+    opens_the_picker, text_field_claims, wheel_is_for_the_pages,
 };
 use crate::label::file_label;
 use crate::navigation::Navigation;
@@ -1032,12 +1032,22 @@ impl Viewer {
         }
 
         let mode = self.state.scroll_mode();
+        // Read once, before the loop takes `&mut self`. True from the frame after the
+        // page grid's search box is clicked until focus leaves it: egui keeps focus in
+        // memory between frames, so this is the state the key was pressed in.
+        let typing = ctx.text_edit_focused();
         for (key, modifiers) in pressed {
+            // Everything unmodified belongs to the box while it has focus, so typing a
+            // page filter cannot also drive the viewer. See [`text_field_claims`].
+            if typing && text_field_claims(modifiers) {
+                continue;
+            }
             // Ctrl+O is handled here rather than in `command_for_key`, and the reason
             // is the point of the design: opening the dialog is not a command. That
             // function's whole job is to turn a key into one, so a key that instead
             // asks a person a question does not belong in it.
             if opens_the_picker(key, modifiers) {
+                Self::consume_key(ctx, typing, key);
                 self.picker.open();
                 continue;
             }
@@ -1045,15 +1055,38 @@ impl Viewer {
             // they need to know which page is on screen, and that function is pure by
             // design. It decides *what was asked for*; this turns it into a command.
             if let Some(edit) = edit_for_key(key, modifiers) {
+                Self::consume_key(ctx, typing, key);
                 if let Some(command) = self.command_for_edit(edit) {
                     self.dispatch(ctx, command);
                 }
                 continue;
             }
             if let Some(command) = command_for_key(key, modifiers, mode) {
+                Self::consume_key(ctx, typing, key);
                 self.dispatch(ctx, command);
             }
         }
+    }
+
+    /// Takes a key press out of the rest of the frame, when a text field would otherwise
+    /// act on it too.
+    ///
+    /// The other half of the rule in [`text_field_claims`]. `logic` runs before `ui`, so
+    /// removing the event here is enough: egui's `TextEdit` reads the same list further
+    /// down the frame, through a non-destructive filter that would otherwise let one
+    /// `Ctrl+Z` undo a page edit *and* the typing in the box at the same moment.
+    ///
+    /// Called only on keys that produced something, which is what leaves `Ctrl+C` and
+    /// `Ctrl+V` — bindings this program does not have — working in the box.
+    fn consume_key(ctx: &egui::Context, typing: bool, key: egui::Key) {
+        if !typing {
+            return;
+        }
+        ctx.input_mut(|input| {
+            input.events.retain(
+                |event| !matches!(event, egui::Event::Key { key: sent, .. } if *sent == key),
+            );
+        });
     }
 
     /// Which page edits are possible right now.
@@ -1979,5 +2012,105 @@ impl eframe::App for Viewer {
         // Our own cost, as distinct from the frame interval. If this stays well
         // under the frame budget, the pipeline has headroom.
         self.timing.ui_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Only the two pieces of the typing gate that a bare `egui::Context` can answer. The
+    // frame loop still needs a window and is still untested here; these cover the
+    // mechanism it leans on, which is the part that would fail silently.
+    use super::*;
+
+    fn ctrl_z() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..egui::RawInput::default()
+        }
+    }
+
+    /// What is left of a frame's events after `body` has run, in the order the real
+    /// program does it: `begin_pass` is what `logic` sees, and the widgets are drawn
+    /// after.
+    fn events_after(input: egui::RawInput, body: impl FnOnce(&egui::Context)) -> Vec<egui::Event> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(input);
+        body(&ctx);
+        let left = ctx.input(|state| state.events.clone());
+        let _ = ctx.end_pass();
+        left
+    }
+
+    /// Runs two passes over `widget`, asking for focus on the first.
+    ///
+    /// Two because egui grants focus for the pass after the one that asks.
+    fn with_focus(mut widget: impl FnMut(&mut egui::Ui) -> egui::Response) -> egui::Context {
+        let ctx = egui::Context::default();
+        for pass in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let response = widget(ui);
+                if pass == 0 {
+                    response.request_focus();
+                }
+            });
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_consumed_key_is_gone_from_the_rest_of_the_frame() {
+        // The claim the whole design rests on: `ui` runs after `logic`, and egui's
+        // TextEdit reads this same list, so taking the event out here is what stops one
+        // Ctrl+Z from undoing a page edit and the typing at the same moment.
+        let left = events_after(ctrl_z(), |ctx| Viewer::consume_key(ctx, true, egui::Key::Z));
+
+        assert!(left.is_empty(), "a text field would still see {left:?}");
+    }
+
+    #[test]
+    fn a_key_is_left_alone_when_nothing_is_being_typed_into() {
+        let left = events_after(ctrl_z(), |ctx| {
+            Viewer::consume_key(ctx, false, egui::Key::Z)
+        });
+
+        assert_eq!(
+            left.len(),
+            1,
+            "with no text field there is nothing to take it from"
+        );
+    }
+
+    #[test]
+    fn a_focused_text_field_is_what_the_gate_reads() {
+        let mut text = String::new();
+        let ctx = with_focus(|ui| ui.add(egui::TextEdit::singleline(&mut text)));
+
+        assert!(
+            ctx.text_edit_focused(),
+            "the gate cannot see the search box"
+        );
+    }
+
+    #[test]
+    fn a_focused_button_is_not_typing() {
+        // Why the gate reads `text_edit_focused` and not `egui_wants_keyboard_input`:
+        // the latter is true for *any* focused widget, so one press of Tab onto a
+        // toolbar button would have silenced every binding in the program.
+        let ctx = with_focus(|ui| ui.button("Open…"));
+
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "this test only means something while the button really has focus"
+        );
+        assert!(
+            !ctx.text_edit_focused(),
+            "a focused button must not silence the keyboard"
+        );
     }
 }

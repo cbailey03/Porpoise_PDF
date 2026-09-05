@@ -62,6 +62,24 @@ pub(crate) fn edit_for_key(key: egui::Key, modifiers: egui::Modifiers) -> Option
     }
 }
 
+/// Whether a focused text field owns this key press rather than the viewer.
+///
+/// The rule is the whole of it: **everything unmodified belongs to the field, every
+/// `Ctrl`/`Cmd` binding belongs to the program.** So typing a page filter cannot turn a
+/// page, and `Ctrl+S` still saves without clicking out of the box first.
+///
+/// The `Ctrl` half costs the field two things egui would otherwise do with those keys:
+/// its own undo, and `Cmd` plus an arrow to jump the caret to either end. Both are worth
+/// giving up here. The only text field in the program holds a page filter like `1,4,7`,
+/// and a `Ctrl+Z` that undid a page edit everywhere except in that box would be the more
+/// surprising of the two rules.
+///
+/// Takes only the modifiers, because no key is an exception today. A key that needed to
+/// be one would change this signature, and that is the right amount of friction.
+pub(crate) fn text_field_claims(modifiers: egui::Modifiers) -> bool {
+    !(modifiers.command || modifiers.ctrl)
+}
+
 /// Whether this key press asks for the file dialog.
 ///
 /// Separate from [`command_for_key`] because the dialog is not a command — see
@@ -400,6 +418,30 @@ mod tests {
 
     fn key(key: egui::Key, modifiers: egui::Modifiers, mode: ScrollMode) -> Option<Command> {
         command_for_key(key, modifiers, mode)
+    }
+
+    #[test]
+    fn a_focused_text_field_claims_the_keys_that_type() {
+        assert!(text_field_claims(none()), "an unmodified key is typing");
+        // The interesting one: shift is selection in a text field, and the shifted
+        // arrows are the viewer's scroll and pan. The field wins while it has focus.
+        assert!(text_field_claims(shift()), "shift is still typing");
+    }
+
+    #[test]
+    fn a_focused_text_field_leaves_the_ctrl_bindings_alone() {
+        assert!(
+            !text_field_claims(ctrl()),
+            "Ctrl+Z, Ctrl+S and friends are the program's"
+        );
+        assert!(
+            !text_field_claims(egui::Modifiers::COMMAND),
+            "cmd on a Mac is the same binding as ctrl elsewhere"
+        );
+        assert!(
+            !text_field_claims(egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            "adding shift does not hand a Ctrl binding back to the field"
+        );
     }
 
     #[test]

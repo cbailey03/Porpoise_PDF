@@ -50,6 +50,10 @@ driving the program from another process.
 | `Ctrl` `+` / `Ctrl` `-` | Zoom by one step |
 | `Ctrl` `0` / `Ctrl` `1` / `Ctrl` `2` | Fit width / 100% / fit page |
 
+While the page grid's search box has focus, every unmodified key types into it and the `Ctrl`
+bindings above still reach the viewer. So `Ctrl` `Z` undoes a page edit rather than your typing,
+and `Ctrl` `S` saves without clicking out of the box first.
+
 ## Crates
 
 | Crate | Role |

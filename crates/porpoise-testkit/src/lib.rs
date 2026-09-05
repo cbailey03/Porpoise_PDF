@@ -274,6 +274,104 @@ pub fn pdf_with_page_sizes(sizes: &[(u32, u32)]) -> Vec<u8> {
         objects.push(stream_object);
     }
 
+    assemble(&objects)
+}
+
+/// Synthesizes a valid PDF whose page tree has two branches instead of one flat list.
+///
+/// Four pages: the first two under one branch, the last two under another. No page
+/// defines `/MediaBox`, `/Rotate` or `/Resources` itself, and neither does the root,
+/// so every page depends on inheriting all three from the branch above it. The two
+/// branches disagree about all three.
+///
+/// That disagreement is the whole point. Flattening this tree without carrying the
+/// inherited attributes down gives a document that still opens and still reports four
+/// pages, while every page from the second branch quietly comes out the wrong size and
+/// the wrong way up. A fixture whose branches agreed could not tell that apart from a
+/// correct save.
+#[must_use]
+pub fn nested_page_tree_pdf() -> Vec<u8> {
+    // Width, height and rotation per branch, deliberately different in every field.
+    let branches = [(200_u32, 100_u32, 0_i64), (300, 150, 90)];
+    let per_branch = 2;
+    let pages = branches.len() * per_branch;
+
+    // Objects 1 and 2 are the catalog and the root; 3 and 4 are the branches; each
+    // page then takes two objects, a page dictionary followed by its content stream.
+    let first_branch_object = 3;
+    let first_page_object = first_branch_object + branches.len();
+
+    let branch_refs: Vec<String> = (0..branches.len())
+        .map(|branch| format!("{} 0 R", first_branch_object + branch))
+        .collect();
+
+    let mut objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+            branch_refs.join(" ")
+        )
+        .into_bytes(),
+    ];
+
+    for (branch, &(width_pt, height_pt, rotate)) in branches.iter().enumerate() {
+        let kids: Vec<String> = (0..per_branch)
+            .map(|slot| {
+                let index = branch * per_branch + slot;
+                format!("{} 0 R", first_page_object + index * 2)
+            })
+            .collect();
+        objects.push(
+            format!(
+                "<< /Type /Pages /Parent 2 0 R /Kids [{}] /Count {per_branch} \
+                 /MediaBox [0 0 {width_pt} {height_pt}] /Rotate {rotate} /Resources << >> >>",
+                kids.join(" ")
+            )
+            .into_bytes(),
+        );
+    }
+
+    for (branch, &(width_pt, height_pt, _)) in branches.iter().enumerate() {
+        for slot in 0..per_branch {
+            let index = branch * per_branch + slot;
+            let page_object = first_page_object + index * 2;
+            let content_object = page_object + 1;
+            let branch_object = first_branch_object + branch;
+
+            // Shrink the rectangle a little per page so renders differ visibly, the
+            // same way the flat fixture does.
+            let inset = 20 + u32::try_from(index).unwrap_or(0) * 5;
+            let box_width = width_pt.saturating_sub(inset * 2).max(1);
+            let box_height = height_pt.saturating_sub(inset * 2).max(1);
+            let content =
+                format!("0 0 1 rg\n{inset} {inset} {box_width} {box_height} re\nf\n").into_bytes();
+
+            let mut stream_object =
+                format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+            stream_object.extend_from_slice(&content);
+            stream_object.extend_from_slice(b"\nendstream");
+
+            // No /MediaBox, /Rotate or /Resources here. Everything comes from above.
+            objects.push(
+                format!(
+                    "<< /Type /Page /Parent {branch_object} 0 R /Contents {content_object} 0 R >>"
+                )
+                .into_bytes(),
+            );
+            objects.push(stream_object);
+        }
+    }
+
+    assemble(&objects)
+}
+
+/// Wraps numbered object bodies in a header, a cross-reference table and a trailer.
+///
+/// Object `n` is written as `n 0 obj`, so a body referring to `3 0 R` means the third
+/// entry in `objects`. Offsets are computed from the assembled bytes rather than
+/// hardcoded, so this stays correct as the bodies change. Object 1 is taken as the
+/// catalog, because the trailer has to name a root.
+fn assemble(objects: &[Vec<u8>]) -> Vec<u8> {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n");
     // A comment line with high bytes marks the file as binary for tools that

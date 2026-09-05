@@ -9,6 +9,7 @@
 //! This is also the seam where `lopdf` joins for incremental save once the editor
 //! phase begins.
 
+mod inherit;
 mod order;
 mod save;
 

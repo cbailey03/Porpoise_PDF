@@ -23,8 +23,10 @@ driving the program from another process.
 - **Reorganize** supports picking several pages at once — click, `Ctrl+click`, `Shift+click`, or a
   drag box over empty space — and moves or deletes the whole group as one undo step.
 - Pages also reorder and delete from the toolbar or keyboard, with undo, then **Save** or **Save
-  As**. A save is atomic (written beside the file, then renamed into place); documents with a
-  nested page tree are refused rather than risk a silent mis-edit.
+  As**. A save is atomic (written beside the file, then renamed into place). A document whose page
+  tree is nested is flattened on the way out, with each page's inherited size, rotation and
+  resources written onto the page first, so moving a page between branches cannot change how it
+  renders.
 - Closing the window or opening another file with unsaved page changes **asks first** — save,
   discard, or cancel — the same whether a person or a script is driving.
 - **Paged** and **Free** view modes: one page at a time, or one continuous scroll.

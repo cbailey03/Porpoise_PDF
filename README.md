@@ -2,70 +2,32 @@
 
 A PDF viewer and editor written in Rust, with no C PDF or codec library in the shipped binary.
 
-See [GOALS.md](GOALS.md) for what we're building and
-[docs/goal-1-plan.md](docs/goal-1-plan.md) for the stack decisions, project structure, and
-milestone plan.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, checks, conventions, and
+driving the program from another process.
 
-**Current state: Goals 1 to 4 are complete.** Open a PDF, scroll it freely or page by page,
-navigate by keyboard, zoom by wheel, pinch, key, or fit mode, and pan sideways once a sheet is
-wider than the window. Pages rasterize on worker threads
-so the UI never waits: a 400-page drawing set sits at around 16 MB of cached page textures rather
-than four hundred pages' worth, and a synthetic scroll of 40 pages per second holds a 60 fps median
-with our own code using under 15% of the frame budget.
+## Features
 
-Hardened against damaged input: 4,000 deterministic mutations plus every possible truncation length
-of a valid PDF, all of which either open or return an error — none panic, none hang, and rejecting
-damaged input averages 7 µs.
-
-Open a file by dragging it onto the window, with `Ctrl+O` or the **Open…** button, or by passing a path
-on the command line. Launching with no path opens an empty window rather than refusing to start. While
-a file is held over the window, an overlay says what letting go will do — including whether it will stop
-to ask about unsaved page changes.
-
-`Ctrl+T` opens a grid of page thumbnails, with two tabs deciding what a click in it means:
-**Navigation** — the default — jumps the main view to the page you click, and **Reorganize** lets you
-pick pages out and drag them into a new order. Two modes rather than one gesture that guesses, so a
-click has exactly one meaning and a misfire while browsing cannot reorder the document.
-
-A search box above the tabs narrows the grid to the pages you name, in either tab: a number,
-a range like `5-9`, a list like `1,4,7`, or any mix. It filters as you type and never
-refuses input — a query it cannot read matches nothing and says so. This searches page
-*numbers*, not page text: a page-number search works on every document, while text search
-finds nothing on a scanned sheet or a CAD export that draws its labels as outlines. While
-the grid is narrowed, pages cannot be dragged — dropping one between two others with pages
-hidden between them has no meaning worth guessing at — but picking them out still works, so
-searching and then deleting is fine.
-
-In **Reorganize** you can work on several pages at once. Click a page to pick it, `Ctrl+click` to add
-or remove one, or `Shift+click` to take everything between it and the last one you picked. Dragging a
-box over empty space selects what it touches — from *empty* space, because a drag that starts on a page
-is that page moving. Dragging any picked page moves the whole group, which arrives together and in
-order however scattered it was, and **Delete** removes all of them. Either way it is one undo step, so
-`Ctrl+Z` puts the whole group back rather than one page of it. The status bar says how many pages are
-picked, since the grid can be scrolled away from them.
-
-Pages can also be reordered and
-deleted from the toolbar or the keyboard, with undo, then written back with **Save** or to a new file
-with `save_as`. Nothing on disk changes until you save, and a save either completes or leaves the
-original untouched — it writes beside the file and renames into place. Documents whose page tree is
-nested are
-refused rather than reordered, because reordering one can silently change what pages inherit; all
-three drawing sets tested here are flat. See `docs/goal-4-plan.md` section 2.
-
-Closing the window, or opening another file, with pages reordered and unsaved **asks first** — save,
-discard, or cancel. The question is guarded at the command rather than at the button, so an agent gets the
-same protection and answers it the same way; that is also what makes the whole flow testable. See
-`docs/goal-4-plan.md` section 8.
-
-**Paged** in the toolbar is a kind of view, not a key binding: the window shows one page, the scroll
-range is that page, and scrolling off either end turns to the next page or back to the previous one.
-A page taller than the window still scrolls within itself first. **Free** is one continuous column of
-every page. See `docs/goal-1-plan.md` section 6d.
-
-Rendering fidelity is validated against real documents and for determinism, not against another
-engine. Comparing output to PDFium is explicitly a non-goal: building this in pure Rust is the
-objective, so the C++ engine we declined is not the yardstick. See `docs/goal-1-plan.md`
-sections 1 and 6a.
+- **View**: scroll freely or page by page, navigate by keyboard, zoom by wheel, pinch, key, or fit
+  mode, and pan once a page is wider than the window. Pages rasterize on worker threads so the UI
+  never blocks — a 400-page drawing set holds about 16 MB of cached textures and scrolls at 40
+  pages/sec with a 60 fps median.
+- **Hardened against damaged input**: 4,000 deterministic mutations plus every truncation length of
+  a valid PDF all open or return an error — none panic, none hang — and rejecting damaged input
+  averages 7 µs.
+- **Open a file** by dragging it onto the window, `Ctrl+O`, the **Open…** button, or a path on the
+  command line. Launching with no path opens an empty window instead of refusing to start.
+- **`Ctrl+T`** opens a grid of page thumbnails with two tabs: **Navigation** jumps the main view to
+  a clicked page, **Reorganize** lets you pick pages and drag them into a new order. A search box
+  above narrows the grid by page number — a single number, a range like `5-9`, a list like
+  `1,4,7`, or any mix.
+- **Reorganize** supports picking several pages at once — click, `Ctrl+click`, `Shift+click`, or a
+  drag box over empty space — and moves or deletes the whole group as one undo step.
+- Pages also reorder and delete from the toolbar or keyboard, with undo, then **Save** or **Save
+  As**. A save is atomic (written beside the file, then renamed into place); documents with a
+  nested page tree are refused rather than risk a silent mis-edit.
+- Closing the window or opening another file with unsaved page changes **asks first** — save,
+  discard, or cancel — the same whether a person or a script is driving.
+- **Paged** and **Free** view modes: one page at a time, or one continuous scroll.
 
 ## Keys
 
@@ -129,149 +91,8 @@ Rasterize a page to a PNG:
 cargo run -p porpoise-app -- render path/to/file.pdf --page 1 --dpi 150 -o page1.png
 ```
 
-`--dpi` is a friendlier spelling of `--scale`, where `--scale 1.0` is 72 DPI; the two conflict and
+`--dpi` is a friendlier spelling of `--scale` (`--scale 1.0` is 72 DPI); the two conflict and
 cannot be combined.
-
-## Page numbers
-
-Page numbers start at 1 everywhere they are visible: the CLI, the status bar, the control protocol,
-and every event. There is no zero-based page number anywhere a person or an agent can see one, and
-`{"page":0}` is refused rather than quietly meaning page 1.
-
-Internally, page *indices* start at 0, because they index arrays. The two are separate types —
-`PageNumber` and `usize` — so converting between them has to be written down. That is not
-pedantry: the protocol shipped with `go_to_page` counting from 0 while `--start-page` counted from
-1, in the same program.
-
-## Driving it from another program
-
-Every effect in the viewer is reachable by a named command, so a script or an AI
-agent can operate it. `porpoise serve` opens a window and reads newline-delimited
-JSON on stdin, replying and reporting events on stdout:
-
-```bash
-porpoise serve document.pdf
-```
-
-```text
-in   {"id":1,"command":"go_to_page","page":4}
-out  {"id":1,"ok":true,"outcome":"changed"}
-out  {"event":"page_rendered","page":4}
-out  {"event":"idle"}
-in   {"id":2,"command":"capture","path":"page5.png"}
-out  {"id":2,"ok":true,"outcome":"capturing"}
-out  {"event":"captured","path":"page5.png"}
-```
-
-Send `{"command":"commands"}` for the full list and `{"command":"snapshot"}` for the
-current state. The file argument is optional — send `{"command":"open","path":"…"}`
-instead.
-
-Four things worth knowing:
-
-- **Wait for `idle` before capturing or asserting.** It means nothing is queued and
-  everything visible is drawn. Acting before it gets you placeholder tiles.
-- **Page numbers start at 1**, here and everywhere else. `{"page":0}` is refused.
-- **`quit`, `close` and `open` can come back `needs_answer`** when pages have been
-  reordered and not saved. Nothing has happened yet; read `awaiting_answer` in the
-  snapshot to see what is being asked, then reply with
-  `{"command":"answer","choice":"save"|"discard"|"cancel"}`. You get the same
-  protection a person does, for the same reason.
-- **Closing stdin exits the program**, the way every other stdio protocol behaves —
-  including with unsaved changes, because by then there is nobody left to ask.
-
-This is off unless you ask for it, and it is stdio only — no port is opened. Be
-clear about what you are granting: the controlling process can open any file you can
-read, see it rendered, and write a PNG anywhere you can write. It runs as you
-already, so this is not an escalation, but it is more than "a viewer". See
-`docs/goal-2-plan.md` section 5.
-
-## Diagnostics
-
-Warnings go to stderr, so they never mix with `info` and `render` output. Set `RUST_LOG` to a level
-to see more:
-
-```bash
-RUST_LOG=debug porpoise file.pdf
-```
-
-`trace`, `debug`, `info`, `warn` (the default), `error`, and `off` are understood. A per-target
-directive like `RUST_LOG=porpoise_render=debug` is *not* parsed — it falls back to the default rather
-than going silent — because supporting it means pulling regex machinery in to parse a filter string.
-
-## Untrusted input
-
-Two flags exist because a PDF is untrusted input, and both have sane defaults:
-
-- `--max-pixels` refuses a render above a pixel budget, defaulting to 64 megapixels. A page can
-  be within the per-axis limit on both axes and still be an absurd allocation — a 200x100 pt page
-  at 5000 DPI is 2.5 *billion* pixels — so the total is capped, not just the dimensions.
-- `--timeout-ms` gives up on a page after a time budget, defaulting to 10 seconds. Some malformed
-  documents make the interpreter loop rather than crash, and memory safety does not help there.
-
-## Checks
-
-**There is no CI.** These run locally, and nothing runs them for you — so a commit is only as
-checked as whoever made it. Removed deliberately while the commit rate is high; the workflow is in
-git history if it earns its place back.
-
-Run all of them before a commit that matters:
-
-```bash
-cargo fmt --all --check
-```
-
-```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-```bash
-cargo test --workspace --all-features
-```
-
-`cargo-deny` enforces the license allowlist and blocks the AGPL/GPL traps documented in
-`docs/goal-1-plan.md` section 6, along with C codec libraries:
-
-```bash
-cargo deny check bans licenses sources advisories
-```
-
-Three more that used to run only in CI, and are easy to forget for that reason.
-
-The end-to-end tests open a real window and are skipped unless asked for, so a plain `cargo test`
-reports them as passing without running them:
-
-```bash
-PORPOISE_E2E=1 cargo test --workspace --all-features
-```
-
-The oldest floor still has to build:
-
-```bash
-cargo +1.92 check --workspace --all-features --all-targets
-```
-
-And the one that guards this project's central claim — no C PDF or codec library in the shipped
-binary. `deny.toml` bans the known names, but this catches anything arriving by a new path, including
-a test-only dependency leaking out of `porpoise-testkit`:
-
-```bash
-cargo tree --package porpoise-app --edges normal | grep -iE "pdfium|mupdf|openjpeg|jpeg2k|jbig2dec|testkit"
-```
-
-No output is a pass.
-
-## Conventions
-
-- `unsafe_code` is `forbid`den workspace-wide. The security argument for this project rests on
-  memory safety, so it is a machine-checked invariant rather than an intention.
-- `unwrap`/`expect` warn in library code. Panicking on untrusted input is a denial-of-service
-  bug in a PDF viewer, not a style question.
-- Untrusted input is parsed and rasterized inside `catch_unwind`; a malformed page must degrade
-  to one broken page, never take down the process.
-- A page that times out is retried a bounded number of times, because a timeout usually means the
-  machine was busy. A page that panics or is refused for its size is not retried — that failure is
-  deterministic, so a retry only spends a worker to reach the same answer.
 
 ## License
 
@@ -282,11 +103,10 @@ Licensed under either of
 
 at your option.
 
-The dual license is the Rust ecosystem norm, and both halves earn their place here. Apache-2.0
-carries an explicit patent grant, which MIT lacks — that matters more than usual for a PDF
-implementation, since the format's image codecs have a long patent history. Offering MIT
-alongside it keeps the code usable by GPLv2 projects, which Apache-2.0 alone is incompatible
-with. It also matches `hayro`, our primary dependency.
+The dual license is the Rust ecosystem norm. Apache-2.0 adds an explicit patent grant, which
+matters more than usual here given PDF image codecs' long patent history; MIT keeps the code
+usable by GPLv2 projects that Apache-2.0 alone can't satisfy. It also matches `hayro`, the primary
+dependency.
 
 ### Contribution
 

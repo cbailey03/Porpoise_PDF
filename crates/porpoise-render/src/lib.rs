@@ -2,8 +2,7 @@
 //!
 //! Rendering sits behind the [`Renderer`] trait so that a future GPU backend,
 //! built on hayro's `Device` trait, slots in at the same seam — and so that the
-//! render pool can be driven by a stub in tests. See `docs/goal-1-plan.md`,
-//! sections 1 and 5.
+//! render pool can be driven by a stub in tests.
 //!
 //! # Untrusted input
 //!
@@ -456,7 +455,6 @@ impl Renderer for HayroRenderer {
 /// That is acceptable for a one-shot CLI render. It is *not* an adequate answer
 /// for the viewer, which needs a bounded worker pool so timeouts cannot pile up,
 /// and eventually a separate process so a hung render can actually be killed.
-/// Tracked in `docs/goal-1-plan.md`, section 2.
 pub fn render_with_timeout<R>(
     renderer: R,
     document: Arc<Document>,

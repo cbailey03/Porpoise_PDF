@@ -1,6 +1,6 @@
 //! The system file dialog, kept off the frame loop.
 //!
-//! See `docs/goal-3-plan.md`. Two things shape this module.
+//! Two things shape this module.
 //!
 //! **It must not block.** `rfd::FileDialog::pick_file` blocks until the person
 //! chooses, and calling that from `App::ui` freezes rendering — which breaks the one
@@ -15,7 +15,7 @@
 //! the toolbar as a *producer* of that command, and no `pick_file` exists on the
 //! control protocol. An agent already has `open` with a path, which is strictly more
 //! capable — and a `pick_file` without a programmatic cancel would let an agent enter
-//! a modal only a human could dismiss. See `docs/goal-3-plan.md` section 1.
+//! a modal only a human could dismiss.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};

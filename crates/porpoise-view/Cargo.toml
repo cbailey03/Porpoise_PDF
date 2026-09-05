@@ -12,7 +12,7 @@ publish.workspace = true
 porpoise-doc.workspace = true
 thiserror.workspace = true
 # Optional so the wire format stays the shell's concern; this crate is worth
-# keeping dependency-light. See docs/goal-2-plan.md, section 4.
+# keeping dependency-light.
 serde = { workspace = true, optional = true }
 
 [features]

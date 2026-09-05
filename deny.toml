@@ -1,10 +1,10 @@
 # cargo-deny configuration.
 #
 # Two jobs here. The first is the obvious one: keep copyleft out of the dependency
-# graph. The second is to mechanically enforce the pure-Rust architecture decision
-# from docs/goal-1-plan.md, section 1 — several of the bans below are permissively
-# licensed and banned anyway, because pulling in a C PDF or codec library would
-# quietly undo the security rationale for this project.
+# graph. The second is to mechanically enforce the pure-Rust architecture decision:
+# several of the bans below are permissively licensed and banned anyway, because
+# pulling in a C PDF or codec library would quietly undo the security rationale for
+# this project.
 
 [graph]
 targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]

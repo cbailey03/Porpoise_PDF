@@ -10,12 +10,11 @@
 //! - [`single_page_pdf`], which synthesizes a valid PDF in memory, so the core
 //!   pipeline can be tested in CI without vendoring any fixture files.
 //! - [`Mutator`], which damages that PDF in thousands of deterministic ways, so
-//!   the hardening claims in `docs/goal-1-plan.md` section 6a are measured rather
-//!   than asserted.
+//!   the hardening claims are measured rather than asserted.
 //! - [`pixel_diff`], which compares two rasterizations channel by channel. Used
 //!   to prove rendering is deterministic and that the threaded path produces the
 //!   same pixels as the direct one. Comparing against a second *engine* is
-//!   explicitly a non-goal; see `docs/goal-1-plan.md`, section 1.
+//!   explicitly a non-goal.
 
 use porpoise_render::RenderedPage;
 

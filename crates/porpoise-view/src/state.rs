@@ -23,7 +23,7 @@
 //! So a command does not move the view directly. It records a *request*, the shell
 //! hands that to egui, and the shell reports back where egui actually landed. That
 //! keeps [`apply`] pure and testable with no window, at the cost of a command
-//! taking effect on the next frame. See `docs/goal-2-plan.md`, section 2.
+//! taking effect on the next frame.
 
 use std::ops::Range;
 

@@ -8,8 +8,8 @@
 //! # It guards the command, not the gesture
 //!
 //! Everywhere else in this program a dialog is kept off the command surface, because a
-//! box only a person can dismiss is a box an agent can get stuck behind
-//! (`docs/goal-3-plan.md` §1). The obvious reading of that rule here would be to raise
+//! box only a person can dismiss is a box an agent can get stuck behind.
+//! The obvious reading of that rule here would be to raise
 //! the question from the X button, from `Ctrl+O`, and from a file drop — each producer
 //! checking for itself.
 //!

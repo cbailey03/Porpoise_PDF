@@ -21,8 +21,8 @@
 //! them would starve the pool with no way to recover. Going through
 //! [`render_with_timeout`] means a hang abandons one anonymous thread while the
 //! worker itself returns to the queue and stays useful. That leaks a thread per
-//! hang — the honest limitation described in `docs/goal-1-plan.md`, section 2,
-//! whose real fix is process isolation — but it keeps the pool alive.
+//! hang, an honest limitation whose real fix is process isolation, but it keeps
+//! the pool alive.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

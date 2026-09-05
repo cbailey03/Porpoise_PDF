@@ -749,7 +749,7 @@ impl Viewer {
         };
         // Saving an unedited document over itself would rewrite the file for no gain —
         // and not even byte-identically, since the writer makes its own choices about
-        // object encoding. See `docs/goal-4-plan.md` §5a.
+        // object encoding.
         //
         // Deliberately ahead of the busy check below, so "there is nothing to write" wins
         // over "a save is already running" when both are true. It is the more accurate of

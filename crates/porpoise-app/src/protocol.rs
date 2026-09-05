@@ -1,6 +1,6 @@
 //! The control protocol: newline-delimited JSON, one object per line.
 //!
-//! See `docs/goal-2-plan.md`, sections 3 and 4. The shape is deliberately small:
+//! The shape is deliberately small:
 //!
 //! ```text
 //! in   {"id":1,"command":"go_to_page","page":4}

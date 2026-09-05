@@ -1,8 +1,7 @@
 //! `porpoise` — command line entry point.
 //!
 //! Three ways in: a bare file path opens the viewer, `info` describes a document,
-//! and `render` rasterizes one page to a PNG. See `docs/goal-1-plan.md`,
-//! section 4.
+//! and `render` rasterizes one page to a PNG.
 
 mod chrome;
 mod command;

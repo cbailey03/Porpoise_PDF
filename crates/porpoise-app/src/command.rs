@@ -5,8 +5,6 @@
 //! is what keeps them testable. The commands here cannot make that claim: opening
 //! a file is I/O, capturing a window needs a window, and quitting needs an event
 //! loop. So they live in the shell and wrap the pure ones rather than joining them.
-//!
-//! See `docs/goal-2-plan.md`, section 2.
 
 use std::path::PathBuf;
 
@@ -113,7 +111,7 @@ pub(crate) enum Command {
     ///
     /// A command rather than a click-only toggle because it changes what is on screen,
     /// and unlike the file dialog an agent that opens it can also close it — so there is
-    /// no state it can enter and not leave. See `docs/goal-4-plan.md` §7.
+    /// no state it can enter and not leave.
     SetThumbnails {
         /// Whether the grid should be showing.
         visible: bool,

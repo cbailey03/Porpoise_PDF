@@ -7,7 +7,7 @@
 //! than in `porpoise-render`.
 //!
 //! This is also the seam where `lopdf` joins for incremental save once the editor
-//! phase begins. See `docs/goal-1-plan.md`, section 1.
+//! phase begins.
 
 mod order;
 mod save;

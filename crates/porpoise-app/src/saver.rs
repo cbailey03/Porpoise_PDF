@@ -1,7 +1,7 @@
 //! Saving, kept off the frame loop.
 //!
 //! Measured before deciding this was necessary: reversing the 400-page, 126 MB drawing
-//! set took **1.04 seconds** (`docs/goal-4-plan.md` §5a). Doing that inside `ui()`
+//! set took **1.04 seconds**. Doing that inside `ui()`
 //! would freeze the window for a second on every save, which is exactly the thing this
 //! viewer has avoided everywhere else.
 //!

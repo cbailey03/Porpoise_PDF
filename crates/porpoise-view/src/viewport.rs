@@ -2,8 +2,8 @@
 //!
 //! Its own module because "pixels" and "points" are the sharpest edge in this crate
 //! and deserve one place to look. Three bugs have come from confusing them: the
-//! pixels-versus-points scroll request in `docs/goal-2-plan.md` section 7a, and the
-//! scroll bound and visible-page count in section 7e.
+//! pixels-versus-points scroll request, and the scroll bound and visible-page
+//! count.
 
 /// The visible window, in the shell's layout pixels.
 ///
@@ -69,7 +69,7 @@ impl Viewport {
 /// reads perfectly and is correct at zoom 1.0, which is where most testing happens.
 /// At any other zoom it silently understates or overstates how far the document can
 /// scroll, and how many pages are on screen. Same family as the pixels-versus-points
-/// bug in `force_scroll`; see `docs/goal-2-plan.md` section 7a.
+/// bug in `force_scroll`.
 pub(crate) fn extent_pt(pixels: f64, zoom: f32) -> f64 {
     let zoom = f64::from(zoom);
     if zoom.is_finite() && zoom > 0.0 {

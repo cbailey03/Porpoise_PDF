@@ -16,10 +16,10 @@ porpoise-render = { path = "crates/porpoise-render" }
 porpoise-view = { path = "crates/porpoise-view" }
 porpoise-testkit = { path = "crates/porpoise-testkit" }
 
-# --- PDF: parsing and rendering (see docs/goal-1-plan.md, section 1) ---
+# --- PDF: parsing and rendering ---
 hayro = "0.7.1"
 hayro-syntax = "0.7.2"
-# Rewrites the page tree when saving a reordered document (docs/goal-4-plan.md).
+# Rewrites the page tree when saving a reordered document.
 #
 # `default-features = false` on purpose. The defaults pull in `rayon` — which this
 # workspace deliberately removed — plus three separate date libraries (`chrono`,
@@ -44,12 +44,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 clap = { version = "4.6", features = ["derive"] }
-# The system file dialog (docs/goal-3-plan.md, section 2). Default features are
+# The system file dialog. Default features are
 # `xdg-portal` on Linux, *not* `gtk3` — so `gtk-sys`, `glib-sys` and `gobject-sys`
 # stay out of the tree and the dialog is pure Rust. On Windows it is COM through
 # `windows-sys`, which eframe already pulls in, so it costs one crate: `pollster`.
 rfd = "0.17.2"
-# The control channel's wire format (docs/goal-2-plan.md, section 4). Both are
+# The control channel's wire format. Both are
 # already in the tree via the eframe stack, so this adds a direct edge rather
 # than new code.
 serde = { version = "1.0", features = ["derive"] }
@@ -69,7 +69,7 @@ unreachable_pub = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 # Panicking on untrusted input is a denial-of-service bug in this codebase, not a
-# style question. See docs/goal-1-plan.md, section 2.
+# style question.
 unwrap_used = "warn"
 expect_used = "warn"
 indexing_slicing = "warn"

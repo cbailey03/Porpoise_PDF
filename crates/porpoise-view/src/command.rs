@@ -6,8 +6,6 @@
 //! structural property rather than a maintained one: a click-only feature is
 //! unrepresentable, because clicks produce commands and commands are the surface.
 //!
-//! See `docs/goal-2-plan.md`, sections 1 and 2.
-//!
 //! # Effects, not gestures
 //!
 //! Commands name *effects*. They deliberately do not model input devices: there

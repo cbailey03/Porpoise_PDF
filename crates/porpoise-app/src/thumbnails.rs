@@ -32,7 +32,7 @@
 //! module adds a way to *author* an edit and no new capability, exactly like the file
 //! picker authoring an `open`. Whether the panel is showing is a different matter and
 //! does get a command, because it changes what is on screen and an agent that opens it
-//! can also close it. See `docs/goal-4-plan.md` §7.
+//! can also close it.
 //!
 //! Clicking a page to *go* to it is the same idea applied to `GoToPage`, and picking
 //! several out to move together is the same idea again: ctrl+click, shift+click and a

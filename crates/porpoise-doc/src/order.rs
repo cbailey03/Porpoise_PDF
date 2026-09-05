@@ -14,7 +14,7 @@
 //! codebase has been caught by that shape three times already — pixels versus PDF
 //! points, zero-based indices versus one-based numbers, screen units versus document
 //! units. Every crossing here goes through [`PageOrder::source_of`], and variables
-//! are named `position` or `source`, never `page`. See `docs/goal-4-plan.md` §3.
+//! are named `position` or `source`, never `page`.
 
 /// How many undo steps are remembered.
 ///

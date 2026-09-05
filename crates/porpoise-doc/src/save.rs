@@ -12,8 +12,7 @@
 //! mistake to disk. [`save_reordered`] refuses rather than guessing.
 //!
 //! Measured on three real drawing sets before relying on it: hayro and lopdf agreed on
-//! the page count for all three, and all three had flat page trees. See
-//! `docs/goal-4-plan.md` §2.
+//! the page count for all three, and all three had flat page trees.
 
 use std::path::{Path, PathBuf};
 

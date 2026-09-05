@@ -71,7 +71,7 @@ pub(crate) fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bo
 ///
 /// Like the file dialog, a drop is a **producer** of [`Command::Open`] rather than a
 /// command of its own — an agent already has `open` with a path, which is strictly more
-/// capable than a gesture. See `docs/goal-3-plan.md` §1.
+/// capable than a gesture.
 ///
 /// One decision serves two callers: the hint painted while the drag is still in the air
 /// and the open that happens when the button is released. Computing those separately

@@ -14,8 +14,6 @@
 //! controller already runs as the user — but it is meaningfully more than "a
 //! viewer", which is why it exists only when `porpoise serve` is invoked and never
 //! by default.
-//!
-//! See `docs/goal-2-plan.md`, section 5.
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};

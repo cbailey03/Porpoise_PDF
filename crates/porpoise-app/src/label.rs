@@ -32,11 +32,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_windows_path_shows_as_its_file_name() {
+        // Windows only, because a backslash is a separator there and an ordinary
+        // filename character everywhere else. Splitting on it regardless of host would
+        // label the real, openable Unix file `a\b.pdf` as `b.pdf`, which is a worse
+        // failure than leaving a foreign path untrimmed: the foreign path cannot be
+        // opened on this host anyway, so showing it whole says more than shortening it.
         assert_eq!(
             file_label(Path::new(r"C:\Users\me\Desktop\ROLT14_GDOT-U_6.pdf")),
             "ROLT14_GDOT-U_6.pdf"
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_backslash_is_part_of_the_name_rather_than_a_separator() {
+        // The other half of the decision above, asserted rather than left implied. This
+        // is a legal filename here, and a person who made it deserves to see it named.
+        assert_eq!(file_label(Path::new(r"plans/od\even.pdf")), r"od\even.pdf");
     }
 
     #[test]

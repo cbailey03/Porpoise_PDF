@@ -127,6 +127,8 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         }
         ui.separator();
 
+        // These two glyphs are in egui's bundled fonts. U+2191/U+2193 are not, and render
+        // as empty boxes, so check any new glyph against a capture of the real toolbar.
         if ui.button("⏮").on_hover_text("First page (Home)").clicked() {
             commands.push(ViewCommand::FirstPage.into());
         }
@@ -135,23 +137,7 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         }
         ui.separator();
 
-        // Page editing. Words rather than arrow glyphs: U+2191/U+2193 are missing from
-        // egui's bundled fonts and rendered as empty boxes — caught by looking at a
-        // capture of the real toolbar rather than by any test.
-        edit_button(
-            ui,
-            &mut commands,
-            "Up",
-            "Move this page earlier (Ctrl+Up)",
-            state.edits.move_earlier.as_ref(),
-        );
-        edit_button(
-            ui,
-            &mut commands,
-            "Down",
-            "Move this page later (Ctrl+Down)",
-            state.edits.move_later.as_ref(),
-        );
+        // Page editing.
         edit_button(
             ui,
             &mut commands,

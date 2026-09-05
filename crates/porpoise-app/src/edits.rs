@@ -41,9 +41,9 @@ pub(crate) struct Situation {
     pub(crate) thumbnails: bool,
     /// Pages picked out in the grid, ascending. Empty when nothing is picked.
     ///
-    /// Only **Delete** reads it. Moving stays anchored to the page in view, because the
-    /// toolbar's Up and Down mean "this page, one step" and a group move is a drag —
-    /// there is no sensible "one step" for five scattered pages.
+    /// Only **Delete** reads it. Moving stays anchored to the page in view, because
+    /// Ctrl+Up and Ctrl+Down mean "this page, one step" and a group move is a drag.
+    /// There is no sensible "one step" for five scattered pages.
     pub(crate) selection: Vec<PageNumber>,
 }
 
@@ -290,8 +290,9 @@ mod tests {
 
     #[test]
     fn a_selection_does_not_change_which_way_a_page_can_move() {
-        // Up and Down mean "this page, one step". There is no sensible one step for five
-        // scattered pages, so a group move is a drag and the buttons stay as they were.
+        // Ctrl+Up and Ctrl+Down mean "this page, one step". There is no sensible one
+        // step for five scattered pages, so a group move is a drag and the available
+        // moves stay as they were.
         let picked = Edits::available(Situation {
             selection: vec![page(2), page(8)],
             ..settled()

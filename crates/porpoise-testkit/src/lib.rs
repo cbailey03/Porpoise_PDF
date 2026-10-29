@@ -1,7 +1,7 @@
 //! Test fixtures and comparison helpers.
 //!
 //! This crate exists so that fixtures and comparison logic cannot leak into the
-//! shipped binary. Nothing here is reachable from `porpoise-app` — a `cargo tree`
+//! shipped binary. Nothing here is reachable from `porpoise-app` - a `cargo tree`
 //! check in the README's *Checks* section confirms it, though since CI was removed
 //! nothing runs that check unless somebody does.
 //!
@@ -218,7 +218,7 @@ pub fn multi_page_pdf(pages: usize, width_pt: u32, height_pt: u32) -> Vec<u8> {
 
 /// Synthesizes a valid PDF whose pages have the given sizes in points.
 ///
-/// Real PDFs mix page sizes freely, and several behaviours only appear when they do —
+/// Real PDFs mix page sizes freely, and several behaviours only appear when they do -
 /// fit-width takes the widest page, the scroll layout cannot assume a uniform height, and a
 /// page whose aspect ratio is extreme enough will exceed the renderer's pixel cap at every
 /// zoom, which is the only way to produce a deterministically unrenderable page.

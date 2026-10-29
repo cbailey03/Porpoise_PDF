@@ -7,11 +7,11 @@
 //!
 //! The keyboard and the toolbar used to work this out separately, and they had already
 //! drifted. `Ctrl+S` produced a `Save` unconditionally while the Save button was disabled
-//! during a save — so pressing the key twice on a large document put *"a save is already
+//! during a save - so pressing the key twice on a large document put *"a save is already
 //! running"* in the status bar, which the button could never do. Measured on the 400-page
 //! drawing set: the second `save` comes back `ok:false`.
 //!
-//! Harmless in itself — the message clears when the save lands — but it was two answers
+//! Harmless in itself - the message clears when the save lands - but it was two answers
 //! to one question, and that is how they drift further. Now there is one answer, and
 //! because it takes plain values rather than a borrow of the viewer, it is the first part
 //! of the toolbar's behaviour that has unit tests at all.
@@ -63,7 +63,7 @@ pub(crate) struct Edits {
     pub(crate) undo: Option<Command>,
     /// Write the changes over the file.
     pub(crate) save: Option<Command>,
-    /// Show or hide the page grid. Always possible — it needs no document and cannot
+    /// Show or hide the page grid. Always possible - it needs no document and cannot
     /// fail, which is also why an agent can never be stuck with it open.
     pub(crate) toggle_thumbnails: Command,
 }
@@ -98,7 +98,7 @@ impl Edits {
             // refuses it too, so this only spares the person a button that does nothing.
             //
             // With pages picked out in the grid, Delete acts on those instead of on the
-            // page in view — otherwise the highlight would be visibly ignored by the one
+            // page in view - otherwise the highlight would be visibly ignored by the one
             // button it obviously applies to. Deleting every page is refused for the same
             // reason deleting the last one is, and here that means not offering it.
             delete: match (open, selection.as_slice()) {

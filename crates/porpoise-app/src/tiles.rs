@@ -23,8 +23,8 @@ pub(crate) const FULL_UV: egui::Rect = egui::Rect {
 /// - `ColorImage::from_rgba_unmultiplied` *panics* on a length mismatch, and a
 ///   panic on the UI thread takes down the window.
 /// - `load_texture` hands the result to wgpu, which validates dimensions. A
-///   zero-width or zero-height image passes the length check trivially — zero
-///   bytes is exactly what `0 * h * 4` asks for — and then fails validation.
+///   zero-width or zero-height image passes the length check trivially - zero
+///   bytes is exactly what `0 * h * 4` asks for - and then fails validation.
 ///
 /// `HayroRenderer` refuses a sub-pixel page before either of these is reached, so
 /// neither case is reachable through the shipped renderer today. The guard does

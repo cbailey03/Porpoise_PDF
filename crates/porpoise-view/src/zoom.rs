@@ -20,7 +20,7 @@ const RUNGS_PER_OCTAVE: f32 = 8.0;
 /// a hair below the integer in floating point, so `ceil` climbs to the next rung,
 /// and every layout pass would zoom in a little further. The cost is that a zoom
 /// up to 0.1% above a rung snaps down to it, so a texture can be up to 0.1%
-/// smaller than its display size — invisible, and far better than drift.
+/// smaller than its display size - invisible, and far better than drift.
 const RUNG_SLACK: f32 = 1.0e-3;
 
 /// A zoom level snapped to the ladder.
@@ -37,7 +37,7 @@ impl ZoomBucket {
     /// pixels.
     ///
     /// `NaN` and non-positive input snap to [`MIN_SCALE`]. Note that positive
-    /// infinity clamps *up* to [`MAX_SCALE`] — it is an absurd zoom, not a
+    /// infinity clamps *up* to [`MAX_SCALE`] - it is an absurd zoom, not a
     /// degenerate one, and treating it as the floor would silently render a
     /// hugely magnified page at minimum resolution.
     #[must_use]

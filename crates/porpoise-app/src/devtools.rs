@@ -2,7 +2,7 @@
 //! capture for headless verification.
 //!
 //! None of this is part of the viewer. It lives in its own module because the
-//! alternative — which is what this started as — is a frame loop where the
+//! alternative - which is what this started as - is a frame loop where the
 //! measurement apparatus is interleaved with the thing being measured, and a
 //! `Viewer` where a quarter of the fields exist only for instrumentation. Neither
 //! reads well, and neither can be tested without opening a window.
@@ -40,7 +40,7 @@ pub(crate) struct FrameTiming {
 /// A scripted scroll used to measure frame times.
 ///
 /// Goal 1 asks for sustained 60 fps while scrolling, and every other check in
-/// this project is a static capture — which proves geometry and caching but says
+/// this project is a static capture - which proves geometry and caching but says
 /// nothing about behaviour under motion. This drives the scroll from code so the
 /// claim can actually be measured.
 pub(crate) struct ScrollBenchmark {
@@ -94,7 +94,7 @@ impl ScrollBenchmark {
 
     /// How many frames were actually measured, warmup excluded.
     ///
-    /// Only the tests need this — the report reads the sample vectors directly —
+    /// Only the tests need this - the report reads the sample vectors directly -
     /// so it is gated rather than left as a dead accessor in the shipped binary.
     #[cfg(test)]
     pub(crate) fn measured_frames(&self) -> usize {
@@ -108,7 +108,7 @@ impl ScrollBenchmark {
         print_percentiles("ui time", &self.ui_ms);
         print_percentiles("frame interval", &self.frame_ms);
         println!(
-            "  (discarded warmup: worst frame interval {:.2} ms — window and GPU setup)",
+            "  (discarded warmup: worst frame interval {:.2} ms - window and GPU setup)",
             self.warmup_worst_ms
         );
     }
@@ -128,7 +128,7 @@ pub(crate) struct Percentiles {
 
 /// Summarizes `samples`, or `None` if there are none.
 ///
-/// Uses nearest-rank on a sorted copy — no interpolation, so every reported value
+/// Uses nearest-rank on a sorted copy - no interpolation, so every reported value
 /// is a frame that actually happened.
 pub(crate) fn percentiles(samples: &[f32]) -> Option<Percentiles> {
     if samples.is_empty() {

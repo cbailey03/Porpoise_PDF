@@ -8,7 +8,7 @@
 //!
 //! Pages are opened and rasterized with `hayro`, which cannot write PDFs, so saving
 //! uses `lopdf`. The file is therefore parsed twice, and the two have to agree on
-//! what "page 3" is — if they disagree, a reorder moves the wrong page and writes the
+//! what "page 3" is - if they disagree, a reorder moves the wrong page and writes the
 //! mistake to disk. [`save_reordered`] refuses rather than guessing.
 //!
 //! Measured on three real drawing sets before relying on it: hayro and lopdf agreed on
@@ -85,7 +85,7 @@ pub enum SaveError {
 pub enum Overwrite {
     /// Replace whatever is there. What "Save" means.
     Allow,
-    /// Refuse if the destination exists. What "Save As" means — silently replacing
+    /// Refuse if the destination exists. What "Save As" means - silently replacing
     /// somebody's other file is how work gets lost.
     Refuse,
 }
@@ -180,7 +180,7 @@ pub fn save_reordered(
     tree.set("Count", Object::Integer(count));
 
     // Deleted pages are now unreferenced. Pruning keeps the file from carrying content
-    // the document no longer shows — which matters for more than size: a deleted page
+    // the document no longer shows - which matters for more than size: a deleted page
     // left in the file is still extractable.
     document.prune_objects();
 

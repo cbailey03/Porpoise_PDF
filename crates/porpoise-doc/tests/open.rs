@@ -1,7 +1,7 @@
 //! Direct coverage of this crate's own surface.
 //!
 //! Everything here was already exercised indirectly, through the render pipeline's
-//! tests — which meant `cargo test -p porpoise-doc` reported "0 passed" while the
+//! tests - which meant `cargo test -p porpoise-doc` reported "0 passed" while the
 //! behaviour was in fact well covered somewhere else. A green zero reads as "nothing
 //! to check", so these assert the things this crate promises on its own terms:
 //! geometry is available immediately on open, and every failure mode is an error

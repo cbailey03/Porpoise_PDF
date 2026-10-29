@@ -1,7 +1,7 @@
 //! The eframe window.
 //!
 //! The frame loop only ever polls for finished pages, submits requests for
-//! missing ones, and paints whatever the cache currently holds — it never waits
+//! missing ones, and paints whatever the cache currently holds - it never waits
 //! for a render. That is the whole reason scrolling can stay smooth while pages
 //! are still being drawn.
 //!
@@ -24,7 +24,7 @@
 //! toolbar click, and a message from an agent all produce a [`Command`], and
 //! [`Viewer::dispatch`] is the only thing that carries one out. That is what makes
 //! "every feature is programmatically controllable" structural rather than
-//! aspirational — there is no second way in to be forgotten about.
+//! aspirational - there is no second way in to be forgotten about.
 //!
 //! # What lives elsewhere
 //!
@@ -34,22 +34,22 @@
 //!
 //! | Module | What | Tested |
 //! |---|---|---|
-//! | [`crate::input`] | Key press or file drop to [`Command`] — pure | ✅ |
-//! | [`crate::edits`] | Which page edits are possible right now — pure | ✅ |
-//! | [`crate::confirm`] | Which commands would discard unsaved work — pure | ✅ |
-//! | [`crate::failure`] | Whether a failed render is worth retrying — pure policy | ✅ |
-//! | [`crate::label`] | How a path is shown in limited space — pure | ✅ |
-//! | [`crate::tiles`] | Rasterized page to egui texture — the GPU boundary | ✅ |
-//! | [`crate::picker`] | The file dialog, off the frame loop | ✅ |
-//! | [`crate::saver`] | Writing the document out, off the frame loop | ✅ |
-//! | [`crate::thumbnails`] | The page grid's arithmetic | ✅ |
-//! | [`crate::chrome`] | Toolbar, status bar and the two overlays — painting only | ❌ |
-//! | [`crate::devtools`] | Frame timing and window capture | ✅ |
+//! | [`crate::input`] | Key press or file drop to [`Command`] - pure | yes |
+//! | [`crate::edits`] | Which page edits are possible right now - pure | yes |
+//! | [`crate::confirm`] | Which commands would discard unsaved work - pure | yes |
+//! | [`crate::failure`] | Whether a failed render is worth retrying - pure policy | yes |
+//! | [`crate::label`] | How a path is shown in limited space - pure | yes |
+//! | [`crate::tiles`] | Rasterized page to egui texture - the GPU boundary | yes |
+//! | [`crate::picker`] | The file dialog, off the frame loop | yes |
+//! | [`crate::saver`] | Writing the document out, off the frame loop | yes |
+//! | [`crate::thumbnails`] | The page grid's arithmetic | yes |
+//! | [`crate::chrome`] | Toolbar, status bar and the two overlays - painting only | no |
+//! | [`crate::devtools`] | Frame timing and window capture | yes |
 //!
 //! [`crate::chrome`] is the one extraction that gained no tests, and that is honest
 //! rather than an oversight: it needs a live `egui::Context` exactly as this module does.
-//! It was moved for navigability. The part of the toolbar that *was* worth testing — which
-//! buttons should be live — went to [`crate::edits`] instead, and has tests.
+//! It was moved for navigability. The part of the toolbar that *was* worth testing - which
+//! buttons should be live - went to [`crate::edits`] instead, and has tests.
 //!
 //! What remains here has no unit tests either, for the same reason: everything left needs
 //! a live context, a GPU adapter, or both. It is covered by `tests/control.rs`, which
@@ -97,7 +97,7 @@ use crate::tiles::{FULL_UV, to_color_image};
 ///
 /// Goal 1 targets under 500 MB resident for a whole document, so this leaves
 /// headroom for everything else. In practice `retain_pages` keeps usage far below
-/// it — the budget is the backstop, not the mechanism.
+/// it - the budget is the backstop, not the mechanism.
 const TEXTURE_BUDGET_BYTES: usize = 192 << 20;
 
 /// Pages either side of the viewport to render speculatively.
@@ -105,8 +105,8 @@ const PREFETCH_PAGES: usize = 2;
 
 /// Pages either side of the viewport whose textures are kept.
 ///
-/// Wider than [`PREFETCH_PAGES`] so that reversing direction — a common thing to
-/// do — reuses a texture instead of re-rendering. Costs a few megabytes against a
+/// Wider than [`PREFETCH_PAGES`] so that reversing direction - a common thing to
+/// do - reuses a texture instead of re-rendering. Costs a few megabytes against a
 /// 192 MB budget.
 ///
 /// Note: this was originally widened on the theory that per-frame texture
@@ -134,7 +134,7 @@ const CAPTURE_BUDGET_FRAMES: u32 = 240;
 /// Everything that belongs to one open document.
 ///
 /// Grouped so that opening another is a single replacement rather than eight
-/// fields to remember to reset — the kind of bookkeeping that goes wrong once a
+/// fields to remember to reset - the kind of bookkeeping that goes wrong once a
 /// ninth is added.
 struct OpenDocument {
     path: PathBuf,
@@ -299,7 +299,7 @@ pub(crate) fn run(options: ViewerOptions) -> Result<(), Box<dyn std::error::Erro
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([320.0, 240.0])
-            .with_title(format!("{title} — Porpoise PDF")),
+            .with_title(format!("{title} - Porpoise PDF")),
         ..Default::default()
     };
 
@@ -333,7 +333,7 @@ struct Viewer {
     ///
     /// So that a wheel gesture over the strip scrolls the strip instead of turning the
     /// page. Last frame's rectangle, because the wheel is read before this frame's panels
-    /// are laid out — a panel that moved in between could mis-route one gesture, which is
+    /// are laid out - a panel that moved in between could mis-route one gesture, which is
     /// why this is a plain rectangle test and not a claim about the current layout.
     ///
     /// The strip rather than the pages, deliberately: see [`wheel_is_for_the_pages`].
@@ -371,8 +371,8 @@ struct Viewer {
 
     /// Pages picked out in the grid. See [`crate::selection`].
     ///
-    /// Outside `open`, so it is not one of the things a reorder has to remember to fix up
-    /// — it holds source pages and follows them on its own.
+    /// Outside `open`, so it is not one of the things a reorder has to remember to fix
+    /// up: it holds source pages and follows them on its own.
     selection: Selection,
 
     /// What is typed in the grid's search box. Empty when nothing is.
@@ -391,8 +391,8 @@ struct Viewer {
     /// Whether the window has been told to close for real.
     ///
     /// Load-bearing, not defensive. `ViewportCommand::Close` comes back round as a
-    /// close *request* on the next frame — egui-winit pushes it onto the same event
-    /// queue the X button feeds — so a close interception with no way to tell "the
+    /// close *request* on the next frame - egui-winit pushes it onto the same event
+    /// queue the X button feeds - so a close interception with no way to tell "the
     /// person clicked X" from "we asked to close" re-raises the question forever and the
     /// window can never be shut. Checked in egui 0.35's source rather than discovered.
     quitting: bool,
@@ -491,7 +491,7 @@ impl Viewer {
 
     /// Queues an event, if anyone is listening.
     ///
-    /// Takes a closure so that building the event — which can allocate — costs
+    /// Takes a closure so that building the event - which can allocate - costs
     /// nothing when the program is being driven by a person.
     fn emit(&mut self, event: impl FnOnce() -> Event) {
         if self.control.is_some() {
@@ -502,7 +502,7 @@ impl Viewer {
     /// An empty layout, so the view can be read even with no document open.
     ///
     /// Takes the field rather than `&self` so that callers can hold this alongside
-    /// a mutable borrow of [`Viewer::state`] — which `dispatch` needs, since
+    /// a mutable borrow of [`Viewer::state`] - which `dispatch` needs, since
     /// applying a command reads the layout and writes the state at the same time.
     fn layout_of(open: &Option<OpenDocument>) -> &ScrollLayout {
         static EMPTY: std::sync::LazyLock<ScrollLayout> =
@@ -571,13 +571,13 @@ impl Viewer {
     ///
     /// The pending-request half is easy to leave out and matters more than the render
     /// half. A scroll command records a *request*, and the shell only carries it out
-    /// while painting. Until then the view has not moved — so reporting `idle` with a
+    /// while painting. Until then the view has not moved - so reporting `idle` with a
     /// request outstanding tells a client "everything you asked for is done" when the
     /// thing it asked for has not happened.
     ///
     /// On a visible window that window is one frame wide. On a **minimised** one it is
     /// indefinite: painting stops, so the request is never consumed, and the program
-    /// goes on cheerfully answering commands and reporting idle. Measured by hand —
+    /// goes on cheerfully answering commands and reporting idle. Measured by hand -
     /// `go_to_page 7` on a minimised window replied `changed`, reported `idle: true`,
     /// and left `current_page` at 3 until the window was restored. Nothing is lost, but
     /// a client that trusted `idle` would have read the old page and believed it.
@@ -588,7 +588,7 @@ impl Viewer {
         // let a client read the file before it exists.
         //
         // So is a question nobody has answered. The program itself has nothing left to
-        // do, but the thing that was asked for has not happened — and `idle` means
+        // do, but the thing that was asked for has not happened - and `idle` means
         // "everything you asked for is done", not "the CPU is quiet". A client that read
         // idle after `quit` would believe the window had closed.
         no_pending_move
@@ -685,11 +685,11 @@ impl Viewer {
     /// Carries out one command. The only path into view or document state.
     ///
     /// Wraps [`Self::carry_out`] purely to keep [`Self::last_error`] in step, so that
-    /// every producer — keyboard, toolbar, picker, control channel — reports failure
+    /// every producer - keyboard, toolbar, picker, control channel - reports failure
     /// the same way rather than each remembering to.
     fn dispatch(&mut self, ctx: &egui::Context, command: Command) -> DispatchResult {
-        // In front of `carry_out`, so every producer — the X button, the keyboard, the
-        // toolbar, a file drop, the control channel — is covered by one check rather
+        // In front of `carry_out`, so every producer - the X button, the keyboard, the
+        // toolbar, a file drop, the control channel - is covered by one check rather
         // than each remembering to make it. See [`crate::confirm`] for why this guards
         // the command instead of the gesture.
         if self.unsaved_changes()
@@ -748,7 +748,7 @@ impl Viewer {
         let Some(open) = &self.open else {
             return DispatchResult::Failed(NOTHING_OPEN.to_owned());
         };
-        // Saving an unedited document over itself would rewrite the file for no gain —
+        // Saving an unedited document over itself would rewrite the file for no gain -
         // and not even byte-identically, since the writer makes its own choices about
         // object encoding.
         //
@@ -958,7 +958,7 @@ impl Viewer {
                         self.guard = Some(Guard::Saving(intent));
                         DispatchResult::Saving
                     }
-                    // Nothing left to write — the order got put back while the question
+                    // Nothing left to write - the order got put back while the question
                     // was up, which an agent can do because the control channel is not
                     // blocked by the box. "Save, then continue" with nothing to save is
                     // just "continue"; leaving the question up here would strand it with
@@ -1018,7 +1018,7 @@ impl Viewer {
         }
 
         if (zoom_delta - 1.0).abs() > 0.001 {
-            // A pinch is not a command of its own — it is a zoom with a computed
+            // A pinch is not a command of its own - it is a zoom with a computed
             // factor, applied continuously so the gesture feels proportional.
             // Bucketing still bounds how often we re-render.
             let target = (self.view().zoom() * zoom_delta).clamp(MIN_SCALE, MAX_SCALE);
@@ -1077,7 +1077,7 @@ impl Viewer {
     /// `Ctrl+Z` undo a page edit *and* the typing in the box at the same moment.
     ///
     /// Called only on keys that produced something, which is what leaves `Ctrl+C` and
-    /// `Ctrl+V` — bindings this program does not have — working in the box.
+    /// `Ctrl+V` - bindings this program does not have - working in the box.
     fn consume_key(ctx: &egui::Context, typing: bool, key: egui::Key) {
         if !typing {
             return;
@@ -1120,7 +1120,7 @@ impl Viewer {
     /// Sends a gesture's intended selection through the command channel.
     ///
     /// The gestures work out *which* pages they want by asking [`Selection`], then hand
-    /// the answer over as `set_selection` rather than writing it in place — so a click in
+    /// the answer over as `set_selection` rather than writing it in place - so a click in
     /// the grid and an agent's `set_selection` take exactly the same path, and there is no
     /// selection a person can reach that a client cannot.
     fn dispatch_selection(&mut self, ctx: &egui::Context, wanted: &Selection) {
@@ -1137,7 +1137,7 @@ impl Viewer {
     ///
     /// Re-derived rather than stored. Parsing is a walk over a short string, and holding
     /// the resolved list instead would give a reorder or a delete something else to keep
-    /// in step — which is the shape that has already caused three bugs here.
+    /// in step - which is the shape that has already caused three bugs here.
     fn page_filter(&self) -> PageFilter {
         PageFilter::parse(
             &self.page_filter,
@@ -1195,8 +1195,8 @@ impl Viewer {
     /// Turns the window's close button into a `Quit` command.
     ///
     /// So the X, `Alt+F4`, the taskbar's Close, and `quit` from an agent all take one
-    /// path and meet one guard. The alternative — checking for unsaved changes here as
-    /// well as in dispatch — is how two producers end up disagreeing.
+    /// path and meet one guard. The alternative - checking for unsaved changes here as
+    /// well as in dispatch - is how two producers end up disagreeing.
     fn intercept_close(&mut self, ctx: &egui::Context) {
         // `quitting` is what stops this from firing on the close *we* asked for. See the
         // field's own note: egui-winit feeds `ViewportCommand::Close` back through the
@@ -1224,7 +1224,7 @@ impl Viewer {
                 self.last_error = None;
                 if let Some(open) = &mut self.open {
                     // The file we are editing is now the one just written, so a Save As
-                    // switches to it — what every editor does, and what stops the status
+                    // switches to it - what every editor does, and what stops the status
                     // bar nagging about a document that has been saved somewhere.
                     open.path = saved.path;
                     // The order the *write* saw, not the current one. If pages were
@@ -1281,7 +1281,7 @@ impl Viewer {
                 self.dispatch(ctx, Command::Open { path });
             }
             // Set here rather than through `dispatch`, because nothing became a
-            // command — the drop was refused before there was one. It still has to be
+            // command - the drop was refused before there was one. It still has to be
             // visible, or dropping a `.docx` looks like the window ignoring you.
             Some(DropAction::Refuse { reason }) => self.last_error = Some(reason),
         }
@@ -1390,7 +1390,7 @@ impl Viewer {
 
         if bucket != open.submitted_bucket {
             // Queued work is for the old rung and no longer worth doing. Cached
-            // textures are kept deliberately — they are the fallback that stops a
+            // textures are kept deliberately - they are the fallback that stops a
             // resize from flashing grey.
             //
             // Everything, not only this rung's, because `cancel_pending` is
@@ -1417,7 +1417,7 @@ impl Viewer {
             if cache.contains(key) {
                 continue;
             }
-            // Everything else — already queued, or given up on — is [`RenderQueue`]'s to
+            // Everything else - already queued, or given up on - is [`RenderQueue`]'s to
             // decide, because the thumbnail grid has to decide it the same way.
             queue.want(key, pixels_per_point);
         }
@@ -1428,7 +1428,7 @@ impl Viewer {
     /// The texture to draw for a page: the current rung, else the nearest cached
     /// rung, else nothing.
     ///
-    /// Takes the cache mutably because a hit counts as a use — leaving LRU order
+    /// Takes the cache mutably because a hit counts as a use - leaving LRU order
     /// untouched here would make the byte budget evict pages that are on screen.
     fn texture_for(
         cache: &mut PageCache<egui::TextureHandle>,
@@ -1463,7 +1463,7 @@ impl Viewer {
         }
 
         // A failure with retries left is still pending, so claiming failure would
-        // be premature — fall through to the placeholder instead.
+        // be premature - fall through to the placeholder instead.
         if let Some(failure) = open.failures.get(&key)
             && failure.gave_up()
         {
@@ -1566,7 +1566,7 @@ impl Viewer {
             // Claim the full window even when the content is smaller, so pages centre in
             // it rather than hugging the top-left corner with the scrollbar stranded out
             // to the right of them. Vertically that only ever happens in paged mode, where
-            // a page shorter than the window is the normal case — and where a page pinned
+            // a page shorter than the window is the normal case - and where a page pinned
             // to the top with grey below it reads as a layout fault rather than a mode.
             let column = egui::vec2(
                 content_size.x.max(ui.available_width()),
@@ -1574,7 +1574,7 @@ impl Viewer {
             );
             let (content_rect, _response) = ui.allocate_exact_size(column, egui::Sense::hover());
             // Half the slack on each side. The page's own top-left corner is therefore not
-            // at the column's, so both reports below subtract it — otherwise scrolling and
+            // at the column's, so both reports below subtract it - otherwise scrolling and
             // panning would each appear to start partway along.
             let gutter = ((column - content_size) * 0.5).max(egui::Vec2::ZERO);
 
@@ -1594,7 +1594,7 @@ impl Viewer {
             let Some(open) = &mut self.open else { return };
 
             // Resolved in a first pass because a cache hit is a *use* and updates
-            // LRU order, which needs the cache mutably — while painting needs the
+            // LRU order, which needs the cache mutably - while painting needs the
             // layout and geometry immutably.
             let tiles: Vec<(usize, egui::Rect, Option<egui::TextureId>)> = visible
                 .clone()
@@ -1650,8 +1650,8 @@ impl Viewer {
     /// which owns the policy and records the arithmetic.
     fn retain_textures(&mut self) {
         let visible = self.view().visible_pages();
-        // Taken rather than read: a frame in which the grid did not draw — because the
-        // panel is closed — must not go on keeping alive whatever it last showed.
+        // Taken rather than read: a frame in which the grid did not draw - because the
+        // panel is closed - must not go on keeping alive whatever it last showed.
         let grid = std::mem::take(&mut self.grid_pages);
         let Some(open) = &mut self.open else { return };
         let keep = retain::pages_to_keep(&visible, RETAIN_PAGES, grid, |position| {
@@ -1713,7 +1713,7 @@ impl Viewer {
         }
 
         // Through the normal dispatch, so a drag is indistinguishable from an agent
-        // sending `move_pages` — which is the whole point of the command model.
+        // sending `move_pages` - which is the whole point of the command model.
         if let Some((from, to)) = drawn.moved {
             let ctx = ui.ctx().clone();
             let from: Vec<PageNumber> = from
@@ -1748,7 +1748,7 @@ impl Viewer {
     /// Asks about unsaved page changes, and dispatches the answer.
     ///
     /// The three buttons produce the same `answer` command an agent sends, so there is no
-    /// click-only path out of the question — which is what keeps the whole flow testable.
+    /// click-only path out of the question - which is what keeps the whole flow testable.
     /// See [`crate::confirm`].
     fn draw_question(&mut self, ctx: &egui::Context) {
         // Read as an owned string so the borrow of `self.guard` ends before dispatch.
@@ -1849,7 +1849,7 @@ impl Viewer {
     fn drive_screenshot(&mut self, ctx: &egui::Context) {
         // `is_none_or`, not `is_some_and`: with no document there is no pipeline to
         // wait for, so the window is as ready as it will ever be. Under
-        // `is_some_and` an empty window could never be captured at all — it would
+        // `is_some_and` an empty window could never be captured at all - it would
         // spin out the whole frame budget and report "no screenshot arrived". That
         // did not matter while a path was mandatory; since Goal 3 an empty window is
         // how the program starts.
@@ -1929,7 +1929,7 @@ impl DispatchResult {
             // that treated this as completion would read a file that is not there yet;
             // it has to wait for the `saved` event or for `idle`.
             Self::Saving => Reply::ok(id, "saving"),
-            // `ok`, because being asked is not an error — but emphatically *not*
+            // `ok`, because being asked is not an error - but emphatically *not*
             // carried out. A client reads `awaiting_answer` in the snapshot to find out
             // what it is being asked, then replies with `answer`.
             Self::NeedsAnswer => Reply::ok(id, "needs_answer"),
@@ -1948,7 +1948,7 @@ impl eframe::App for Viewer {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame = self.frame.saturating_add(1);
         // `stable_dt` is the interval the user actually perceives, including any
-        // wait for vsync — which is the number that decides whether scrolling
+        // wait for vsync - which is the number that decides whether scrolling
         // looks smooth.
         self.timing.frame_ms = ctx.input(|input| input.stable_dt) * 1000.0;
 
@@ -2102,7 +2102,7 @@ mod tests {
         // Why the gate reads `text_edit_focused` and not `egui_wants_keyboard_input`:
         // the latter is true for *any* focused widget, so one press of Tab onto a
         // toolbar button would have silenced every binding in the program.
-        let ctx = with_focus(|ui| ui.button("Open…"));
+        let ctx = with_focus(|ui| ui.button("Open\u{2026}"));
 
         assert!(
             ctx.egui_wants_keyboard_input(),

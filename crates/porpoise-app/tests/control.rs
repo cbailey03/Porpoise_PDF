@@ -9,7 +9,7 @@
 //! # Needs a display
 //!
 //! `porpoise serve` opens a window, so these tests need a display server. They are
-//! skipped — loudly, never silently — when `PORPOISE_E2E` is unset, so that a
+//! skipped - loudly, never silently - when `PORPOISE_E2E` is unset, so that a
 //! headless `cargo test` does not report a failure it cannot help.
 //!
 //! Nothing sets it for you since CI was removed, so a plain `cargo test` reports these
@@ -43,7 +43,7 @@ const PAGES: usize = 6;
 /// Serializes these tests against one another.
 ///
 /// Each opens a real GPU window, and the control channel is serviced *inside the frame
-/// loop* — so a window starved of frames is a window that has stopped answering.
+/// loop* - so a window starved of frames is a window that has stopped answering.
 /// Eight of them contending for one adapter starve each other, and whichever test is
 /// waiting on a reply then times out after a minute.
 ///
@@ -168,7 +168,7 @@ impl Serve {
     ///
     /// A page the renderer refuses should be reported a bounded number of times and then
     /// left alone. This counter is how that is checked, because "stopped asking" is not
-    /// visible in a snapshot — only in the absence of further events.
+    /// visible in a snapshot - only in the absence of further events.
     fn failures_seen(&self) -> usize {
         self.failures_seen.get()
     }
@@ -529,7 +529,7 @@ fn an_agent_can_reorder_a_document_and_save_it() {
 
     // Goal 4 through the running program rather than the library. `porpoise-render`'s
     // reorder tests prove the *bytes* are right by comparing pixels; this proves the
-    // command path reaches them — that a move changes what the window shows, that the
+    // command path reaches them - that a move changes what the window shows, that the
     // page count follows a delete, that undo walks back, and that the saved file has
     // the pages the session ended with.
     let document = fixture("e2e-reorder.pdf");
@@ -556,7 +556,7 @@ fn an_agent_can_reorder_a_document_and_save_it() {
         "move_page did not report an edit: {reply}"
     );
     // `pages_reordered`, not `idle`. An edit takes effect in the frame that accepts it,
-    // and `idle` is emitted on the *settling edge* — so an edit needing no new
+    // and `idle` is emitted on the *settling edge* - so an edit needing no new
     // rasterization produces no new `idle` at all, and waiting for one hangs. Found
     // exactly that way.
     let event = serve.wait_for_event("pages_reordered");
@@ -616,7 +616,7 @@ fn an_agent_can_reorder_a_document_and_save_it() {
         "undo went back further than one edit"
     );
 
-    // Save As to a new file, and wait for it — the reply only means it started.
+    // Save As to a new file, and wait for it - the reply only means it started.
     let id = serve.send(
         "save_as",
         &[("path", Value::from(saved.to_string_lossy().as_ref()))],
@@ -682,7 +682,7 @@ fn the_page_grid_can_be_opened_and_closed_by_command() {
         Some(true)
     );
 
-    // Asking for what is already true is `unchanged`, not an error — the same
+    // Asking for what is already true is `unchanged`, not an error - the same
     // convention every other command follows.
     let id = serve.send("set_thumbnails", &[("visible", Value::from(true))]);
     assert_eq!(
@@ -719,7 +719,7 @@ fn pages_can_be_picked_out_and_moved_as_a_group() {
 
     // The grid's ctrl+click, shift+click and marquee all come down to `set_selection`,
     // and dragging the result comes down to `move_pages`. Neither gesture can be
-    // synthesized here, but both commands can — so what a gesture *authors* is covered
+    // synthesized here, but both commands can - so what a gesture *authors* is covered
     // even though the pointer itself is not.
     let document = fixture("e2e-group-edit.pdf");
     let mut serve = Serve::start(&document);
@@ -799,7 +799,7 @@ fn pages_can_be_picked_out_and_moved_as_a_group() {
 
     // Deleting everything is refused rather than leaving an arbitrary page behind. It
     // comes back `unchanged` rather than as an error, which is the same convention
-    // `delete_page` has always followed for the last remaining page — asking for
+    // `delete_page` has always followed for the last remaining page - asking for
     // something that changes nothing is not a failure here. What matters is the
     // document, so that is what this checks.
     let id = serve.send("delete_pages", &[("pages", Value::from(vec![1, 2, 3]))]);
@@ -826,7 +826,7 @@ fn pages_can_be_picked_out_and_moved_as_a_group() {
     );
 
     // The group edits leave real unsaved changes, so quitting is guarded exactly as it is
-    // after a single-page edit — worth pinning here too, since a group edit that skipped
+    // after a single-page edit - worth pinning here too, since a group edit that skipped
     // the guard would lose work quietly.
     let id = serve.send("quit", &[]);
     assert_eq!(
@@ -849,7 +849,7 @@ fn the_page_grid_can_be_narrowed_to_a_few_pages() {
     };
 
     // The search box narrows the grid, and reports both what was typed and what it
-    // resolved to — so a client need not reimplement the query parser to know what is on
+    // resolved to - so a client need not reimplement the query parser to know what is on
     // screen. `PAGES` is 6.
     let document = fixture("e2e-page-filter.pdf");
     let mut serve = Serve::start(&document);
@@ -889,7 +889,7 @@ fn the_page_grid_can_be_narrowed_to_a_few_pages() {
     );
     assert_eq!(filtered(&mut serve), Some(vec![1, 3, 4]));
 
-    // A query that reads as nothing is still a filter — `Some([])`, not `None`. The panel
+    // A query that reads as nothing is still a filter - `Some([])`, not `None`. The panel
     // says "no pages match" rather than looking broken, and a client can tell the two
     // apart.
     let id = serve.send("set_page_filter", &[("query", Value::from("nonsense"))]);
@@ -932,8 +932,8 @@ fn the_page_grid_can_be_narrowed_to_a_few_pages() {
         "narrowing kept a selection the query had hidden"
     );
 
-    // An omitted query is the empty one, which clears the filter — the same reading the
-    // box's ✕ has. Only a non-string is an error.
+    // An omitted query is the empty one, which clears the filter - the same reading the
+    // box's X button has. Only a non-string is an error.
     let id = serve.send("set_page_filter", &[]);
     assert_eq!(
         serve.reply_to(id).get("ok").and_then(Value::as_bool),
@@ -1005,7 +1005,7 @@ fn the_page_grid_mode_can_be_set_by_command() {
     };
 
     // The mode decides what clicking a thumbnail does, so it is state a client has to be
-    // able to read as well as set — otherwise a screenshot of the grid is ambiguous about
+    // able to read as well as set - otherwise a screenshot of the grid is ambiguous about
     // what a click in it would have done.
     let document = fixture("e2e-grid-mode.pdf");
     let mut serve = Serve::start(&document);
@@ -1040,7 +1040,7 @@ fn the_page_grid_mode_can_be_set_by_command() {
         Some("changed")
     );
 
-    // An unknown mode is refused, and the refusal has to name the alternatives — an
+    // An unknown mode is refused, and the refusal has to name the alternatives - an
     // agent that guessed "reorder" has no other way to find out what to say.
     let id = serve.send("set_grid_mode", &[("mode", Value::from("reorder"))]);
     let reply = serve.reply_to(id);
@@ -1087,8 +1087,8 @@ fn saving_an_unedited_document_over_itself_is_refused() {
         return;
     };
 
-    // Rewriting the file would not even be byte-identical — the writer makes its own
-    // encoding choices — so an unedited save is a no-op rather than a harmless one.
+    // Rewriting the file would not even be byte-identical - the writer makes its own
+    // encoding choices - so an unedited save is a no-op rather than a harmless one.
     let document = fixture("e2e-no-op-save.pdf");
     let before = std::fs::read(&document).expect("should read");
     let mut serve = Serve::start(&document);
@@ -1117,7 +1117,7 @@ fn an_empty_window_can_still_be_captured() {
     };
 
     // The regression: `capture` waited on `open.settled() && !cache.is_empty()`, which
-    // with no document is false forever — so the request was never sent and the
+    // with no document is false forever - so the request was never sent and the
     // attempt burned its whole frame budget before reporting "no screenshot arrived".
     // Harmless while a path was mandatory. Since Goal 3 an empty window is how the
     // program starts, so it is the first thing anyone would try to capture.
@@ -1177,7 +1177,7 @@ fn idle_is_never_reported_while_a_move_is_still_pending() {
 
     // `idle` is the field every client is told to wait on, so it must not be true while
     // the view still has somewhere to go. It used to count only render work, and a
-    // scroll command records a *request* that the shell carries out while painting — so
+    // scroll command records a *request* that the shell carries out while painting - so
     // for a frame after every command, `idle` was true and the view had not moved.
     //
     // A minimised window turns that one-frame window into an indefinite one, because
@@ -1186,7 +1186,7 @@ fn idle_is_never_reported_while_a_move_is_still_pending() {
     //
     // It reads the *event stream* rather than polling snapshots, and that distinction is
     // the whole test. On a visible window the bad frame is about 16 ms wide, and a
-    // snapshot round-trip through the pipe is slower than that — so a polling version of
+    // snapshot round-trip through the pipe is slower than that - so a polling version of
     // this test passed against the unfixed code, which is how it was found to be
     // worthless. `view_changed` is emitted inside the same frame that accepted the
     // command, before the frame's painting consumes the request, so the offending state
@@ -1247,7 +1247,7 @@ fn a_file_that_will_not_open_reports_a_visible_reason() {
 
     // Goal 3's third part. Until the file picker existed, a bad path was a startup
     // error printed to a terminal; now it is something a person does at runtime, so
-    // the reason has to be readable rather than going only to `tracing::warn!` — which
+    // the reason has to be readable rather than going only to `tracing::warn!` - which
     // for a windowed app means nowhere. The status bar and this field show the same
     // string, so testing one covers what the other displays.
     let document = fixture("e2e-open-failure.pdf");
@@ -1382,7 +1382,7 @@ fn a_refused_command_explains_itself_and_changes_nothing() {
 
     // Page zero does not exist under one-based numbering. Unlike page 999 above it
     // is refused by the wire *type* rather than by a bounds check, so it fails during
-    // decoding rather than in `apply` — a different path, and one that used to throw
+    // decoding rather than in `apply` - a different path, and one that used to throw
     // the request id away. `reply_to` only returns on a matching id, so this call
     // hanging is exactly the failure a real client would see.
     let id = serve.send("go_to_page", &[("page", Value::from(0))]);
@@ -1444,7 +1444,7 @@ fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
     //
     // The fixture's pages are 300 pt, so this zooms until the window covers slightly more
     // than one of them. Every other test here runs at fit-width, where the window is
-    // *shorter* than a page — which is exactly why none of them caught it.
+    // *shorter* than a page - which is exactly why none of them caught it.
     let document = fixture("e2e-paged-end.pdf");
     let mut serve = Serve::start(&document);
     serve.wait_for_event("idle");
@@ -1462,7 +1462,7 @@ fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
 
     // Measured from the window and the zoom rather than from the scroll limit. Paged mode
     // confines the scroll range to one page, so `content_height - max_scroll` no longer
-    // names the window's height — it did when this test was written, which is why the
+    // names the window's height - it did when this test was written, which is why the
     // derivation is now spelled out.
     let viewport_pt = window_height_pt(&serve.view());
     assert!(
@@ -1568,7 +1568,7 @@ fn scrolling_in_paged_mode_turns_the_page() {
 
     // What the wheel and the arrow keys do, over the wire. Scrolling off the end of the
     // page is the only gesture a single-page view has left, so it has to mean the next
-    // page — and the same command an agent sends is the one the wheel produces.
+    // page - and the same command an agent sends is the one the wheel produces.
     let document = fixture("e2e-paged-scroll.pdf");
     let mut serve = Serve::start(&document);
     serve.wait_for_event("idle");
@@ -1576,7 +1576,7 @@ fn scrolling_in_paged_mode_turns_the_page() {
     serve.reply_to(id);
 
     // At fit-width these 200 pt sheets zoom to about 5x, which makes the window cover
-    // barely half of one — so this is the case with page left to read before there is
+    // barely half of one - so this is the case with page left to read before there is
     // anything to turn to, and scrolling has to do both jobs in the right order.
     let view = serve.view();
     let window = window_height_pt(&view);
@@ -1600,7 +1600,7 @@ fn scrolling_in_paged_mode_turns_the_page() {
     );
     let view = serve.view();
     assert_eq!(page_field(&view, "current_page"), 2);
-    // The fixture's pages are 300 pt with 12 pt gaps, so page 2 starts at 312 — the top of
+    // The fixture's pages are 300 pt with 12 pt gaps, so page 2 starts at 312 - the top of
     // the page, not a screenful past wherever the last one ended.
     assert_eq!(
         view.get("scroll_top_pt").and_then(Value::as_f64),
@@ -1651,7 +1651,7 @@ fn the_page_grid_does_not_fight_the_page_column_over_textures() {
     };
 
     // Reported as "pages 10, 11 and 12 flicker". The texture cache has two consumers, and
-    // eviction ran inside the page column with only its own window to go on — so the grid
+    // eviction ran inside the page column with only its own window to go on - so the grid
     // asked for a thumbnail, the render landed, the column evicted it for being far from the
     // viewport, and the grid asked again. Forever.
     //
@@ -1713,11 +1713,11 @@ fn the_page_grid_stops_asking_for_a_page_the_renderer_refuses() {
 
     // The grid submitted renders without the retry budget the page column uses, so a page
     // that cannot be rasterized was re-requested from the grid on every frame it was on
-    // screen — a worker permanently busy producing an answer already known.
+    // screen - a worker permanently busy producing an answer already known.
     //
     // One page with an absurd aspect ratio, which is the only way found to fail
     // deterministically: at 100 x 4,000,000 pt it comes to 64 x 2,593,679 px even at the tiny
-    // zoom thumbnails use, past the backend's 65,535 px per-axis limit — and a refused size
+    // zoom thumbnails use, past the backend's 65,535 px per-axis limit - and a refused size
     // is not the kind of failure worth retrying. The other pages are ordinary and must go on
     // rendering.
     //
@@ -1755,7 +1755,7 @@ fn the_page_grid_stops_asking_for_a_page_the_renderer_refuses() {
     let settled = serve.failures_seen();
     assert!(
         settled > 0 && settled < 10,
-        "expected a handful of refusals, not {settled} — the budget is bounded per rung"
+        "expected a handful of refusals, not {settled} - the budget is bounded per rung"
     );
     for _ in 0..200 {
         serve.snapshot();
@@ -1867,7 +1867,7 @@ fn opening_another_document_with_unsaved_changes_asks_first() {
     };
 
     // `open` replaces the document, so it loses an edit exactly as quitting does. Two
-    // commands, one guard — which is the point of guarding dispatch rather than each
+    // commands, one guard - which is the point of guarding dispatch rather than each
     // producer.
     let document = fixture("e2e-guard-open-a.pdf");
     let other = fixture("e2e-guard-open-b.pdf");
@@ -1902,7 +1902,7 @@ fn opening_another_document_with_unsaved_changes_asks_first() {
         "the document was replaced before the question was answered: {snapshot}"
     );
 
-    // Discard, and the open finally happens — with the edit gone, as asked.
+    // Discard, and the open finally happens - with the edit gone, as asked.
     let id = serve.send("answer", &[("choice", Value::from("discard"))]);
     assert_eq!(
         serve.reply_to(id).get("outcome").and_then(Value::as_str),
@@ -1990,7 +1990,7 @@ fn a_saved_document_stops_claiming_unsaved_changes() {
     };
 
     // Before this, `unsaved_changes` meant "differs from the document as first opened"
-    // and nothing ever cleared it — so a saved file went on claiming changes forever.
+    // and nothing ever cleared it - so a saved file went on claiming changes forever.
     // Survivable while it only lit a status bar; not survivable once a warning is built
     // on it, because a warning that fires when nothing is at risk is one people learn to
     // click straight through.
@@ -2013,7 +2013,7 @@ fn a_saved_document_stops_claiming_unsaved_changes() {
         "still claiming unsaved changes after writing them: {snapshot}"
     );
 
-    // Which means quitting is not questioned at all — and `quit` fails rather than
+    // Which means quitting is not questioned at all - and `quit` fails rather than
     // hanging if it ever is, so this line is the assertion.
     serve.quit();
 }
@@ -2026,7 +2026,7 @@ fn answering_save_with_nothing_left_to_save_still_goes_ahead() {
 
     // Reachable because the question box does not block the control channel: the order
     // can be put back while it is up. "Save, then continue" with nothing to save is just
-    // "continue" — leaving the question standing would strand it with no answer that
+    // "continue" - leaving the question standing would strand it with no answer that
     // works, since saving an unedited document over itself is refused by design.
     let document = fixture("e2e-guard-nothing-to-save.pdf");
     let mut serve = Serve::start(&document);

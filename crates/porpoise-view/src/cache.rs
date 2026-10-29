@@ -7,7 +7,7 @@
 //! Memory has to track the *viewport*, not the document, or a 400-page file
 //! eventually holds 400 rasterized pages. The budget here is what enforces that,
 //! and it is a byte budget rather than an entry count because pages differ wildly
-//! in size — one tabloid page at high zoom can outweigh twenty small ones.
+//! in size - one tabloid page at high zoom can outweigh twenty small ones.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
@@ -118,8 +118,8 @@ impl<T> PageCache<T> {
     /// Inserts a rasterization, evicting least-recently-used entries until the
     /// budget is satisfied.
     ///
-    /// An entry larger than the whole budget is still stored — refusing it would
-    /// mean a page that can never be displayed — but everything else is evicted
+    /// An entry larger than the whole budget is still stored - refusing it would
+    /// mean a page that can never be displayed - but everything else is evicted
     /// first. Callers wanting to avoid that should check the size against
     /// [`Self::budget_bytes`] beforehand.
     pub fn insert(&mut self, key: CacheKey, value: T, bytes: usize) {
@@ -162,7 +162,7 @@ impl<T> PageCache<T> {
 
     // `retain_bucket` used to live here: it dropped every rung of a page except one, and its
     // doc said it was called once the wanted rung arrived. Nothing ever called it, and the
-    // policy it encoded is now actively wrong — the thumbnail grid needs a page to hold two
+    // policy it encoded is now actively wrong - the thumbnail grid needs a page to hold two
     // rungs at once, its own and the main view's. Removed rather than left as a trap with a
     // comment claiming it was in use. The byte budget and `retain_pages` were doing this job
     // all along.
@@ -329,7 +329,7 @@ mod tests {
     fn one_page_can_hold_several_rungs_at_once() {
         // The thumbnail grid depends on this: it draws a page at a tiny rung while the
         // main view holds the same page at reading size, and neither may evict the
-        // other. This replaces a `retain_bucket` that dropped every rung but one — it
+        // other. This replaces a `retain_bucket` that dropped every rung but one - it
         // was never called, and the policy it encoded is now the opposite of what is
         // wanted.
         let mut cache: PageCache<u32> = PageCache::new(10_000);

@@ -1,7 +1,7 @@
 //! Rasterizing PDF pages to RGBA pixels.
 //!
 //! Rendering sits behind the [`Renderer`] trait so that a future GPU backend,
-//! built on hayro's `Device` trait, slots in at the same seam — and so that the
+//! built on hayro's `Device` trait, slots in at the same seam - and so that the
 //! render pool can be driven by a stub in tests.
 //!
 //! # Untrusted input
@@ -22,8 +22,8 @@
 //!
 //! Note that hayro is `!UnwindSafe` because it holds interior-mutable caches, so
 //! [`AssertUnwindSafe`] is required rather than merely convenient. The assertion
-//! is sound for the way we use it — a [`Document`] whose render panicked is
-//! still safe to *read*, and we discard the per-call cache — but resuming a
+//! is sound for the way we use it - a [`Document`] whose render panicked is
+//! still safe to *read*, and we discard the per-call cache - but resuming a
 //! partially-unwound cache is exactly the kind of thing worth staying nervous
 //! about, so prefer discarding a document that has panicked repeatedly.
 
@@ -61,8 +61,8 @@ pub struct RenderLimits {
 impl RenderLimits {
     /// 64 megapixels, or 256 MB as RGBA.
     ///
-    /// Chosen to leave room for a legitimately large render — a tabloid page at
-    /// 600 DPI is about 42 Mpx — while refusing anything that could not plausibly
+    /// Chosen to leave room for a legitimately large render - a tabloid page at
+    /// 600 DPI is about 42 Mpx - while refusing anything that could not plausibly
     /// be wanted. A viewport-driven caller should set something much smaller;
     /// Goal 1's memory target for a whole document is 500 MB.
     pub const DEFAULT_MAX_TOTAL_PIXELS: u64 = 64 << 20;
@@ -253,7 +253,7 @@ pub trait Renderer {
 /// is a reasonable primitive but the wrong default for a viewer: a PDF page is
 /// conceptually a sheet of white paper, and most pages leave most of their area
 /// untouched. Rendering transparent means those areas take on whatever is behind
-/// them — so a text document composited onto a dark UI comes out as black text on
+/// them - so a text document composited onto a dark UI comes out as black text on
 /// dark grey, and a PNG of an invoice looks empty in any viewer with a dark
 /// background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -310,7 +310,7 @@ impl HayroRenderer {
     ///
     /// Split out from [`Renderer::render`] so the arithmetic can be tested
     /// directly, and because rejecting a bad size is the cheapest possible
-    /// defence — it happens before the backend sees the request at all.
+    /// defence - it happens before the backend sees the request at all.
     fn target_size(
         &self,
         index: usize,
@@ -422,7 +422,7 @@ impl Renderer for HayroRenderer {
 
         // hayro hands back `Vec<Rgba8>`; flattening it costs one copy of the
         // page. Removable later with a bytemuck reinterpret if it shows up in a
-        // profile — but the upload to a GPU texture is the interesting cost here,
+        // profile - but the upload to a GPU texture is the interesting cost here,
         // not this.
         let rgba = pixmap
             .take_unpremultiplied()
@@ -488,7 +488,7 @@ where
             })
         }
         // The worker vanished without sending. `render` catches panics itself, so
-        // reaching here means something stranger happened — report it as a panic
+        // reaching here means something stranger happened - report it as a panic
         // rather than inventing a new case.
         Err(RecvTimeoutError::Disconnected) => Err(RenderError::Panicked { index }),
     }

@@ -1,4 +1,4 @@
-//! `porpoise` — command line entry point.
+//! `porpoise` - command line entry point.
 //!
 //! Three ways in: a bare file path opens the viewer, `info` describes a document,
 //! and `render` rasterizes one page to a PNG.
@@ -112,7 +112,7 @@ struct InfoArgs {
 
 #[derive(Args)]
 struct ServeArgs {
-    /// A PDF to open immediately. Optional — send an `open` command instead.
+    /// A PDF to open immediately. Optional - send an `open` command instead.
     file: Option<PathBuf>,
 
     /// Open scrolled to this page, counting from 1.
@@ -152,7 +152,7 @@ struct RenderArgs {
 
 fn main() -> ExitCode {
     // Taken before anything else so "time to first page" includes argument
-    // parsing, file reading and window creation — everything the user waits for.
+    // parsing, file reading and window creation - everything the user waits for.
     let launched = Instant::now();
     init_tracing();
     let cli = Cli::parse();
@@ -185,7 +185,7 @@ fn main() -> ExitCode {
 
 /// Sends `tracing` output to stderr.
 ///
-/// Without a subscriber, every `warn!` in the render pipeline is discarded —
+/// Without a subscriber, every `warn!` in the render pipeline is discarded -
 /// including the one reporting that the interpreter panicked on a page, which for
 /// this project is the single most important diagnostic there is. stderr rather
 /// than stdout so diagnostics never mix with `info` and `render` output.
@@ -219,7 +219,7 @@ fn log_level(setting: Option<&str>) -> LevelFilter {
         "info" => LevelFilter::INFO,
         "error" => LevelFilter::ERROR,
         "off" | "none" => LevelFilter::OFF,
-        // Anything else — unset, or a per-target directive we do not parse —
+        // Anything else - unset, or a per-target directive we do not parse -
         // leaves the default. Staying at `warn` on an unrecognized value is safer
         // than going silent on a typo.
         _ => LevelFilter::WARN,
@@ -404,7 +404,7 @@ fn run_render(args: &RenderArgs) -> Result<(), Box<dyn Error>> {
     std::fs::write(&args.output, &png)?;
 
     println!(
-        "wrote {} — {}x{} px, {} KB, rasterized in {} ms",
+        "wrote {} - {}x{} px, {} KB, rasterized in {} ms",
         args.output.display(),
         page.width,
         page.height,

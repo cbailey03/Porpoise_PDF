@@ -1,7 +1,7 @@
 //! Every effect that can change what the viewer shows, named.
 //!
 //! This is the surface Goal 2 rests on. Keyboard, toolbar, and an external agent
-//! are all *producers* of [`ViewCommand`] — none of them reaches viewer state any
+//! are all *producers* of [`ViewCommand`] - none of them reaches viewer state any
 //! other way. That makes "every feature is programmatically controllable" a
 //! structural property rather than a maintained one: a click-only feature is
 //! unrepresentable, because clicks produce commands and commands are the surface.
@@ -16,7 +16,7 @@
 //! The same principle decides an ambiguity worth pointing at.
 //! [`ViewCommand::NextPage`] always means the next *page*, in every scroll mode.
 //! A `PageDown` key press means "next page" in paged mode and "next screenful" in
-//! free mode — so the *key handler* chooses between [`ViewCommand::NextPage`] and
+//! free mode - so the *key handler* chooses between [`ViewCommand::NextPage`] and
 //! [`ViewCommand::ScrollByViewports`]. Mode-dependence belongs to input
 //! translation, not to the command, or an agent could never be sure what
 //! `NextPage` would do.
@@ -25,7 +25,7 @@
 //!
 //! One exception, and it is not one: the scrolling commands mean different things in
 //! [`crate::ScrollMode::Paged`], where running off the end of the page on screen turns to the
-//! next page. That is not a gesture leaking into a command — it is the same command
+//! next page. That is not a gesture leaking into a command - it is the same command
 //! against a different **scrollable range**, because paged mode confines the view to one
 //! page. `ScrollBy(48)` still means "move 48 points down"; there is simply less document to
 //! move through, and the mode decides what happens at the edge. `ScrollTo` addresses a
@@ -211,7 +211,7 @@ pub enum Rejection {
 /// What applying a command did.
 ///
 /// `Changed` and `Unchanged` are distinguished so that a caller can skip emitting
-/// a state-change event for a command that asked for what was already true —
+/// a state-change event for a command that asked for what was already true -
 /// otherwise an agent polling with `SetZoom(FitWidth)` would generate an endless
 /// stream of events reporting nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

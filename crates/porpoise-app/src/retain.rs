@@ -1,7 +1,7 @@
 //! Which page textures survive a frame.
 //!
-//! The texture cache has **two** consumers — the scrolling page column and the thumbnail
-//! grid — and this is the one place that decides what either of them still needs. That is
+//! The texture cache has **two** consumers - the scrolling page column and the thumbnail
+//! grid - and this is the one place that decides what either of them still needs. That is
 //! the whole reason it exists as a module rather than a few lines inside the page column,
 //! which is where it used to live.
 //!
@@ -23,7 +23,7 @@
 //!
 //! The column's window is a range of display **positions**; the cache is keyed by
 //! **source** page. After any reorder those differ, so the positions have to be resolved
-//! before comparing — comparing them directly evicts textures for pages that are on screen
+//! before comparing - comparing them directly evicts textures for pages that are on screen
 //! and keeps ones that are not, which shows up as pages flashing grey while scrolling near
 //! an edit.
 //!
@@ -38,7 +38,7 @@ use std::ops::Range;
 /// `visible` is the display positions the page column is showing and `margin` how many
 /// positions either side of it to keep as well, so that reversing direction reuses a
 /// texture instead of re-rendering. `grid` is the source pages the thumbnail grid is
-/// showing, already resolved — it is virtualized, so that is the rows on screen and not the
+/// showing, already resolved - it is virtualized, so that is the rows on screen and not the
 /// whole document.
 ///
 /// `source_of` maps a display position to a source page. A function rather than a
@@ -71,8 +71,8 @@ mod tests {
 
     #[test]
     fn a_page_the_grid_is_showing_survives_a_distant_viewport() {
-        // The reported bug. Twelve pages, the column showing only the first — which is what
-        // paged mode does — and a margin of eight. Positions 0..9 resolve to pages 0..8, so
+        // The reported bug. Twelve pages, the column showing only the first - which is what
+        // paged mode does - and a margin of eight. Positions 0..9 resolve to pages 0..8, so
         // pages 9, 10 and 11 are outside the column's window entirely; the grid is showing
         // them and they have to stay.
         let grid: Vec<usize> = (0..12).collect();

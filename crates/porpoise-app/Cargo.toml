@@ -31,7 +31,7 @@ rfd.workspace = true
 
 [dev-dependencies]
 # Fixtures for the end-to-end control test. Dev-only, so it cannot reach the
-# shipped binary — the `no-native-deps` CI job inspects `--edges normal` and would
+# shipped binary - the `no-native-deps` CI job inspects `--edges normal` and would
 # catch it if it did.
 porpoise-testkit.workspace = true
 png.workspace = true

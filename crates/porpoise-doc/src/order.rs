@@ -1,24 +1,24 @@
 //! What order the pages are in, and how to change it.
 //!
 //! An edit never touches the file. It is held as a list of **source page indices in
-//! display order**, starting at `[0, 1, 2, …]`. Moving a page reorders the list;
+//! display order**, starting at `[0, 1, 2, ...]`. Moving a page reorders the list;
 //! deleting one drops an entry. The document on disk changes only on save.
 //!
-//! Pure arithmetic over a `Vec<usize>` — no PDF, no `lopdf`, no window. Two useful
+//! Pure arithmetic over a `Vec<usize>` - no PDF, no `lopdf`, no window. Two useful
 //! consequences: undo is a snapshot rather than an inverse operation, and a reorder
 //! invalidates no rendered pages, because page textures stay keyed by source page.
 //!
 //! # Display position is not source page
 //!
 //! After any edit there are two page numbers in play and both are `usize`. This
-//! codebase has been caught by that shape three times already — pixels versus PDF
+//! codebase has been caught by that shape three times already - pixels versus PDF
 //! points, zero-based indices versus one-based numbers, screen units versus document
 //! units. Every crossing here goes through [`PageOrder::source_of`], and variables
 //! are named `position` or `source`, never `page`.
 
 /// How many undo steps are remembered.
 ///
-/// Each step is a copy of the order — 3.2 KB for a 400-page document — so this is
+/// Each step is a copy of the order - 3.2 KB for a 400-page document - so this is
 /// bounded to keep a long session from growing without limit rather than because the
 /// copies are expensive.
 const UNDO_DEPTH: usize = 64;
@@ -33,7 +33,7 @@ pub struct PageOrder {
     ///
     /// This is what makes "unsaved changes" mean it, rather than meaning "differs from
     /// the document as first opened". Without it a saved document goes on claiming
-    /// changes forever — the status bar nags, the Save button stays lit, and anything
+    /// changes forever - the status bar nags, the Save button stays lit, and anything
     /// built on top warns when there is nothing left to lose. A warning that fires when
     /// nothing is at risk is one people learn to click through.
     saved: Vec<usize>,
@@ -104,7 +104,7 @@ impl PageOrder {
     ///
     /// Takes the order that was actually written rather than assuming it is the current
     /// one. A save runs off the UI thread and takes about a second on a 400-page
-    /// document, so the pages may well have been moved again while it ran — and marking
+    /// document, so the pages may well have been moved again while it ran - and marking
     /// *those* moves as saved would tell somebody their work is on disk when it is not.
     /// Passing the written order through makes that case come out right on its own
     /// rather than needing to be noticed.
@@ -121,7 +121,7 @@ impl PageOrder {
     /// Moves the page at `from` so that it sits at `to`.
     ///
     /// Returns whether anything changed. A move to where the page already is, or with
-    /// either position out of range, changes nothing and is not an error — the same
+    /// either position out of range, changes nothing and is not an error - the same
     /// convention the view commands use, where being already where you asked to go is
     /// `Unchanged` rather than a rejection.
     pub fn move_page(&mut self, from: usize, to: usize) -> bool {
@@ -132,7 +132,7 @@ impl PageOrder {
     /// relative order.
     ///
     /// `to` is where the group ends up **after** the move, which is the contract
-    /// [`Self::move_page`] has always had — not "insert before whatever is at `to`
+    /// [`Self::move_page`] has always had - not "insert before whatever is at `to`
     /// now". The two spellings disagree whenever the group moves forward, so the choice
     /// matters: `move_pages(&[0], 2)` on `[0,1,2,3]` gives `[1,2,0,3]`, with the moved
     /// page third as asked.
@@ -152,7 +152,7 @@ impl PageOrder {
         }
 
         // Clamp so the group lands wholly inside the document. `to` is already known to
-        // be a valid position, so for a single page this can never bite — which is what
+        // be a valid position, so for a single page this can never bite - which is what
         // keeps `move_page`'s existing behaviour exactly as it was.
         let landing = to.min(self.order.len() - taken.len());
 
@@ -209,7 +209,7 @@ impl PageOrder {
         true
     }
 
-    /// Sorted, deduplicated, in-range positions — or `None` if there is nothing to act
+    /// Sorted, deduplicated, in-range positions - or `None` if there is nothing to act
     /// on.
     ///
     /// Shared by both group edits so "which positions did you mean" is answered once.
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn a_single_page_group_moves_exactly_like_move_page() {
-        // The two share one implementation, and this is what pins that they agree —
+        // The two share one implementation, and this is what pins that they agree -
         // `move_page`'s contract predates groups and its callers depend on it.
         for from in 0..5 {
             for to in 0..5 {
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn a_fresh_document_matches_its_file() {
         // Nothing has been written, but nothing has been changed either, so there is
-        // nothing to lose — and saving it over itself would be pointless.
+        // nothing to lose - and saving it over itself would be pointless.
         assert!(PageOrder::identity(7).is_unedited());
         assert!(PageOrder::identity(0).is_unedited());
     }

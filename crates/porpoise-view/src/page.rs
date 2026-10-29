@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 /// Deliberately a distinct type from the zero-based `usize` indices used by
 /// [`crate::ScrollLayout`], the page cache and the renderer. The two differ by
 /// exactly one and are otherwise identical, which is the kind of confusion that
-/// never crashes — it quietly shows the wrong page. Both conventions had already
+/// never crashes - it quietly shows the wrong page. Both conventions had already
 /// grown up side by side here: the CLI's `--start-page` and `render --page` counted
 /// from 1, while the control protocol's `go_to_page` counted from 0.
 ///

@@ -3,7 +3,7 @@
 //! A PDF viewer's input is whatever someone hands it, so the question that
 //! matters is not whether valid files work but whether damaged ones fail safely.
 //! These tests take a valid PDF apart in thousands of deterministic ways and
-//! require that every single one either opens or reports an error — never
+//! require that every single one either opens or reports an error - never
 //! unwinds, never hangs, never allocates without bound.
 //!
 //! Being deterministic is the point: a failure reproduces from its seed.
@@ -41,7 +41,7 @@ fn within_budget(label: &str, budget: Duration, body: impl FnOnce() + Send + 'st
     });
     assert!(
         wait.recv_timeout(budget).is_ok(),
-        "{label} did not finish within {budget:?} — likely a hang on malformed input"
+        "{label} did not finish within {budget:?} - likely a hang on malformed input"
     );
 }
 

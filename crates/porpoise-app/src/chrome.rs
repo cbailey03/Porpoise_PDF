@@ -6,7 +6,7 @@
 //!
 //! Be clear about what the split buys: **navigability, not coverage.** Every function here
 //! needs a live `egui::Context`, so none of them gains a unit test by moving. What *is*
-//! newly tested is the part worth testing — which edits are possible — and that went to
+//! newly tested is the part worth testing - which edits are possible - and that went to
 //! [`crate::edits`] rather than here.
 //!
 //! # Nothing here decides anything
@@ -22,8 +22,8 @@
 //!
 //! There is no click-only path. Each control returns the same [`Command`] an agent would
 //! send, collected and handed back rather than dispatched here, because dispatch needs
-//! `&mut Viewer` while `ui` holds the borrow. The one exception is **Open…**, which asks
-//! a person a question rather than having an effect, so it comes back as its own flag —
+//! `&mut Viewer` while `ui` holds the borrow. The one exception is **Open...**, which asks
+//! a person a question rather than having an effect, so it comes back as its own flag -
 //! see [`crate::picker`] for why the dialog is not a command.
 
 use std::path::Path;
@@ -64,13 +64,13 @@ pub(crate) struct Toolbar<'a> {
 pub(crate) struct Clicked {
     /// Commands to dispatch, in the order they were clicked.
     pub(crate) commands: Vec<Command>,
-    /// The **Open…** button. Not a command; see the module docs.
+    /// The **Open...** button. Not a command; see the module docs.
     pub(crate) open_picker: bool,
 }
 
 /// What the status bar reads.
 ///
-/// A wide struct because the status bar is a wide row — every field is one thing on
+/// A wide struct because the status bar is a wide row - every field is one thing on
 /// screen. Plain values rather than a borrow of the viewer, the same shape as
 /// [`crate::thumbnails::Grid`], so this module never learns what a `Viewer` is.
 pub(crate) struct Status<'a> {
@@ -104,7 +104,7 @@ pub(crate) struct StatusDocument {
     /// How many pages are picked out in the grid. Zero when none are.
     ///
     /// Shown because the grid can be scrolled away from what is picked, and **Delete**
-    /// acts on it — so "how many pages would that button take" has to be readable without
+    /// acts on it - so "how many pages would that button take" has to be readable without
     /// hunting for highlights.
     pub(crate) selected: usize,
 }
@@ -116,7 +116,7 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
 
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(!state.picker_open, egui::Button::new("Open…"))
+            .add_enabled(!state.picker_open, egui::Button::new("Open\u{2026}"))
             .on_hover_text("Open a PDF (Ctrl+O), or drag one onto the window")
             .clicked()
         {
@@ -140,28 +140,28 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         command_button(
             ui,
             &mut commands,
-            "⏮",
+            "\u{23ee}",
             "First page (Home or Up)",
             state.navigation.first.as_ref(),
         );
         command_button(
             ui,
             &mut commands,
-            "◀",
+            "\u{25c0}",
             "Previous page (Left)",
             state.navigation.previous.as_ref(),
         );
         command_button(
             ui,
             &mut commands,
-            "▶",
+            "\u{25b6}",
             "Next page (Right)",
             state.navigation.next.as_ref(),
         );
         command_button(
             ui,
             &mut commands,
-            "⏭",
+            "\u{23ed}",
             "Last page (End or Down)",
             state.navigation.last.as_ref(),
         );
@@ -191,7 +191,11 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
         );
         ui.separator();
 
-        if ui.button("−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
+        if ui
+            .button("\u{2212}")
+            .on_hover_text("Zoom out (Ctrl+-)")
+            .clicked()
+        {
             commands.push(ViewCommand::StepZoom { rungs: -1 }.into());
         }
         if ui.button("+").on_hover_text("Zoom in (Ctrl++)").clicked() {
@@ -249,7 +253,7 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, state: &Toolbar<'_>) -> Clicked {
 ///
 /// The whole point of taking the command as the enabled state: for the page edits, a lit
 /// button and a live key binding cannot disagree, because they are the same `Option`.
-/// The navigation buttons share the helper but not that guarantee, on purpose — see
+/// The navigation buttons share the helper but not that guarantee, on purpose - see
 /// [`crate::navigation`] for why the keyboard is allowed to fire a move this would grey
 /// out.
 fn command_button(
@@ -317,14 +321,14 @@ pub(crate) fn status(ui: &mut egui::Ui, state: &Status<'_>) {
                 }
             }
             None => {
-                ui.label("no document — Ctrl+O to open one, or drag one in");
+                ui.label("no document - Ctrl+O to open one, or drag one in");
             }
         }
 
         // Editing state, before the error, so a save failure reads next to it.
         if let Some(destination) = state.saving_to {
             ui.separator();
-            ui.label(format!("saving to {}…", file_label(destination)));
+            ui.label(format!("saving to {}\u{2026}", file_label(destination)));
         } else if state.unsaved_changes {
             ui.separator();
             ui.colored_label(ui.visuals().warn_fg_color, "unsaved changes");
@@ -342,7 +346,7 @@ pub(crate) fn status(ui: &mut egui::Ui, state: &Status<'_>) {
 
 /// Asks about unsaved page changes. Returns an answer only when one was given.
 ///
-/// A [`egui::Modal`], so it dims the window and takes the keyboard — but it deliberately
+/// A [`egui::Modal`], so it dims the window and takes the keyboard - but it deliberately
 /// does **not** block the control channel, which is serviced outside the frame's UI. An
 /// agent can therefore still read, still answer, and still change the order underneath it.
 pub(crate) fn question(ctx: &egui::Context, what: &str) -> Option<Answer> {
@@ -379,7 +383,7 @@ pub(crate) fn question(ctx: &egui::Context, what: &str) -> Option<Answer> {
     });
 
     // Escape, or clicking outside the box. Treated as Cancel because that is the answer
-    // that changes nothing — a dismissal must never be the destructive one.
+    // that changes nothing - a dismissal must never be the destructive one.
     if choice.is_none() && modal.should_close() {
         choice = Some(Answer::Cancel);
     }
@@ -389,7 +393,7 @@ pub(crate) fn question(ctx: &egui::Context, what: &str) -> Option<Answer> {
 /// Paints what letting go of a file drag would do.
 ///
 /// `unsaved_changes` only reaches [`DropAction::hint`], which decides whether to mention
-/// it — so this function has no opinion about what the sentence says, which is the point.
+/// it - so this function has no opinion about what the sentence says, which is the point.
 pub(crate) fn drop_hint(ctx: &egui::Context, action: &DropAction, unsaved_changes: bool) {
     let colour = match action {
         DropAction::Open { .. } => egui::Color32::WHITE,

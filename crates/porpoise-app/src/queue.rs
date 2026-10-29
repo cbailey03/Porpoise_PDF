@@ -1,6 +1,6 @@
 //! Asking a worker for a page, and deciding whether it is worth asking.
 //!
-//! One decision with two callers — the scrolling page column and the thumbnail grid — and
+//! One decision with two callers - the scrolling page column and the thumbnail grid - and
 //! it lives here because it had been written twice and the copies had diverged. The grid's
 //! copy was missing the retry budget entirely, so a page that could not be rasterized was
 //! re-requested from the grid every frame for as long as it stayed on screen, while the
@@ -12,7 +12,7 @@
 //! # The scale belongs here too
 //!
 //! Not only the policy. A caller derives the rasterization scale from a zoom rung and tags
-//! the job with that rung, and those two have to agree — a job scaled for one rung and
+//! the job with that rung, and those two have to agree - a job scaled for one rung and
 //! tagged with another caches its result under a size it was not drawn at, which shows up
 //! as a blurry or oversized page rather than as an error. Deriving both from the one
 //! [`CacheKey`] makes disagreeing impossible instead of unlikely.
@@ -28,7 +28,7 @@ use crate::failure::Failure;
 ///
 /// Read-only on purpose: the retry is spent by [`RenderQueue::want`] once a worker has
 /// actually taken the job. Deciding and spending used to be a single step, which meant a
-/// refused submission — a full queue, a poisoned lock — burned a retry on an attempt no
+/// refused submission - a full queue, a poisoned lock - burned a retry on an attempt no
 /// worker ever looked at.
 ///
 /// Does **not** consult the cache. The caller has already had to look there, because it
@@ -54,7 +54,7 @@ pub(crate) fn worth_asking_for(
 ///
 /// The fields are private, which is the point rather than tidiness: [`Self::want`] is then
 /// the *only* way to reach the worker pool, so a caller cannot submit a render without the
-/// policy — which is exactly what the thumbnail grid had been doing. A rule nobody can
+/// policy - which is exactly what the thumbnail grid had been doing. A rule nobody can
 /// bypass beats a rule everybody has to remember.
 pub(crate) struct RenderQueue<'a> {
     pool: &'a RenderPool,
@@ -97,7 +97,7 @@ impl<'a> RenderQueue<'a> {
             return false;
         }
         self.in_flight.push(key);
-        // Spent now that a worker has it, and only if this was a retry — a page's first
+        // Spent now that a worker has it, and only if this was a retry - a page's first
         // attempt has no failure to spend from.
         if let Some(failure) = self.failures.get_mut(&key) {
             failure.take_retry();
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn a_page_at_another_rung_is_a_different_request() {
         // The grid and the column hold the same page at two sizes, so one being in flight
-        // must not block the other — that would leave a panel with a permanent grey box.
+        // must not block the other - that would leave a panel with a permanent grey box.
         let thumbnail = CacheKey::new(3, ZoomBucket::enclosing(0.1));
         assert!(worth_asking_for(thumbnail, &[key(3)], &HashMap::new()));
     }

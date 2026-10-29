@@ -1,13 +1,13 @@
 //! Proof that a reordered save means what it says.
 //!
 //! Reordering is the one operation in this project that writes to disk, so "the file
-//! parsed afterwards" is nowhere near enough — a scrambled page tree parses fine. Every
+//! parsed afterwards" is nowhere near enough - a scrambled page tree parses fine. Every
 //! test here **rasterizes the saved document and compares pixels** against the pages it
 //! came from. If page 1 of the saved file does not look exactly like page 3 of the
 //! original, the bytes did not mean what we intended.
 //!
 //! Lives in `porpoise-render`'s tests because it needs the renderer to check the
-//! result, `porpoise-doc` to write it, and `porpoise-testkit` for fixtures — and
+//! result, `porpoise-doc` to write it, and `porpoise-testkit` for fixtures - and
 //! `porpoise-render` is the one crate where all three are in scope without inverting
 //! the layering.
 
@@ -20,7 +20,7 @@ use porpoise_render::{HayroRenderer, RenderRequest, RenderedPage, Renderer};
 use porpoise_testkit::{multi_page_pdf, nested_page_tree_pdf, pixel_diff, single_page_pdf};
 
 /// Pages in the fixture. Each one's rectangle is inset differently, so any two
-/// rasterize to visibly different images — without that, a reorder test could pass on
+/// rasterize to visibly different images - without that, a reorder test could pass on
 /// a document whose pages are indistinguishable.
 const PAGES: usize = 4;
 

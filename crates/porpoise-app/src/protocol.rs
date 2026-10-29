@@ -21,7 +21,7 @@
 //! A derived `Deserialize` on [`Command`] would nest the view commands one level
 //! deep, and `#[serde(untagged)]` would flatten them at the cost of turning every
 //! failure into "data did not match any variant". An agent needs to be told which
-//! command it got wrong and what the valid ones are — a protocol whose errors are
+//! command it got wrong and what the valid ones are - a protocol whose errors are
 //! unhelpful gets worked around by guessing, which is what we are trying to avoid.
 //!
 //! # This is an untrusted-input surface
@@ -116,15 +116,15 @@ impl DecodeError {
 
 /// A line that could not be decoded, and the id it was sent under.
 ///
-/// The id matters more than it looks. A bad *argument* on a well-formed line —
-/// `{"id":7,"command":"go_to_page","page":0}` — has a perfectly good id, and
+/// The id matters more than it looks. A bad *argument* on a well-formed line -
+/// `{"id":7,"command":"go_to_page","page":0}` - has a perfectly good id, and
 /// discarding it hands the client an error it cannot match to any request. A client
 /// waiting for a reply to id 7 then waits forever.
 ///
 /// That is not hypothetical: the first end-to-end test to send a bad argument under
 /// an id hung with the window open until it was closed by hand. So the id travels
 /// with the failure whenever the line got far enough to have one, and is `None` only
-/// when it genuinely could not be read — a line that is not JSON, not an object, or
+/// when it genuinely could not be read - a line that is not JSON, not an object, or
 /// whose `id` was itself malformed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{reason}")]
@@ -144,7 +144,7 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
         return Err(DecodeError::TooLong.at(None));
     }
     // A leading UTF-8 BOM is stripped rather than refused. JSON permits ignoring
-    // it, and plenty of tooling — PowerShell's pipe among them — emits one without
+    // it, and plenty of tooling - PowerShell's pipe among them - emits one without
     // being asked. Found the first time this protocol was driven by hand: the very
     // first command failed with "expected value at line 1 column 1", which is a
     // baffling error to hand somebody whose message was perfectly well formed.
@@ -266,8 +266,8 @@ pub(crate) fn decode(line: &str) -> Result<Option<Request>, DecodeFailure> {
             pages: pages_argument("pages")?,
         }),
         "set_page_filter" => RequestBody::Command(Command::SetPageFilter {
-            // A missing "query" is the empty one, which clears the filter — the same
-            // reading the search box's ✕ has. Only a non-string is an error, because that
+            // A missing "query" is the empty one, which clears the filter - the same
+            // reading the search box's X button has. Only a non-string is an error, because that
             // is a client sending the wrong shape rather than asking for everything.
             query: match object.get("query") {
                 None | Some(serde_json::Value::Null) => String::new(),
@@ -385,7 +385,7 @@ pub(crate) struct Snapshot {
     pub(crate) grid_mode: GridMode,
     /// What is typed in the grid's search box. Empty when nothing is.
     pub(crate) page_filter: String,
-    /// The pages that query resolves to, counting from 1 — `None` when nothing is typed.
+    /// The pages that query resolves to, counting from 1 - `None` when nothing is typed.
     ///
     /// Reported as well as the query so a client need not reimplement the parser to know
     /// what is on screen. `Some([])` is a query that matched nothing, which is a different
@@ -394,13 +394,13 @@ pub(crate) struct Snapshot {
     pub(crate) filtered_pages: Option<Vec<PageNumber>>,
     /// Pages picked out in the grid, counting from 1, ascending.
     ///
-    /// Display positions, like every other page number here — so after a reorder these
+    /// Display positions, like every other page number here - so after a reorder these
     /// are where the selected pages are *now*. Empty when nothing is picked, which is
     /// also when **Delete** falls back to acting on the page in view.
     pub(crate) selection: Vec<PageNumber>,
     /// Whether the page order differs from the file on disk.
     ///
-    /// False again once a save of that exact order reports success — so a document that
+    /// False again once a save of that exact order reports success - so a document that
     /// has just been written does not go on claiming changes.
     pub(crate) unsaved_changes: bool,
     /// What is waiting on an `answer` command, because carrying it out would discard
@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn an_answer_that_means_nothing_lists_the_ones_that_do() {
         // An agent that guessed "yes" has no other way to find out what to say, and
-        // this is the command that gets it *out* of a question — a bad error here is
+        // this is the command that gets it *out* of a question - a bad error here is
         // the difference between recovering and being stuck.
         let error =
             decode(r#"{"id":2,"command":"answer","choice":"yes"}"#).expect_err("should be refused");
@@ -884,11 +884,11 @@ mod tests {
 
     #[test]
     fn a_non_ascii_path_survives_decoding() {
-        match command(r#"{"command":"open","path":"café/naïve.pdf"}"#) {
+        match command("{\"command\":\"open\",\"path\":\"caf\u{e9}/na\u{ef}ve.pdf\"}") {
             Command::Open { path } => {
                 let shown = path.to_string_lossy();
-                assert!(shown.contains("café"), "mangled: {shown}");
-                assert!(shown.contains("naïve"), "mangled: {shown}");
+                assert!(shown.contains("caf\u{e9}"), "mangled: {shown}");
+                assert!(shown.contains("na\u{ef}ve"), "mangled: {shown}");
             }
             other => panic!("expected Open, got {other:?}"),
         }

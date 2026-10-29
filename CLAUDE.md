@@ -91,3 +91,55 @@ is no `idle` event to wait for; wait on the specific completion event instead (e
 **Untrusted input**: rendering runs inside `catch_unwind`, bounded by `--max-pixels` and
 `--timeout-ms`. `unsafe_code` is `forbid`den workspace-wide, and `unwrap`/`expect` warn outside
 tests (`clippy.toml` allows them in tests, since a panic is the clearest way to write one).
+
+## Code Preference
+- Prefer simple, long-term stable solutions.
+- Document complex decisions.
+- **Plain ASCII only:** every text file in the repo (code, comments, docs, config) uses plain ASCII characters. No em or en dashes, curly quotes, degree signs, superscripts, or emoji. Write `-`, `"`, `degrees`, `m2` instead.
+
+### Design principles
+
+- **Composition over inheritance:** Build features by combining small objects ("has-a") rather than making rigid parent-child trees ("is-a").
+- **Interfaces at real seams only:** Define a trait where behavior genuinely varies or code touches the outside world (rendering, disk, the control channel). Everywhere else, keep code concrete until a second implementation actually exists.
+- **Encapsulate what varies:** Isolate volatile logic into its own modules to protect stable code from changes.
+- **Single Responsibility (SRP):** Give every class, module, or function exactly one job and one reason to change.
+- **Open/Closed (OCP):** Write code that lets you add new behavior without rewriting or breaking existing, tested code. The exception is where the Architecture section deliberately requires edits, such as the three exhaustive matches a new `Command` variant must update.
+- **Liskov Substitution (LSP):** Any implementation of a trait must honor its full contract, so it can replace another without breaking callers.
+- **Interface Segregation (ISP):** Build small, specific interfaces instead of bulky ones so code only depends on what it actually uses.
+- **Dependency Inversion (DIP):** Make high-level logic depend on abstract interfaces, not low-level technical details.
+- **Law of Demeter:** Do not chain deep object calls like `a.get_b().get_c().do_it()`. Talk only to immediate neighbors. Builder and iterator chains (`ui.button(..).on_hover_text(..)`, `iter().map(..)`) don't count; they act on one value, not a walk through other objects.
+
+## Git
+- **Every PR targets `main` directly**, and must leave the application in a
+  working state when merged. No exceptions by issue type.
+- Every branch is named `issue-<number>-<github-username>`, using the GitHub issue
+  number with no zero padding (e.g. `issue-15-cbailey03`, `issue-2416-cbailey03`).
+  There are no exceptions; releases are tags, not branches.
+- **Local work:** commit as often as convenient. Nothing here restricts local
+  commit frequency. Messy WIP commits are fine, they never reach permanent
+  history.
+
+**Before opening a PR:**
+1. Squash all local commits into one.
+2. Rebase that commit onto the latest main:
+   ```bash
+   git fetch origin
+   git rebase origin/main
+   ```
+   Do not `git pull` main into the issue branch. That creates a merge commit
+   and breaks the single-commit rule.
+3. Write that single commit's message following Django's rules:
+   - Subject line in past tense, ending with a period.
+     - Right: `Fixed the customer name uniqueness check.`
+     - Wrong: `Fix the check.` / `Fixing the check.` / `Fixed the check` (no period)
+   - Blank line, then a body wrapped at ~72 chars per line (soft limit).
+   - The body explains **why**, not what or how. The diff already shows
+     that.
+   - The body is 5 sentences or fewer, since it doubles as the PR Summary.
+4. Open the PR using `.github/pull_request_template.md` and fill in every
+   section. `gh pr create --body` does not apply the template, so build the
+   body from its sections.
+   - **Summary** is that same commit body, verbatim. Write it once, not
+     twice.
+   - **Related Issue** is `Closes #<number>`, matching the branch's issue
+     number, so the issue closes on merge.

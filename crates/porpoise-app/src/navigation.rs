@@ -56,7 +56,7 @@ impl Navigation {
     /// Works out where the reader can go.
     ///
     /// `current` is ignored when `pages` is zero, matching
-    /// [`crate::edits::Edits::available`] — with nothing open there is no page to be on.
+    /// [`crate::edits::Edits::available`] - with nothing open there is no page to be on.
     pub(crate) fn available(current: PageNumber, pages: usize) -> Self {
         let here = current.get();
         // With no document there is no page to be on, and a page past the end is what a

@@ -8,8 +8,8 @@ use std::ops::Range;
 
 /// The pages worth rasterizing, in the order they should be requested.
 ///
-/// Visible pages come first, then alternating outward — one after, one before,
-/// widening — up to `prefetch` pages either side. Order matters because the
+/// Visible pages come first, then alternating outward - one after, one before,
+/// widening - up to `prefetch` pages either side. Order matters because the
 /// render queue is served in order and the viewport can move before it drains,
 /// so anything speculative must come after everything visible.
 ///

@@ -1,7 +1,7 @@
 //! Which pages the grid shows, from what was typed in the search box.
 //!
 //! Turning `"1, 4-6, 9"` into a set of pages is arithmetic over a string, so it lives
-//! here rather than in [`crate::thumbnails`] and is tested without a window — the same
+//! here rather than in [`crate::thumbnails`] and is tested without a window - the same
 //! split [`crate::edits`] and [`crate::selection`] made.
 //!
 //! # It searches page numbers, not page text
@@ -22,8 +22,8 @@
 //! The box filters as you type, so every prefix of a real query is a query too. `"5-9"`
 //! passes through `"5"` and `"5-"` on the way, and if `"5-"` meant "page 5 to the end" the
 //! grid would flash the whole document between two keystrokes. So a range missing its
-//! upper bound is read as just the lower one, and only a *leading* dash — `"-9"`, which no
-//! prefix of a normal query produces — means "from the start".
+//! upper bound is read as just the lower one, and only a *leading* dash - `"-9"`, which no
+//! prefix of a normal query produces - means "from the start".
 
 use std::collections::BTreeSet;
 
@@ -98,7 +98,7 @@ impl PageFilter {
 
     /// Whether a query is narrowing the grid.
     ///
-    /// True even when the query matched nothing — the grid is still narrowed, to nothing,
+    /// True even when the query matched nothing - the grid is still narrowed, to nothing,
     /// and that is a state worth telling somebody about rather than showing an empty panel.
     pub(crate) fn is_narrowed(&self) -> bool {
         matches!(self, Self::Only(_))
@@ -116,7 +116,7 @@ impl PageFilter {
     ///
     /// The indirection the whole module exists for: the grid counts slots, the document
     /// counts positions, and with a filter up they are different numbers. Everything the
-    /// grid reports back — a move, a pick, a page to keep a texture for — is a *position*,
+    /// grid reports back - a move, a pick, a page to keep a texture for - is a *position*,
     /// so this is the only place the two are allowed to meet.
     pub(crate) fn position_at(&self, slot: usize, page_count: usize) -> Option<usize> {
         match self {
@@ -133,7 +133,7 @@ impl PageFilter {
 /// Collapsing them is what made `"0-0"` produce page 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bound {
-    /// Nothing between the separators — an open end.
+    /// Nothing between the separators - an open end.
     Missing,
     /// A number. Zero is kept rather than refused, because clamping it to the first page
     /// is what makes `"0-2"` mean pages 1 to 2 while `"0"` alone still means no page.
@@ -151,7 +151,7 @@ fn bound(text: &str) -> Bound {
     if !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return Bound::Nonsense;
     }
-    // All digits, so parsing can only fail by overrunning a `usize` — and a number that
+    // All digits, so parsing can only fail by overrunning a `usize` - and a number that
     // long is past the end of any document, which the clamp already handles.
     Bound::Number(text.parse().unwrap_or(usize::MAX))
 }
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn filtered_slots_map_to_the_pages_that_matched() {
         // The crossing this module exists for. Slot 0 of a filtered grid is page 4, and a
-        // drag from it has to report position 3 — not 0, which would move the wrong page.
+        // drag from it has to report position 3 - not 0, which would move the wrong page.
         let filter = PageFilter::parse("4-6", 10);
         assert_eq!(filter.position_at(0, 10), Some(3));
         assert_eq!(filter.position_at(1, 10), Some(4));

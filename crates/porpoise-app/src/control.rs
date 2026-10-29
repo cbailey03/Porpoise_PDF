@@ -5,13 +5,13 @@
 //! This is a security decision, not a convenience one. A bound socket is reachable
 //! by every process on the machine and would need an authentication story we have
 //! no reason to write. stdio is a pipe handed to us by a parent that already holds
-//! our privileges — a different risk class entirely.
+//! our privileges - a different risk class entirely.
 //!
 //! It is worth being plain about what this channel grants, since the whole point of
 //! Goal 2 is to grant it: the controlling process can open any file the user can
 //! read, see it rendered, and write a PNG anywhere the user can write. That is a
-//! file-read and screen-read capability. It is not privilege escalation — the
-//! controller already runs as the user — but it is meaningfully more than "a
+//! file-read and screen-read capability. It is not privilege escalation - the
+//! controller already runs as the user - but it is meaningfully more than "a
 //! viewer", which is why it exists only when `porpoise serve` is invoked and never
 //! by default.
 
@@ -126,8 +126,8 @@ enum Line {
 ///
 /// `BufRead::read_line` would grow without bound on a client that never sends a
 /// newline, which is an allocation attack on a channel whose input is not ours to
-/// trust. `Read::take` cannot help here — it requires `Sized` and this is a trait
-/// object — so the cap is applied by hand over `fill_buf`.
+/// trust. `Read::take` cannot help here - it requires `Sized` and this is a trait
+/// object - so the cap is applied by hand over `fill_buf`.
 ///
 /// An over-long line is *skipped* rather than fatal. One bad message should cost
 /// the client that message, not the whole session.

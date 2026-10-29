@@ -3,7 +3,7 @@
 //! Split from the layout it serves because these are two different questions:
 //! [`crate::ScrollLayout`] answers *where does each page sit*, and this answers
 //! *how big should everything be*. The only interesting content here is the
-//! degenerate cases — a page or viewport of zero, `NaN`, or a negative size — all
+//! degenerate cases - a page or viewport of zero, `NaN`, or a negative size - all
 //! of which have to produce a usable zoom rather than a division by zero.
 
 use porpoise_doc::PageGeometry;
@@ -24,7 +24,7 @@ pub const MIN_SCALE: f32 = 0.01;
 
 /// Largest zoom [`fit_scale`] will return.
 ///
-/// This is a usability bound, not a safety one — `porpoise-render` enforces the
+/// This is a usability bound, not a safety one - `porpoise-render` enforces the
 /// limits that actually protect memory.
 pub const MAX_SCALE: f32 = 64.0;
 
@@ -33,7 +33,7 @@ pub const MAX_SCALE: f32 = 64.0;
 /// Viewport dimensions are in points, so a caller working in physical pixels
 /// should divide by its device pixel ratio first. The result is always finite and
 /// within [`MIN_SCALE`]..=[`MAX_SCALE`], including when the page or viewport is
-/// degenerate — a malformed document should letterbox oddly, not crash the view.
+/// degenerate - a malformed document should letterbox oddly, not crash the view.
 #[must_use]
 pub fn fit_scale(
     mode: FitMode,

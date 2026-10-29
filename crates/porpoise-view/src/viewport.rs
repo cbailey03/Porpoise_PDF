@@ -62,7 +62,7 @@ impl Viewport {
 /// Converts a viewport extent in pixels into the document extent it covers.
 ///
 /// The whole reason [`Viewport`] is measured in pixels and not points. A zoom factor
-/// is *window pixels per page point*, so fitting needs pixels — but a scroll bound
+/// is *window pixels per page point*, so fitting needs pixels - but a scroll bound
 /// needs points, and this is the only way across.
 ///
 /// Getting this wrong does not look wrong. `content_height_pt - viewport.height()`

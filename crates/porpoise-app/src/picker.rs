@@ -3,7 +3,7 @@
 //! Two things shape this module.
 //!
 //! **It must not block.** `rfd::FileDialog::pick_file` blocks until the person
-//! chooses, and calling that from `App::ui` freezes rendering — which breaks the one
+//! chooses, and calling that from `App::ui` freezes rendering - which breaks the one
 //! property this viewer has been careful about throughout. `rfd` offers an async
 //! dialog instead, but that wants an executor and this program has no async runtime;
 //! adopting one for a file dialog would be a poor trade. So the blocking call runs on
@@ -14,7 +14,7 @@
 //! argument to [`crate::command::Command::Open`]. So the picker joins the keyboard and
 //! the toolbar as a *producer* of that command, and no `pick_file` exists on the
 //! control protocol. An agent already has `open` with a path, which is strictly more
-//! capable — and a `pick_file` without a programmatic cancel would let an agent enter
+//! capable - and a `pick_file` without a programmatic cancel would let an agent enter
 //! a modal only a human could dismiss.
 
 use std::path::PathBuf;
@@ -48,7 +48,7 @@ impl FilePicker {
         }
         let (sender, receiver) = channel();
         // Detached on purpose. If the viewer exits while a dialog is up, the thread
-        // finds a closed channel and drops the answer, which is the correct outcome —
+        // finds a closed channel and drops the answer, which is the correct outcome -
         // there is nothing left to open the file into.
         std::thread::spawn(move || {
             let chosen = rfd::FileDialog::new()
@@ -64,7 +64,7 @@ impl FilePicker {
     ///
     /// `None` covers three cases that are all "nothing happened": no answer yet, the
     /// dialog was cancelled, and the dialog could not be shown at all. Cancelling is
-    /// deliberately not distinguished from failing — neither should produce a message,
+    /// deliberately not distinguished from failing - neither should produce a message,
     /// because a person who cancels has not made a mistake.
     pub(crate) fn poll(&mut self) -> Option<PathBuf> {
         let receiver = self.pending.as_ref()?;

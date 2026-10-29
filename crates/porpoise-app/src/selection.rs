@@ -7,7 +7,7 @@
 //!
 //! # It holds source pages, not display positions
 //!
-//! The obvious choice is to remember the positions that are lit up — they are what is on
+//! The obvious choice is to remember the positions that are lit up - they are what is on
 //! screen, and what a marquee produces. It is also wrong, because every edit moves them.
 //! Select positions 1 and 2, drag them to the end, and a position-based selection is now
 //! lighting up two pages nobody picked; delete a page and every selection after it is off
@@ -15,14 +15,14 @@
 //!
 //! Source pages have none of that. A reorder does not change which source page is which,
 //! so the selection follows the pages it was pointing at with no reconciliation step to
-//! forget — and an undo brings back both the pages and their selection, which is what
+//! forget - and an undo brings back both the pages and their selection, which is what
 //! somebody who has just undone a delete would expect. The cost is that reading the
 //! selection back out needs the order, so every method here takes one. That is the point:
 //! there is no way to ask this module a question about positions without saying which
 //! order they are positions in.
 //!
 //! This is the same crossing `PageOrder::source_of` exists for, and the fourth time this
-//! codebase has had two kinds of number in one shape — see `porpoise-doc`'s `order`
+//! codebase has had two kinds of number in one shape - see `porpoise-doc`'s `order`
 //! module docs for the other three.
 
 use std::collections::BTreeSet;
@@ -80,7 +80,7 @@ impl Selection {
     /// How many of `order`'s pages are selected.
     ///
     /// Takes the order because a selected page that has since been deleted is not
-    /// selected any more — it is only remembered in case of an undo.
+    /// selected any more - it is only remembered in case of an undo.
     pub(crate) fn count(&self, order: &PageOrder) -> usize {
         order
             .as_slice()
@@ -99,7 +99,7 @@ impl Selection {
     /// Selected display positions, ascending.
     ///
     /// Ascending because that is what the group edits in `PageOrder` want and what keeps
-    /// a dragged block in the order it appeared in — clicking pages 5 then 2 and dragging
+    /// a dragged block in the order it appeared in - clicking pages 5 then 2 and dragging
     /// them must not put 5 before 2.
     pub(crate) fn positions(&self, order: &PageOrder) -> Vec<usize> {
         (0..order.len())
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn shift_wins_over_ctrl() {
-        // Both held is ambiguous, and treating it as a toggle would discard the anchor —
+        // Both held is ambiguous, and treating it as a toggle would discard the anchor -
         // losing information the person can only restore by starting the range again.
         assert_eq!(Pick::of(true, true), Pick::Range);
     }

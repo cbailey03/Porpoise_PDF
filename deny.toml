@@ -33,8 +33,8 @@ allow = [
     # Font licences, not code licences. They arrive via `epaint_default_fonts`,
     # which is egui's bundled default typeface set, declared as
     # "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0". Both permit
-    # redistribution but attach conditions — reserved font names, and shipping the
-    # licence text — so they are part of the THIRD-PARTY-NOTICES obligation
+    # redistribution but attach conditions - reserved font names, and shipping the
+    # licence text - so they are part of the THIRD-PARTY-NOTICES obligation
     # recorded in README.md, not a free pass.
     "OFL-1.1",
     "Ubuntu-font-1.0",
@@ -109,7 +109,7 @@ reason = "Wraps openjpeg-sys. See above."
 version = 2
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2026-0192 — `ttf-parser` is unmaintained. Not a vulnerability: the
+    # RUSTSEC-2026-0192 - `ttf-parser` is unmaintained. Not a vulnerability: the
     # author has stated it will receive no further fixes.
     #
     # It reaches us four levels down a path we did not choose:
@@ -117,13 +117,27 @@ ignore = [
     #
     # `sctk-adwaita` draws Wayland client-side window decorations, so this is
     # Linux-and-Wayland only and absent from the Windows build entirely. It never
-    # touches document text — that goes through skrifa and harfrust.
+    # touches document text - that goes through skrifa and harfrust.
     #
     # Removing it would mean dropping eframe's `wayland` feature and with it real
     # Wayland support, which is a bad trade for an unmaintained notice on a
     # title-bar font parser. Upstream's to fix. Revisit when winit moves off
     # ab_glyph.
     "RUSTSEC-2026-0192",
+
+    # RUSTSEC-2026-0370, -0371, -0372 - `zvariant`, `zbus_names` and
+    # `zvariant_derive` are unmaintained. Not a vulnerability: all three were
+    # folded into `zbus` 6.0, and the advisories list no safe upgrade.
+    #
+    # They reach us through eframe's Linux accessibility support:
+    #   zvariant <- zbus <- accesskit_unix <- accesskit_winit <- egui-winit <- eframe
+    #
+    # Removing them would mean turning off AccessKit on Linux, which takes the
+    # viewer away from screen-reader users to clear a notice that the crates
+    # moved. Upstream's to fix. Revisit when eframe moves to `zbus` 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [sources]

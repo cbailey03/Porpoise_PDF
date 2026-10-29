@@ -16,8 +16,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# Fixtures and the mutation harness. This is a dependency *cycle* — porpoise-testkit
-# depends on this crate for `RenderedPage` — and Cargo permits it because the edge is
+# Fixtures and the mutation harness. This is a dependency *cycle* - porpoise-testkit
+# depends on this crate for `RenderedPage` - and Cargo permits it because the edge is
 # a dev-dependency, so it never reaches the shipped graph.
 #
 # Worth the cycle: these tests belong with the code they test. They previously lived

@@ -6,7 +6,7 @@
 //! viewer has avoided everywhere else.
 //!
 //! So the write runs on a `std::thread` and the answer comes back over a channel,
-//! polled once per frame — the same shape as the render pool and the file dialog. A
+//! polled once per frame - the same shape as the render pool and the file dialog. A
 //! third use of one pattern rather than a third concurrency mechanism.
 //!
 //! One save at a time. A second request while one is in flight is refused rather than
@@ -26,7 +26,7 @@ pub(crate) struct Saved {
     /// The page order that went into the file, in display order.
     ///
     /// Reported back rather than re-read from the document, because the order can move
-    /// while the write runs — see [`Saver::start`]. This is what
+    /// while the write runs - see [`Saver::start`]. This is what
     /// `PageOrder::mark_saved` needs to get "unsaved changes" right when somebody keeps
     /// editing during a save.
     pub(crate) written: Vec<usize>,
@@ -56,7 +56,7 @@ impl Saver {
     /// Starts a save, unless one is already running.
     ///
     /// Returns whether it started. The order is copied rather than borrowed so the
-    /// caller can go on editing while the write runs — the saved file reflects the
+    /// caller can go on editing while the write runs - the saved file reflects the
     /// order as it was when the save began, which is the only interpretation that does
     /// not need a lock.
     pub(crate) fn start(
@@ -75,7 +75,7 @@ impl Saver {
         let destination = destination.to_path_buf();
         let reported = destination.clone();
         // Taken here, on the UI thread, so it is unambiguously the order the write is
-        // about — even if the pages move again a millisecond from now.
+        // about - even if the pages move again a millisecond from now.
         let written = order.as_slice().to_vec();
 
         std::thread::spawn(move || {

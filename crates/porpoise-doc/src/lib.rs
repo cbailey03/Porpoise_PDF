@@ -3,7 +3,7 @@
 //!
 //! This crate deliberately knows nothing about rendering or windowing. Page
 //! geometry has to be known *before* any page is rasterized, because the
-//! scrolling viewport cannot be laid out without it — so it lives here rather
+//! scrolling viewport cannot be laid out without it - so it lives here rather
 //! than in `porpoise-render`.
 //!
 //! This is also the seam where `lopdf` joins for incremental save once the editor
@@ -83,7 +83,7 @@ impl Document {
     /// Parses a PDF already in memory.
     ///
     /// Page geometry for the whole document is computed eagerly here. This is
-    /// cheap — it reads the page tree without touching any content stream — and
+    /// cheap - it reads the page tree without touching any content stream - and
     /// it means the viewport can be laid out immediately on open.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, DocumentError> {
         // A malformed PDF is ordinary input for a viewer, and hayro has open panic

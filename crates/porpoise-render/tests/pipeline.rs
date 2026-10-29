@@ -145,7 +145,7 @@ fn degenerate_scales_are_rejected_before_rasterizing() {
 fn default_limits_reject_the_case_both_dimension_checks_would_pass() {
     // This is the hole the area cap exists to close. A 200x100 pt page at 300x
     // scale is 60000x30000 px. Both axes are under hayro's u16 viewport limit, so
-    // per-axis checks alone would wave it through — while asking for 1.8 billion
+    // per-axis checks alone would wave it through - while asking for 1.8 billion
     // pixels, about 7.2 GB of RGBA.
     let error = HayroRenderer::new()
         .render(&open_minimal(), request(0, 300.0))
@@ -643,7 +643,7 @@ fn tolerance_masks_differences_at_or_below_it_and_no_further() {
         "a delta of 3 survives a tolerance of 2"
     );
 
-    // At the delta, the difference is absorbed — but `max_channel_delta` keeps
+    // At the delta, the difference is absorbed - but `max_channel_delta` keeps
     // reporting the real distance, which is what makes a clean diff meaningful.
     let forgiving = pixel_diff(&left, &right, 3).expect("same dimensions");
     assert!(

@@ -1,7 +1,7 @@
 //! Showing a path to a person in limited space.
 //!
-//! Its own module because this was written three times independently — the window title,
-//! the save destination in the status bar, and the drop hint — each with the same
+//! Its own module because this was written three times independently - the window title,
+//! the save destination in the status bar, and the drop hint - each with the same
 //! fallback and none of them tested. A window is narrower than a path, so every one of
 //! them wanted the file name.
 
@@ -10,7 +10,7 @@ use std::path::Path;
 /// The file name, or the whole path when there is no file name to take.
 ///
 /// The fallback matters more than it looks. A path can perfectly well end in `..`, `/`,
-/// or a bare drive letter, and none of those have a file name — printing an empty label
+/// or a bare drive letter, and none of those have a file name - printing an empty label
 /// for one would read as a bug in whatever produced the path.
 pub(crate) fn file_label(path: &Path) -> String {
     path.file_name().map_or_else(
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn a_non_ascii_name_survives() {
-        let path = PathBuf::from("café/naïve plan.pdf");
-        assert_eq!(file_label(&path), "naïve plan.pdf");
+        let path = PathBuf::from("caf\u{e9}/na\u{ef}ve plan.pdf");
+        assert_eq!(file_label(&path), "na\u{ef}ve plan.pdf");
     }
 }

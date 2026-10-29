@@ -1,7 +1,7 @@
 //! Asking before unsaved page changes are thrown away.
 //!
 //! Reorder twenty pages, click the X, and until this existed they were gone with no
-//! prompt and no message. The program knew — the status bar said *unsaved changes* —
+//! prompt and no message. The program knew - the status bar said *unsaved changes* -
 //! and nothing acted on it. Same for opening a different file, and for closing the
 //! document.
 //!
@@ -10,7 +10,7 @@
 //! Everywhere else in this program a dialog is kept off the command surface, because a
 //! box only a person can dismiss is a box an agent can get stuck behind.
 //! The obvious reading of that rule here would be to raise
-//! the question from the X button, from `Ctrl+O`, and from a file drop — each producer
+//! the question from the X button, from `Ctrl+O`, and from a file drop - each producer
 //! checking for itself.
 //!
 //! That reading is wrong twice over. It repeats the check three times, so a fourth
@@ -19,7 +19,7 @@
 //!
 //! So the guard sits in front of dispatch and an agent gets the same protection a person
 //! does. An agent that reorders pages and then opens another file loses work exactly as
-//! a person would, so this is not a special case — it is the same rule. The way through
+//! a person would, so this is not a special case - it is the same rule. The way through
 //! is [`Answer`], which is a real command, which is why the whole flow can be tested end
 //! to end.
 //!
@@ -64,8 +64,8 @@ pub(crate) enum Guard {
     Asking(Intent),
     /// Answered with "save first"; waiting on the write to land.
     ///
-    /// A separate state because a save is not instant — about a second on a 400-page
-    /// document — and the intent must not be carried out until the file is really
+    /// A separate state because a save is not instant - about a second on a 400-page
+    /// document - and the intent must not be carried out until the file is really
     /// there. Collapsing this into `Asking` would mean quitting before the save
     /// finished, which loses the changes in the one case somebody explicitly asked to
     /// keep them.
@@ -93,7 +93,7 @@ impl Answer {
 ///
 /// The exhaustive match is the point. Adding a command that replaces or discards the
 /// document without deciding about it here fails to compile, which is the only reason
-/// this list can be trusted — the same mechanism `Command::shell_commands` uses to keep
+/// this list can be trusted - the same mechanism `Command::shell_commands` uses to keep
 /// the reference list honest.
 pub(crate) fn intent_of(command: &Command) -> Option<Intent> {
     match command {

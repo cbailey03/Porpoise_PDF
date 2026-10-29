@@ -3,8 +3,8 @@
 //!
 //! Everything here is pure arithmetic over page geometry, with no windowing or
 //! GPU dependency. That is deliberate. It makes the parts most likely to be
-//! subtly wrong — scroll offsets across heterogeneous page sizes, visible-set
-//! computation, cache eviction — unit-testable without a window, and it caps the
+//! subtly wrong - scroll offsets across heterogeneous page sizes, visible-set
+//! computation, cache eviction - unit-testable without a window, and it caps the
 //! cost of swapping the shell to one crate.
 //!
 //! All coordinates are in PDF points (1/72 inch) unless named otherwise. Zoom is
@@ -29,8 +29,8 @@
 //! # Page numbers versus page indices
 //!
 //! Anything a person or an agent reads or writes is a [`PageNumber`], where the first
-//! page is 1. Anything that indexes a collection — `ScrollLayout`, the cache, the
-//! renderer — is a zero-based `usize`. [`PageNumber::index`] and
+//! page is 1. Anything that indexes a collection - `ScrollLayout`, the cache, the
+//! renderer - is a zero-based `usize`. [`PageNumber::index`] and
 //! [`PageNumber::from_index`] are the only way across, so an off-by-one cannot happen
 //! quietly.
 //!

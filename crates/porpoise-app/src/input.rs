@@ -1,7 +1,7 @@
 //! Translating raw input into commands.
 //!
 //! Pure: no viewer state, no window, no side effects. That is what makes every
-//! binding testable, and it is also the shape the command model wants — input is a
+//! binding testable, and it is also the shape the command model wants - input is a
 //! *producer* of commands like any other, so the translation is a function rather
 //! than a method reaching into the app.
 
@@ -82,7 +82,7 @@ pub(crate) fn text_field_claims(modifiers: egui::Modifiers) -> bool {
 
 /// Whether this key press asks for the file dialog.
 ///
-/// Separate from [`command_for_key`] because the dialog is not a command — see
+/// Separate from [`command_for_key`] because the dialog is not a command - see
 /// [`crate::picker`]. Pure, so the binding is testable without a window.
 pub(crate) fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bool {
     (modifiers.command || modifiers.ctrl) && key == egui::Key::O
@@ -91,7 +91,7 @@ pub(crate) fn opens_the_picker(key: egui::Key, modifiers: egui::Modifiers) -> bo
 /// What dropping these files on the window would do.
 ///
 /// Like the file dialog, a drop is a **producer** of [`Command::Open`] rather than a
-/// command of its own — an agent already has `open` with a path, which is strictly more
+/// command of its own - an agent already has `open` with a path, which is strictly more
 /// capable than a gesture.
 ///
 /// One decision serves two callers: the hint painted while the drag is still in the air
@@ -118,7 +118,7 @@ impl DropAction {
     /// down, so the drag can be abandoned rather than answered.
     ///
     /// This used to read *"will be lost"*, which was true when the drop hint was the
-    /// only warning there was. It is not true any more — [`crate::confirm`] asks first —
+    /// only warning there was. It is not true any more - [`crate::confirm`] asks first -
     /// and a warning that overstates what is at stake is one people stop believing.
     pub(crate) fn hint(&self, unsaved_changes: bool) -> String {
         match self {
@@ -130,7 +130,7 @@ impl DropAction {
                 if unsaved_changes {
                     parts.push("you will be asked about your unsaved page changes".to_owned());
                 }
-                parts.join(" — ")
+                parts.join(" - ")
             }
             Self::Refuse { reason } => reason.clone(),
         }
@@ -139,7 +139,7 @@ impl DropAction {
 
 /// Decides what a set of dropped or hovered paths means.
 ///
-/// `None` means nothing is there — no drop, or a drop egui gave us no paths for.
+/// `None` means nothing is there - no drop, or a drop egui gave us no paths for.
 pub(crate) fn drop_action(paths: &[PathBuf]) -> Option<DropAction> {
     if paths.is_empty() {
         return None;
@@ -163,7 +163,7 @@ pub(crate) fn drop_action(paths: &[PathBuf]) -> Option<DropAction> {
 /// Whether a path names a PDF, judged by its extension.
 ///
 /// Extension only. Reading the first bytes would mean touching the disk while the
-/// pointer is still moving, and guessing wrong here is cheap — the open itself reports
+/// pointer is still moving, and guessing wrong here is cheap - the open itself reports
 /// the real parse failure. A directory has no `.pdf` extension, so this is also what
 /// keeps a dropped folder out.
 fn is_pdf(path: &Path) -> bool {
@@ -174,7 +174,7 @@ fn is_pdf(path: &Path) -> bool {
 /// Translates a key press into a command.
 ///
 /// Pure, and mode-aware on purpose. `PageDown` means "next page" in paged mode and
-/// "next screenful" in free mode — so the *key handler* decides which command that
+/// "next screenful" in free mode - so the *key handler* decides which command that
 /// is. Putting the mode dependence inside a command would mean an agent could
 /// never be sure what `NextPage` was going to do.
 pub(crate) fn command_for_key(
@@ -250,7 +250,7 @@ pub(crate) fn command_for_key(
 /// How far a wheel gesture scrolls when it turns a page, in screenfuls.
 ///
 /// One screenful is more than enough to cross an edge the view is already sitting on,
-/// and an edge is the only place a turn is ever emitted from — so the distance decides
+/// and an edge is the only place a turn is ever emitted from - so the distance decides
 /// nothing. It is a screenful because that is the honest name for "as much as the window
 /// can show", and because [`porpoise_view::ViewCommand::ScrollByViewports`] already
 /// means exactly that.
@@ -270,7 +270,7 @@ const TURN_SCREENFULS: f64 = 1.0;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Wheel {
     /// Movement from discrete notches this frame. Positive moves further into the
-    /// document — the opposite sign to egui's delta, which says how the *content* moves.
+    /// document - the opposite sign to egui's delta, which says how the *content* moves.
     pub(crate) notched: f32,
     /// Movement from a continuous gesture this frame, same sign.
     pub(crate) glided: f32,
@@ -327,7 +327,7 @@ impl Wheel {
 /// Deliberately *not* "is the pointer over the pages", which is the obvious way round and
 /// is wrong. A wheel event can arrive with no pointer position at all: winit's mouse-leave
 /// tracking clears egui's `hover_pos` the moment the cursor is not where it expects, and
-/// that was measured rather than imagined — under a pointer-over-the-pages test, page turns
+/// that was measured rather than imagined - under a pointer-over-the-pages test, page turns
 /// silently stopped happening.
 ///
 /// The strip is the only other scrolling area, so anything not over it belongs to the
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn a_dropped_folder_is_refused() {
-        // A directory has no `.pdf` extension, which is all that keeps it out — worth
+        // A directory has no `.pdf` extension, which is all that keeps it out - worth
         // pinning, because opening one would hand a path to `Document::open`.
         assert!(matches!(
             drop_action(&paths(&["C:/plans/gdot"])),
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn the_hint_mentions_unsaved_page_changes() {
         // So the drag can be abandoned rather than answered. It must not claim they
-        // *will be lost* — `crate::confirm` asks first, and a warning that overstates
+        // *will be lost* - `crate::confirm` asks first, and a warning that overstates
         // the stakes is one people stop believing.
         let action = drop_action(&paths(&["sheet.pdf"])).expect("a PDF was dropped");
         assert!(!action.hint(false).contains("unsaved"));
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn the_hint_and_the_drop_never_disagree() {
         // The whole point of one `drop_action` serving both. If the hint were computed
-        // separately, the window could invite a drop it then refuses — a worse outcome
+        // separately, the window could invite a drop it then refuses - a worse outcome
         // than showing nothing at all.
         let cases = [
             vec![],
@@ -849,7 +849,7 @@ mod tests {
 
     // --- Turning pages with the wheel ----------------------------------------
 
-    /// A page with nowhere left to scroll — the normal case at fit-page, and the one
+    /// A page with nowhere left to scroll - the normal case at fit-page, and the one
     /// where every gesture is a page turn.
     fn stuck() -> ScrollRoom {
         ScrollRoom {
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn every_notch_turns_a_page() {
         // The reason notches and swipes are told apart at all. A person spinning a wheel
-        // expects a page per notch, and `is_scrolling` stays true across a spin — so a
+        // expects a page per notch, and `is_scrolling` stays true across a spin - so a
         // rule based on the gesture alone would turn one page and then sit there.
         let mut turns = PageTurns::default();
         for spin in 0..5 {
@@ -976,7 +976,7 @@ mod tests {
     fn a_swipe_that_starts_by_scrolling_does_not_also_turn_a_page() {
         // One gesture does one thing. A swipe that begins with page left to scroll spends
         // itself on that page rather than carrying on into the next one when it hits the
-        // bottom — otherwise a long swipe would scroll *and* turn, which reads as the
+        // bottom - otherwise a long swipe would scroll *and* turn, which reads as the
         // document jumping.
         let mut turns = PageTurns::default();
         assert_eq!(turns.turn(glide(20.0), room_both_ways()), None);
@@ -1027,8 +1027,8 @@ mod tests {
     #[test]
     fn a_gesture_with_no_pointer_at_all_still_turns_the_page() {
         // The one that had to be measured. winit clears egui's hover position as soon as the
-        // cursor is not where it expects, so a wheel event routinely arrives with no pointer
-        // — and under the obvious test, "is the pointer over the pages", every page turn
+        // cursor is not where it expects, so a wheel event routinely arrives with no
+        // pointer, and under the obvious test, "is the pointer over the pages", every page turn
         // silently stopped happening.
         assert!(wheel_is_for_the_pages(None, Some(strip())));
     }

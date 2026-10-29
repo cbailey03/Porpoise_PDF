@@ -16,7 +16,7 @@ use crate::fit::{FitMode, fit_scale};
 /// Lives here rather than in the shell because it is a property of the layout, and
 /// because more than one caller has to agree on it: the viewer builds a layout to
 /// paint, and `porpoise info` builds one to describe. It was previously declared
-/// separately in each — plus a third time in an integration test — so `info` could
+/// separately in each - plus a third time in an integration test - so `info` could
 /// have reported a scroll height for a layout the viewer does not build, and nothing
 /// would have compared the two.
 pub const PAGE_GAP_PT: f64 = 12.0;
@@ -126,7 +126,7 @@ impl ScrollLayout {
     /// is at `viewport_top_pt`. `None` only when the document has no pages.
     ///
     /// The first visible page showing **at least half of as much of itself as it possibly
-    /// could** — half of `min(page height, viewport height)` — falling back to the topmost
+    /// could** - half of `min(page height, viewport height)` - falling back to the topmost
     /// visible page when none qualifies.
     ///
     /// # Why not simply the topmost visible page
@@ -139,7 +139,7 @@ impl ScrollLayout {
     /// the last page**, the last page's top is past the end of the scroll range: you can
     /// see the whole page, but you can never put its top edge at the top of the window.
     /// Under the topmost-visible rule the previous page went on claiming the view from a
-    /// sliver at the top — so the page counter never reached the end of the document, and
+    /// sliver at the top - so the page counter never reached the end of the document, and
     /// paged navigation stopped one page early with nothing to explain why.
     ///
     /// Measured on a 10-page drawing set of 792 pt pages: at fit-width in a 1024x768
@@ -149,7 +149,7 @@ impl ScrollLayout {
     /// # Why *half of what it could show*, rather than an absolute size
     ///
     /// Because it keeps the property the topmost rule was chosen for. Navigating to a page
-    /// puts its top at the window's top, which shows the most of it that geometry allows —
+    /// puts its top at the window's top, which shows the most of it that geometry allows -
     /// twice the threshold, whatever the zoom, page size or window. So *"go to page N, then
     /// ask which page we are on"* still answers N exactly, which is the round trip every
     /// client depends on. "Most visible page" does not survive that test with pages of
@@ -212,7 +212,7 @@ impl ScrollLayout {
     ///
     /// Deliberately based on the widest page rather than the current one. A
     /// document view uses a single zoom throughout, so that scrolling past a
-    /// landscape page does not resize every other page — which is what happens if
+    /// landscape page does not resize every other page - which is what happens if
     /// you fit each page independently.
     #[must_use]
     pub fn fit_width_scale(&self, viewport_width_pt: f32) -> f32 {
@@ -231,7 +231,7 @@ impl ScrollLayout {
 
     /// Zoom at which the largest page fits entirely inside the viewport.
     ///
-    /// Uses the bounding box across *all* pages — widest width, tallest height —
+    /// Uses the bounding box across *all* pages - widest width, tallest height -
     /// rather than the page currently on screen. Fitting the current page would
     /// change the zoom every time you scrolled between two page sizes, which reads
     /// as the document jumping around.
@@ -257,7 +257,7 @@ impl ScrollLayout {
     /// `index` and nothing else, as `(lowest, highest)`.
     ///
     /// The floor is the page's top edge. The ceiling is as far down as the view can go
-    /// with the page's bottom edge still at the bottom of the window — which is the
+    /// with the page's bottom edge still at the bottom of the window - which is the
     /// *same* as the floor whenever the page is shorter than the window, because then
     /// there is nowhere to go without showing the next page.
     ///
@@ -374,7 +374,7 @@ mod tests {
     fn going_to_a_page_reports_that_page_whatever_the_window() {
         // The property both rejected definitions broke, checked across window heights
         // that span "shorter than a page" to "several pages tall". Navigating puts the
-        // page's top at the window's top, which shows the most of it geometry allows — so
+        // page's top at the window's top, which shows the most of it geometry allows - so
         // this has to hold by construction, not by luck.
         let layout = ten_sheets();
         for viewport in [100.0, 396.0, 792.0, 865.4, 1000.0, 1600.0] {
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_window_still_names_a_page() {
-        // Zero height, or a nonsense height, sees no pages at all — but "which page are we
+        // Zero height, or a nonsense height, sees no pages at all - but "which page are we
         // on" still has to answer something, or the status bar would go blank on a window
         // that has been resized to nothing.
         let layout = ten_sheets();
@@ -443,7 +443,7 @@ mod tests {
     fn a_zero_height_page_does_not_claim_the_view_or_divide_by_nothing() {
         // A malformed PDF can report a page with no height. It covers no part of the
         // window, so `visible_pages` rightly leaves it out and the answer is the real page
-        // beside it — the point here is that the "half of what it could show" comparison
+        // beside it - the point here is that the "half of what it could show" comparison
         // does not divide by its zero height on the way to that answer.
         let layout = ScrollLayout::vertical(&[page(612.0, 0.0), letter()], 12.0);
         assert_eq!(layout.current_page(0.0, 800.0), Some(1));

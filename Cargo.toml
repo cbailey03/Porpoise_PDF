@@ -21,8 +21,8 @@ hayro = "0.7.1"
 hayro-syntax = "0.7.2"
 # Rewrites the page tree when saving a reordered document.
 #
-# `default-features = false` on purpose. The defaults pull in `rayon` — which this
-# workspace deliberately removed — plus three separate date libraries (`chrono`,
+# `default-features = false` on purpose. The defaults pull in `rayon` - which this
+# workspace deliberately removed - plus three separate date libraries (`chrono`,
 # `jiff`, `time`) for metadata we never read. We only need to load a page tree,
 # permute it, and write it back.
 lopdf = { version = "0.44", default-features = false }
@@ -35,7 +35,7 @@ eframe = "0.35"
 thiserror = "2.0"
 tracing = "0.1"
 # Without a subscriber installed, every `tracing` call compiles to a no-op and the
-# diagnostics vanish — including "the renderer just panicked", which is the last
+# diagnostics vanish - including "the renderer just panicked", which is the last
 # one we can afford to lose. `env-filter` is deliberately *not* enabled: it pulls
 # in regex machinery to parse a filter string, which is a poor trade for a project
 # whose argument rests on a small, auditable dependency graph.
@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 clap = { version = "4.6", features = ["derive"] }
 # The system file dialog. Default features are
-# `xdg-portal` on Linux, *not* `gtk3` — so `gtk-sys`, `glib-sys` and `gobject-sys`
+# `xdg-portal` on Linux, *not* `gtk3` - so `gtk-sys`, `glib-sys` and `gobject-sys`
 # stay out of the tree and the dialog is pure Rust. On Windows it is COM through
 # `windows-sys`, which eframe already pulls in, so it costs one crate: `pollster`.
 rfd = "0.17.2"

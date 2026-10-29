@@ -1,7 +1,7 @@
 //! The shell's command surface: everything [`ViewCommand`] cannot express.
 //!
 //! `porpoise-view` owns the commands that change what the view shows, and owns
-//! them precisely because they need no document, no window, and no renderer — that
+//! them precisely because they need no document, no window, and no renderer - that
 //! is what keeps them testable. The commands here cannot make that claim: opening
 //! a file is I/O, capturing a window needs a window, and quitting needs an event
 //! loop. So they live in the shell and wrap the pure ones rather than joining them.
@@ -13,7 +13,7 @@ use porpoise_view::{PageNumber, ViewCommand};
 use crate::confirm::Answer;
 use crate::thumbnails::GridMode;
 
-/// Anything an operator — a person at the keyboard, or an agent — can ask of the
+/// Anything an operator - a person at the keyboard, or an agent - can ask of the
 /// program.
 ///
 /// Deliberately *not* `Deserialize`. The obvious derive would nest a view command
@@ -54,7 +54,7 @@ pub(crate) enum Command {
     /// Move several pages at once, so the group ends up starting at `to`.
     ///
     /// The pages keep their relative order and arrive contiguous, however scattered they
-    /// were. One undo step for the whole group — see `PageOrder::move_pages`, which is
+    /// were. One undo step for the whole group - see `PageOrder::move_pages`, which is
     /// also where `to` is pinned down as *where the group ends up* rather than what it is
     /// inserted before.
     MovePages {
@@ -73,7 +73,7 @@ pub(crate) enum Command {
     /// Remove several pages at once, as one undo step.
     ///
     /// Refused if it would empty the document, rather than keeping an arbitrary page
-    /// back — which page was not meant to go is not something this can guess.
+    /// back - which page was not meant to go is not something this can guess.
     DeletePages {
         /// The pages to remove, counting from 1.
         pages: Vec<PageNumber>,
@@ -81,7 +81,7 @@ pub(crate) enum Command {
     /// Narrow the page grid to the pages a query names, or show them all again.
     ///
     /// The query is the text a person would type: a number, a range like `5-9`, a list
-    /// like `1,4,7`, or a mix. An empty string clears it. Never refused — anything
+    /// like `1,4,7`, or a mix. An empty string clears it. Never refused - anything
     /// unreadable simply matches nothing, because a filter that rejected half-typed input
     /// would be unusable in a box that filters as you type. See [`crate::search`].
     SetPageFilter {
@@ -91,7 +91,7 @@ pub(crate) enum Command {
     /// Pick out pages in the grid, replacing whatever was picked before.
     ///
     /// A command rather than click-only for the reason [`Self::SetGridMode`] is: it
-    /// changes what is on screen, and it decides what **Delete** acts on — so a client
+    /// changes what is on screen, and it decides what **Delete** acts on - so a client
     /// that cannot read it cannot tell what the button in front of it would do. An empty
     /// list clears the selection.
     SetSelection {
@@ -110,7 +110,7 @@ pub(crate) enum Command {
     /// Show or hide the page grid.
     ///
     /// A command rather than a click-only toggle because it changes what is on screen,
-    /// and unlike the file dialog an agent that opens it can also close it — so there is
+    /// and unlike the file dialog an agent that opens it can also close it - so there is
     /// no state it can enter and not leave.
     SetThumbnails {
         /// Whether the grid should be showing.
@@ -119,7 +119,7 @@ pub(crate) enum Command {
     /// Choose what clicking a page in the grid does.
     ///
     /// A command for the same reason [`Self::SetThumbnails`] is: it changes what is on
-    /// screen, and it decides what a click means — so an agent that reads a snapshot can
+    /// screen, and it decides what a click means - so an agent that reads a snapshot can
     /// tell what a person is looking at. See [`GridMode`] for why the panel has modes.
     SetGridMode {
         /// Navigate, or reorganize.
@@ -169,7 +169,7 @@ impl Command {
     ///
     /// The argument values are placeholders; only the variant matters. Kept exhaustive
     /// by `every_shell_command_is_in_the_reference_list`, which matches on every
-    /// variant and so fails to compile when one is added — the same mechanism
+    /// variant and so fails to compile when one is added - the same mechanism
     /// [`ViewCommand::ALL`] uses. Without it, a new command would simply be missing
     /// from what the control channel advertises, and an agent would have no way to
     /// discover it.

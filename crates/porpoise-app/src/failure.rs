@@ -27,8 +27,8 @@ impl Failure {
     ///
     /// A timeout usually means the machine was momentarily busy rather than that this
     /// page is unrenderable, so it earns another attempt. Every other failure is
-    /// deterministic — the index is out of range, the size is refused, or the
-    /// interpreter panicked — and retrying one only burns a worker to arrive at the
+    /// deterministic - the index is out of range, the size is refused, or the
+    /// interpreter panicked - and retrying one only burns a worker to arrive at the
     /// same answer.
     pub(crate) fn from_error(error: &RenderError, previous: Option<&Self>) -> Self {
         let retries_left = if matches!(error, RenderError::TimedOut { .. }) {

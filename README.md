@@ -9,26 +9,26 @@ driving the program from another process.
 
 - **View**: scroll freely or page by page, navigate by keyboard, zoom by wheel, pinch, key, or fit
   mode, and pan once a page is wider than the window. Pages rasterize on worker threads so the UI
-  never blocks — a 400-page drawing set holds about 16 MB of cached textures and scrolls at 40
+  never blocks - a 400-page drawing set holds about 16 MB of cached textures and scrolls at 40
   pages/sec with a 60 fps median.
 - **Hardened against damaged input**: 4,000 deterministic mutations plus every truncation length of
-  a valid PDF all open or return an error — none panic, none hang — and rejecting damaged input
-  averages 7 µs.
-- **Open a file** by dragging it onto the window, `Ctrl+O`, the **Open…** button, or a path on the
+  a valid PDF all open or return an error - none panic, none hang - and rejecting damaged input
+  averages 7 microseconds.
+- **Open a file** by dragging it onto the window, `Ctrl+O`, the **Open...** button, or a path on the
   command line. Launching with no path opens an empty window instead of refusing to start.
 - **`Ctrl+T`** opens a grid of page thumbnails with two tabs: **Navigation** jumps the main view to
   a clicked page, **Reorganize** lets you pick pages and drag them into a new order. A search box
-  above narrows the grid by page number — a single number, a range like `5-9`, a list like
+  above narrows the grid by page number - a single number, a range like `5-9`, a list like
   `1,4,7`, or any mix.
-- **Reorganize** supports picking several pages at once — click, `Ctrl+click`, `Shift+click`, or a
-  drag box over empty space — and moves or deletes the whole group as one undo step.
+- **Reorganize** supports picking several pages at once - click, `Ctrl+click`, `Shift+click`, or a
+  drag box over empty space - and moves or deletes the whole group as one undo step.
 - Pages also reorder and delete from the toolbar or keyboard, with undo, then **Save** or **Save
   As**. A save is atomic (written beside the file, then renamed into place). A document whose page
   tree is nested is flattened on the way out, with each page's inherited size, rotation and
   resources written onto the page first, so moving a page between branches cannot change how it
   renders.
-- Closing the window or opening another file with unsaved page changes **asks first** — save,
-  discard, or cancel — the same whether a person or a script is driving.
+- Closing the window or opening another file with unsaved page changes **asks first** - save,
+  discard, or cancel - the same whether a person or a script is driving.
 - **Paged** and **Free** view modes: one page at a time, or one continuous scroll.
 
 ## Keys
@@ -36,16 +36,16 @@ driving the program from another process.
 | | |
 |---|---|
 | `Ctrl` `O` | Open a PDF (or drag one onto the window) |
-| `Ctrl` `↑` / `Ctrl` `↓` | Move this page earlier / later |
+| `Ctrl` `Up` / `Ctrl` `Down` | Move this page earlier / later |
 | `Ctrl` `T` | Show or hide the page grid |
 | `Ctrl` `Z` | Undo the last page edit |
 | `Ctrl` `S` | Save over the original |
 | `PageDown` / `Space` | Next page, or next screenful in free mode |
 | `PageUp` / `Shift+Space` | Previous |
-| `←` / `→` | Previous / next page, in either mode |
-| `Home` / `End`, or `↑` / `↓` | First / last page |
-| `Shift` `↑` / `Shift` `↓` | Small scroll step |
-| `Shift` `←` / `Shift` `→` | Pan sideways, once zoomed in past the window's width |
+| `Left` / `Right` | Previous / next page, in either mode |
+| `Home` / `End`, or `Up` / `Down` | First / last page |
+| `Shift` `Up` / `Shift` `Down` | Small scroll step |
+| `Shift` `Left` / `Shift` `Right` | Pan sideways, once zoomed in past the window's width |
 | `Ctrl` + wheel, or pinch | Zoom |
 | `Ctrl` `+` / `Ctrl` `-` | Zoom by one step |
 | `Ctrl` `0` / `Ctrl` `1` / `Ctrl` `2` | Fit width / 100% / fit page |

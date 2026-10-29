@@ -9,8 +9,8 @@
 //!
 //! Queued work can be dropped wholesale with [`RenderPool::cancel_pending`],
 //! which is what happens when the viewport moves and the previous request order
-//! is obsolete. Work a thread has already *started* cannot be cancelled — Rust
-//! has no way to interrupt a running thread — so up to one job per worker may
+//! is obsolete. Work a thread has already *started* cannot be cancelled - Rust
+//! has no way to interrupt a running thread - so up to one job per worker may
 //! complete after being cancelled. Those results come back anyway and the caller
 //! discards the ones it no longer wants, which costs a little wasted work bounded
 //! by the worker count.

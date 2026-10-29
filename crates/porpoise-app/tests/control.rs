@@ -6,15 +6,17 @@
 //! Without it, "an AI agent can drive the program" would be exactly the kind of
 //! untested claim this project has refused everywhere else.
 //!
-//! # Needs a display
+//! # Headless by default, a few in a window
 //!
-//! `porpoise serve` opens a window, so these tests need a display server. They are
-//! skipped - loudly, never silently - when `PORPOISE_E2E` is unset, so that a
-//! headless `cargo test` does not report a failure it cannot help.
+//! Every test here runs `porpoise serve --headless`, so a plain `cargo test` runs the
+//! whole suite with no display and nothing on screen. Captures render off-screen, so
+//! the capture tests need a GPU or a software renderer such as Mesa's llvmpipe.
 //!
-//! Nothing sets it for you since CI was removed, so a plain `cargo test` reports these
-//! as passing without running them. `PORPOISE_E2E=1 cargo test` is in the README's
-//! *Checks* section for that reason.
+//! Headless skips eframe's real window, input and surface, so three tests also run in
+//! a window: opening, navigating and capturing; quitting with unsaved changes; and
+//! closing stdin. Those `_in_a_window` variants need a display and are skipped - loudly,
+//! never silently - unless `PORPOISE_E2E` is set. `PORPOISE_E2E=1 cargo test` is in
+//! CONTRIBUTING.md's checks for that reason.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -40,42 +42,76 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The fixture: enough pages that navigating to page 4 means something.
 const PAGES: usize = 6;
 
-/// Serializes these tests against one another.
+/// Serializes the windowed tests against one another. Headless tests do not take it.
 ///
-/// Each opens a real GPU window, and the control channel is serviced *inside the frame
-/// loop* - so a window starved of frames is a window that has stopped answering.
-/// Eight of them contending for one adapter starve each other, and whichever test is
-/// waiting on a reply then times out after a minute.
+/// Each windowed test opens a real GPU window, and the control channel is serviced
+/// *inside the frame loop* - so a window starved of frames is a window that has stopped
+/// answering. Eight of them contending for one adapter starve each other, and whichever
+/// test is waiting on a reply then times out after a minute.
 ///
 /// Measured, not guessed: run alone the offending test passed three times out of
 /// three, `--test-threads=1` passes all eight in 7.5 s, and the parallel run failed
 /// intermittently. A lock rather than a note asking for `--test-threads=1`, so it
 /// holds however cargo is invoked.
+///
+/// Headless tests were measured the same way before being let off it. With every
+/// headless test unlocked, the suite (29 headless, 3 windowed skipped) passed five runs
+/// out of five, in 10.2, 8.3, 8.8, 9.0 and 8.6 s, against 22.3 s with the lock, on a
+/// 32-thread machine. A headless frame has no surface to present and no compositor to
+/// wait on, which is what made windows starve each other.
 static ONE_WINDOW_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// How a test runs the program: with no window, or with a real one.
+#[derive(Clone, Copy)]
+enum Mode {
+    Headless,
+    Windowed,
+}
+
+impl Mode {
+    /// The `serve` flags that select this mode.
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Headless => &["--headless"],
+            Self::Windowed => &[],
+        }
+    }
+
+    /// For file names, so the two runs of one test never share a fixture or a capture.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Headless => "headless",
+            Self::Windowed => "windowed",
+        }
+    }
+}
 
 /// Skips loudly when there is no display, and otherwise takes the window lock.
 ///
 /// One call rather than a skip check and a separate lock, so the lock cannot be
 /// forgotten: there is no way past this line without holding it. A test that silently
 /// does nothing reads as coverage it is not providing, hence the message.
-fn e2e(name: &str) -> Option<MutexGuard<'static, ()>> {
+fn windowed(name: &str) -> Option<MutexGuard<'static, ()>> {
     if std::env::var_os("PORPOISE_E2E").is_none() {
         eprintln!("SKIPPED {name}: set PORPOISE_E2E=1 (needs a display) to run it");
         return None;
     }
+    Some(one_at_a_time())
+}
+
+fn one_at_a_time() -> MutexGuard<'static, ()> {
     // Poisoning is ignored on purpose. A panicking test has already reported itself,
     // and refusing the lock afterwards would turn one failure into eight.
-    Some(
-        ONE_WINDOW_AT_A_TIME
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    ONE_WINDOW_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A running `porpoise serve` and its two pipes.
 struct Serve {
     child: Child,
-    stdin: ChildStdin,
+    /// `None` once [`Self::hang_up`] has closed it.
+    stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     next_id: u64,
     /// How many `page_failed` events have come past, counted on the way through.
@@ -86,11 +122,37 @@ struct Serve {
 }
 
 impl Serve {
-    /// Starts the binary on `document`.
+    /// Starts the binary headless on `document`.
     fn start(document: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-            .arg("serve")
-            .arg(document)
+        Self::start_in(Mode::Headless, document)
+    }
+
+    /// Starts the binary on `document`, with a window or without.
+    fn start_in(mode: Mode, document: &Path) -> Self {
+        Self::start_with(Some(document), mode.flags(), &[])
+    }
+
+    /// Starts the binary headless with no document, as an agent choosing what to open
+    /// would.
+    fn start_empty() -> Self {
+        Self::start_with(None, Mode::Headless.flags(), &[])
+    }
+
+    /// Starts the binary on `document`, if any, with extra `serve` flags, and with the
+    /// named environment variables removed from what it inherits.
+    ///
+    /// Every test starts the program through here, so none can forget `--headless` and
+    /// put a window on the desktop of whoever runs `cargo test`.
+    fn start_with(document: Option<&Path>, flags: &[&str], env_remove: &[&str]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_porpoise"));
+        command.arg("serve").args(flags);
+        if let Some(document) = document {
+            command.arg(document);
+        }
+        for name in env_remove {
+            command.env_remove(name);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherited, so tracing warnings show up in the test output rather
@@ -120,7 +182,7 @@ impl Serve {
 
         Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines,
             next_id: 1,
             failures_seen: Cell::new(0),
@@ -129,8 +191,15 @@ impl Serve {
 
     /// Sends a raw line.
     fn send_raw(&mut self, line: &str) {
-        writeln!(self.stdin, "{line}").expect("should write to the control channel");
-        self.stdin.flush().expect("should flush");
+        let stdin = self.stdin.as_mut().expect("the test already hung up");
+        writeln!(stdin, "{line}").expect("should write to the control channel");
+        stdin.flush().expect("should flush");
+    }
+
+    /// Closes the control channel, the way a controlling process that exits or crashes
+    /// does.
+    fn hang_up(&mut self) {
+        drop(self.stdin.take());
     }
 
     /// Sends a command with a fresh id and returns that id.
@@ -290,13 +359,21 @@ fn scratch(name: &str) -> PathBuf {
 
 #[test]
 fn an_agent_can_open_navigate_and_capture() {
-    let Some(_window) = e2e("an_agent_can_open_navigate_and_capture") else {
+    an_agent_can_open_navigate_and_capture_in(Mode::Headless);
+}
+
+#[test]
+fn an_agent_can_open_navigate_and_capture_in_a_window() {
+    let Some(_lock) = windowed("an_agent_can_open_navigate_and_capture_in_a_window") else {
         return;
     };
+    an_agent_can_open_navigate_and_capture_in(Mode::Windowed);
+}
 
-    let document = fixture("e2e-navigate.pdf");
-    let capture = scratch("e2e-capture.png");
-    let mut serve = Serve::start(&document);
+fn an_agent_can_open_navigate_and_capture_in(mode: Mode) {
+    let document = fixture(&format!("e2e-navigate-{}.pdf", mode.tag()));
+    let capture = scratch(&format!("e2e-capture-{}.png", mode.tag()));
+    let mut serve = Serve::start_in(mode, &document);
 
     // 1. Discovery: an agent should be able to ask what the program does.
     let id = serve.send("commands", &[]);
@@ -378,7 +455,7 @@ fn an_agent_can_open_navigate_and_capture() {
         "unexpected capture path: {event}"
     );
 
-    // 6. The proof: a real PNG, of a real window, with real dimensions.
+    // 6. The proof: a real PNG, of the real frame, with real dimensions.
     let bytes = std::fs::read(&capture).expect("the capture should exist on disk");
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let reader = decoder.read_info().expect("should be a readable PNG");
@@ -395,10 +472,6 @@ fn an_agent_can_open_navigate_and_capture() {
 
 #[test]
 fn a_capture_leaves_the_window_open_for_more_commands() {
-    let Some(_window) = e2e("a_capture_leaves_the_window_open_for_more_commands") else {
-        return;
-    };
-
     // The regression this exists for: `capture` closed the window, because the
     // capture machinery was written for the one-shot CLI `--screenshot` flag, where
     // capture-then-exit is the whole point, and was then reused for the `capture`
@@ -459,36 +532,9 @@ fn a_capture_leaves_the_window_open_for_more_commands() {
 
 #[test]
 fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
-    let Some(_window) = e2e("an_agent_can_open_a_document_that_was_not_on_the_command_line") else {
-        return;
-    };
-
     // No file argument: the window starts empty, which is the case that matters for
     // an agent choosing what to look at.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("porpoise should launch");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (sender, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut serve = Serve {
-        child,
-        stdin,
-        lines,
-        next_id: 1,
-        failures_seen: Cell::new(0),
-    };
+    let mut serve = Serve::start_empty();
 
     let view = serve.view();
     assert_eq!(
@@ -523,10 +569,6 @@ fn an_agent_can_open_a_document_that_was_not_on_the_command_line() {
 
 #[test]
 fn an_agent_can_reorder_a_document_and_save_it() {
-    let Some(_window) = e2e("an_agent_can_reorder_a_document_and_save_it") else {
-        return;
-    };
-
     // Goal 4 through the running program rather than the library. `porpoise-render`'s
     // reorder tests prove the *bytes* are right by comparing pixels; this proves the
     // command path reaches them - that a move changes what the window shows, that the
@@ -654,10 +696,6 @@ fn an_agent_can_reorder_a_document_and_save_it() {
 
 #[test]
 fn the_page_grid_can_be_opened_and_closed_by_command() {
-    let Some(_window) = e2e("the_page_grid_can_be_opened_and_closed_by_command") else {
-        return;
-    };
-
     // The grid is chrome, not a document edit, so it gets a command rather than being
     // click-only. Unlike the file dialog there is no argument for leaving it out: it
     // changes what is on screen, and an agent that opens it can also close it, so it
@@ -713,10 +751,6 @@ fn the_page_grid_can_be_opened_and_closed_by_command() {
 
 #[test]
 fn pages_can_be_picked_out_and_moved_as_a_group() {
-    let Some(_window) = e2e("pages_can_be_picked_out_and_moved_as_a_group") else {
-        return;
-    };
-
     // The grid's ctrl+click, shift+click and marquee all come down to `set_selection`,
     // and dragging the result comes down to `move_pages`. Neither gesture can be
     // synthesized here, but both commands can - so what a gesture *authors* is covered
@@ -844,10 +878,6 @@ fn pages_can_be_picked_out_and_moved_as_a_group() {
 
 #[test]
 fn the_page_grid_can_be_narrowed_to_a_few_pages() {
-    let Some(_window) = e2e("the_page_grid_can_be_narrowed_to_a_few_pages") else {
-        return;
-    };
-
     // The search box narrows the grid, and reports both what was typed and what it
     // resolved to - so a client need not reimplement the query parser to know what is on
     // screen. `PAGES` is 6.
@@ -953,10 +983,6 @@ fn the_page_grid_can_be_narrowed_to_a_few_pages() {
 
 #[test]
 fn leaving_reorganize_mode_forgets_the_selection() {
-    let Some(_window) = e2e("leaving_reorganize_mode_forgets_the_selection") else {
-        return;
-    };
-
     // A selection nobody can see is a trap, because Delete acts on it. Cleared on the way
     // out rather than ignored while hidden, so the state and the snapshot agree.
     let document = fixture("e2e-selection-clear.pdf");
@@ -1000,10 +1026,6 @@ fn leaving_reorganize_mode_forgets_the_selection() {
 
 #[test]
 fn the_page_grid_mode_can_be_set_by_command() {
-    let Some(_window) = e2e("the_page_grid_mode_can_be_set_by_command") else {
-        return;
-    };
-
     // The mode decides what clicking a thumbnail does, so it is state a client has to be
     // able to read as well as set - otherwise a screenshot of the grid is ambiguous about
     // what a click in it would have done.
@@ -1083,10 +1105,6 @@ fn the_page_grid_mode_can_be_set_by_command() {
 
 #[test]
 fn saving_an_unedited_document_over_itself_is_refused() {
-    let Some(_window) = e2e("saving_an_unedited_document_over_itself_is_refused") else {
-        return;
-    };
-
     // Rewriting the file would not even be byte-identical - the writer makes its own
     // encoding choices - so an unedited save is a no-op rather than a harmless one.
     let document = fixture("e2e-no-op-save.pdf");
@@ -1112,40 +1130,13 @@ fn saving_an_unedited_document_over_itself_is_refused() {
 
 #[test]
 fn an_empty_window_can_still_be_captured() {
-    let Some(_window) = e2e("an_empty_window_can_still_be_captured") else {
-        return;
-    };
-
     // The regression: `capture` waited on `open.settled() && !cache.is_empty()`, which
     // with no document is false forever - so the request was never sent and the
     // attempt burned its whole frame budget before reporting "no screenshot arrived".
     // Harmless while a path was mandatory. Since Goal 3 an empty window is how the
     // program starts, so it is the first thing anyone would try to capture.
     let capture = scratch("e2e-empty-window.png");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
-        .arg("serve")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("porpoise should launch");
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (sender, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let mut serve = Serve {
-        child,
-        stdin,
-        lines,
-        next_id: 1,
-        failures_seen: Cell::new(0),
-    };
+    let mut serve = Serve::start_empty();
 
     let id = serve.send(
         "capture",
@@ -1171,10 +1162,6 @@ fn an_empty_window_can_still_be_captured() {
 
 #[test]
 fn idle_is_never_reported_while_a_move_is_still_pending() {
-    let Some(_window) = e2e("idle_is_never_reported_while_a_move_is_still_pending") else {
-        return;
-    };
-
     // `idle` is the field every client is told to wait on, so it must not be true while
     // the view still has somewhere to go. It used to count only render work, and a
     // scroll command records a *request* that the shell carries out while painting - so
@@ -1241,10 +1228,6 @@ fn idle_is_never_reported_while_a_move_is_still_pending() {
 
 #[test]
 fn a_file_that_will_not_open_reports_a_visible_reason() {
-    let Some(_window) = e2e("a_file_that_will_not_open_reports_a_visible_reason") else {
-        return;
-    };
-
     // Goal 3's third part. Until the file picker existed, a bad path was a startup
     // error printed to a terminal; now it is something a person does at runtime, so
     // the reason has to be readable rather than going only to `tracing::warn!` - which
@@ -1310,10 +1293,6 @@ fn a_file_that_will_not_open_reports_a_visible_reason() {
 
 #[test]
 fn a_malformed_message_is_refused_without_killing_the_session() {
-    let Some(_window) = e2e("a_malformed_message_is_refused_without_killing_the_session") else {
-        return;
-    };
-
     let document = fixture("e2e-malformed.pdf");
     let mut serve = Serve::start(&document);
 
@@ -1351,10 +1330,6 @@ fn a_malformed_message_is_refused_without_killing_the_session() {
 
 #[test]
 fn a_refused_command_explains_itself_and_changes_nothing() {
-    let Some(_window) = e2e("a_refused_command_explains_itself_and_changes_nothing") else {
-        return;
-    };
-
     let document = fixture("e2e-refused.pdf");
     let mut serve = Serve::start(&document);
     serve.wait_for_event("idle");
@@ -1405,15 +1380,39 @@ fn a_refused_command_explains_itself_and_changes_nothing() {
 
 #[test]
 fn closing_stdin_shuts_the_program_down() {
-    let Some(_window) = e2e("closing_stdin_shuts_the_program_down") else {
+    closing_stdin_shuts_the_program_down_in(Mode::Headless);
+}
+
+#[test]
+fn closing_stdin_shuts_the_program_down_in_a_window() {
+    let Some(_lock) = windowed("closing_stdin_shuts_the_program_down_in_a_window") else {
         return;
     };
+    closing_stdin_shuts_the_program_down_in(Mode::Windowed);
+}
 
+#[test]
+fn closing_stdin_with_unsaved_changes_still_exits() {
+    // The one exit the unsaved-changes guard deliberately does not hold back (see
+    // `confirm`): once the controller is gone there is nobody left to answer. Headless,
+    // a guard that asked anyway would leave an invisible process running for good.
+    let document = fixture("e2e-hangup-dirty.pdf");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+    make_it_dirty(&mut serve);
+
+    serve.hang_up();
+
+    serve.expect_exit();
+}
+
+fn closing_stdin_shuts_the_program_down_in(mode: Mode) {
     // The convention every stdio protocol follows: when the controller goes away,
     // so do we. Without it an abandoned window survives its agent.
-    let document = fixture("e2e-hangup.pdf");
+    let document = fixture(&format!("e2e-hangup-{}.pdf", mode.tag()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_porpoise"))
         .arg("serve")
+        .args(mode.flags())
         .arg(&document)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1429,13 +1428,73 @@ fn closing_stdin_shuts_the_program_down() {
 }
 
 #[test]
-fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
-    let Some(_window) =
-        e2e("paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page")
-    else {
-        return;
-    };
+fn headless_serve_needs_no_display() {
+    // Both display variables are removed, so a headless mode that quietly still opened
+    // a window would fail here instead of borrowing the desktop it happens to run on.
+    let document = fixture("e2e-headless.pdf");
+    let mut serve = Serve::start_with(
+        Some(&document),
+        &["--headless"],
+        &["DISPLAY", "WAYLAND_DISPLAY"],
+    );
 
+    serve.wait_for_event("idle");
+    assert_eq!(
+        serve.view().get("page_count").and_then(Value::as_u64),
+        Some(PAGES as u64)
+    );
+    serve.quit();
+}
+
+#[test]
+fn a_headless_capture_shows_the_page() {
+    // The page is white and nothing egui draws around it ever is, so exactly-white
+    // pixels mean page textures reached the off-screen renderer - not just that a PNG
+    // of the right size was written, which an empty frame would also manage.
+    let document = fixture("e2e-headless-capture.pdf");
+    let capture = scratch("e2e-headless-capture.png");
+    let mut serve = Serve::start(&document);
+    serve.wait_for_event("idle");
+
+    let id = serve.send(
+        "capture",
+        &[("path", Value::from(capture.to_string_lossy().as_ref()))],
+    );
+    assert_eq!(
+        serve.reply_to(id).get("outcome").and_then(Value::as_str),
+        Some("capturing")
+    );
+    serve.wait_for_event("captured");
+
+    let bytes = std::fs::read(&capture).expect("the capture should exist on disk");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .expect("should be a readable PNG");
+    let mut rgba = vec![0; reader.output_buffer_size().expect("a sane size")];
+    let info = reader.next_frame(&mut rgba).expect("should decode");
+    assert_eq!((info.width, info.height), (1024, 768));
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+
+    let white = rgba
+        .chunks_exact(4)
+        .filter(|pixel| pixel[..3] == [255, 255, 255])
+        .count();
+    let share = white as f64 / (1024.0 * 768.0);
+    eprintln!(
+        "a_headless_capture_shows_the_page: {:.1}% white",
+        share * 100.0
+    );
+    assert!(
+        share > 0.10,
+        "only {:.1}% of the capture is page",
+        share * 100.0
+    );
+
+    serve.quit();
+}
+
+#[test]
+fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
     // A regression a person found before any test did. The last page's top sits at
     // `content_height - page_height` and scrolling stops at `content_height -
     // viewport_height`, so once the window is TALLER than a page, the last page's top is
@@ -1511,10 +1570,6 @@ fn paged_navigation_reaches_the_last_page_in_a_window_taller_than_a_page() {
 
 #[test]
 fn paged_mode_shows_one_page_where_free_mode_shows_two() {
-    let Some(_window) = e2e("paged_mode_shows_one_page_where_free_mode_shows_two") else {
-        return;
-    };
-
     // The complaint that produced the mode: "even when paged is selected, it still scrolls
     // like a free scroll". Paged mode changed what PageDown meant and nothing else, so the
     // next page still showed below the current one and the wheel rolled straight past it.
@@ -1562,10 +1617,6 @@ fn paged_mode_shows_one_page_where_free_mode_shows_two() {
 
 #[test]
 fn scrolling_in_paged_mode_turns_the_page() {
-    let Some(_window) = e2e("scrolling_in_paged_mode_turns_the_page") else {
-        return;
-    };
-
     // What the wheel and the arrow keys do, over the wire. Scrolling off the end of the
     // page is the only gesture a single-page view has left, so it has to mean the next
     // page - and the same command an agent sends is the one the wheel produces.
@@ -1646,10 +1697,6 @@ fn scrolling_in_paged_mode_turns_the_page() {
 
 #[test]
 fn the_page_grid_does_not_fight_the_page_column_over_textures() {
-    let Some(_window) = e2e("the_page_grid_does_not_fight_the_page_column_over_textures") else {
-        return;
-    };
-
     // Reported as "pages 10, 11 and 12 flicker". The texture cache has two consumers, and
     // eviction ran inside the page column with only its own window to go on - so the grid
     // asked for a thumbnail, the render landed, the column evicted it for being far from the
@@ -1707,10 +1754,6 @@ fn the_page_grid_does_not_fight_the_page_column_over_textures() {
 
 #[test]
 fn the_page_grid_stops_asking_for_a_page_the_renderer_refuses() {
-    let Some(_window) = e2e("the_page_grid_stops_asking_for_a_page_the_renderer_refuses") else {
-        return;
-    };
-
     // The grid submitted renders without the retry budget the page column uses, so a page
     // that cannot be rasterized was re-requested from the grid on every frame it was on
     // screen - a worker permanently busy producing an answer already known.
@@ -1799,12 +1842,21 @@ fn make_it_dirty(serve: &mut Serve) {
 
 #[test]
 fn quitting_with_unsaved_changes_asks_before_losing_them() {
-    let Some(_window) = e2e("quitting_with_unsaved_changes_asks_before_losing_them") else {
+    quitting_with_unsaved_changes_asks_before_losing_them_in(Mode::Headless);
+}
+
+#[test]
+fn quitting_with_unsaved_changes_asks_before_losing_them_in_a_window() {
+    let Some(_lock) = windowed("quitting_with_unsaved_changes_asks_before_losing_them_in_a_window")
+    else {
         return;
     };
+    quitting_with_unsaved_changes_asks_before_losing_them_in(Mode::Windowed);
+}
 
-    let document = fixture("e2e-guard-quit.pdf");
-    let mut serve = Serve::start(&document);
+fn quitting_with_unsaved_changes_asks_before_losing_them_in(mode: Mode) {
+    let document = fixture(&format!("e2e-guard-quit-{}.pdf", mode.tag()));
+    let mut serve = Serve::start_in(mode, &document);
     serve.wait_for_event("idle");
     make_it_dirty(&mut serve);
 
@@ -1862,10 +1914,6 @@ fn quitting_with_unsaved_changes_asks_before_losing_them() {
 
 #[test]
 fn opening_another_document_with_unsaved_changes_asks_first() {
-    let Some(_window) = e2e("opening_another_document_with_unsaved_changes_asks_first") else {
-        return;
-    };
-
     // `open` replaces the document, so it loses an edit exactly as quitting does. Two
     // commands, one guard - which is the point of guarding dispatch rather than each
     // producer.
@@ -1926,10 +1974,6 @@ fn opening_another_document_with_unsaved_changes_asks_first() {
 
 #[test]
 fn answering_save_writes_the_file_before_going_ahead() {
-    let Some(_window) = e2e("answering_save_writes_the_file_before_going_ahead") else {
-        return;
-    };
-
     // The ordering that is easy to get wrong: a save takes about a second and runs off
     // the UI thread, so firing both and hoping would close the document before the file
     // existed. `close` rather than `quit` as the intent, so the session survives to prove
@@ -1985,10 +2029,6 @@ fn answering_save_writes_the_file_before_going_ahead() {
 
 #[test]
 fn a_saved_document_stops_claiming_unsaved_changes() {
-    let Some(_window) = e2e("a_saved_document_stops_claiming_unsaved_changes") else {
-        return;
-    };
-
     // Before this, `unsaved_changes` meant "differs from the document as first opened"
     // and nothing ever cleared it - so a saved file went on claiming changes forever.
     // Survivable while it only lit a status bar; not survivable once a warning is built
@@ -2020,10 +2060,6 @@ fn a_saved_document_stops_claiming_unsaved_changes() {
 
 #[test]
 fn answering_save_with_nothing_left_to_save_still_goes_ahead() {
-    let Some(_window) = e2e("answering_save_with_nothing_left_to_save_still_goes_ahead") else {
-        return;
-    };
-
     // Reachable because the question box does not block the control channel: the order
     // can be put back while it is up. "Save, then continue" with nothing to save is just
     // "continue" - leaving the question standing would strand it with no answer that
@@ -2065,10 +2101,6 @@ fn answering_save_with_nothing_left_to_save_still_goes_ahead() {
 
 #[test]
 fn answering_when_nothing_was_asked_does_nothing() {
-    let Some(_window) = e2e("answering_when_nothing_was_asked_does_nothing") else {
-        return;
-    };
-
     // A stray `answer` must not be a way to close the document by accident. Worth
     // pinning because `discard` is the destructive choice and this is the path a
     // confused client takes.

@@ -49,6 +49,9 @@ clap = { version = "4.6", features = ["derive"] }
 # stay out of the tree and the dialog is pure Rust. On Windows it is COM through
 # `windows-sys`, which eframe already pulls in, so it costs one crate: `pollster`.
 rfd = "0.17.2"
+# Blocks on wgpu's adapter and device futures for headless capture, which has no event
+# loop to drive them. Already in the tree via rfd, so this adds a direct edge only.
+pollster = "0.4"
 # The control channel's wire format. Both are
 # already in the tree via the eframe stack, so this adds a direct edge rather
 # than new code.

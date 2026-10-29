@@ -10,9 +10,11 @@ mod control;
 mod devtools;
 mod edits;
 mod failure;
+mod headless;
 mod input;
 mod label;
 mod navigation;
+mod offscreen;
 mod picker;
 mod protocol;
 mod queue;
@@ -118,6 +120,11 @@ struct ServeArgs {
     /// Open scrolled to this page, counting from 1.
     #[arg(long, requires = "file")]
     start_page: Option<usize>,
+
+    /// Run with no window or display. Everything works the same, including capture
+    /// when a GPU or software renderer is available.
+    #[arg(long)]
+    headless: bool,
 }
 
 #[derive(Args)]
@@ -291,10 +298,11 @@ fn run_viewer(
             benchmark_frames: scroll_benchmark,
             report_first_page_from,
         },
+        capture_unavailable: None,
     })
 }
 
-/// Opens a window driven by commands on stdin.
+/// Opens a window driven by commands on stdin, or with `--headless`, no window at all.
 ///
 /// The document is optional: an agent can send `open` instead. Diagnostics already
 /// go to stderr, so stdout carries nothing but the protocol.
@@ -317,12 +325,18 @@ fn run_serve(args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         (None, _) => None,
     };
 
-    viewer::run(viewer::ViewerOptions {
+    let options = viewer::ViewerOptions {
         document,
         start_page,
         control: Some(control::Control::stdio()),
         devtools: viewer::DevOptions::default(),
-    })
+        capture_unavailable: None,
+    };
+    if args.headless {
+        headless::run(options)
+    } else {
+        viewer::run(options)
+    }
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), Box<dyn Error>> {

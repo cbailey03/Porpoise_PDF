@@ -14,22 +14,26 @@ cargo run -p porpoise-app -- path/to/file.pdf                              # ope
 cargo run -p porpoise-app -- info path/to/file.pdf                         # page count / geometry
 cargo run -p porpoise-app -- render path/to/file.pdf --page 1 -o out.png   # rasterize one page
 cargo run -p porpoise-app -- serve path/to/file.pdf                        # stdio control protocol
+cargo run -p porpoise-app -- serve --headless path/to/file.pdf             # the same, with no window or display
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features                                      # unit + most integration tests
+cargo test --workspace --all-features                                      # unit, integration, and the headless e2e suite
 cargo test -p <crate> <test_name>                                          # a single test, e.g. -p porpoise-app page_one_is_index_zero
 
-PORPOISE_E2E=1 cargo test --workspace --all-features                       # also runs the windowed e2e tests (skipped otherwise)
+PORPOISE_E2E=1 cargo test --workspace --all-features                       # also runs the windowed smoke tests (skipped otherwise)
 cargo +1.92 check --workspace --all-features --all-targets                 # the MSRV floor still has to build
 cargo deny check bans licenses sources advisories                          # license allowlist
 cargo tree --package porpoise-app --edges normal | grep -iE "pdfium|mupdf|openjpeg|jpeg2k|jbig2dec|testkit"  # no output = pass
 ```
 
-The e2e suite (`crates/porpoise-app/tests/control.rs`) launches the real binary and opens a real
-window, so it needs a display and is skipped unless `PORPOISE_E2E=1` is set. A plain `cargo test`
-reports it as passing without running it. Those tests serialize themselves on an internal mutex
-(one window at a time), so no `--test-threads=1` is needed even though they're windowed.
+The e2e suite (`crates/porpoise-app/tests/control.rs`) launches the real binary as
+`porpoise serve --headless`, so a plain `cargo test` runs it with no display and nothing on screen.
+Its capture tests render off-screen and need a GPU or a software renderer (Mesa's llvmpipe). Three
+`_in_a_window` smoke tests repeat the parts only a real window exercises; they need a display and
+are skipped unless `PORPOISE_E2E=1` is set, so a plain `cargo test` reports them as passing without
+running them. The windowed ones serialize themselves on an internal mutex (one window at a time),
+so no `--test-threads=1` is needed; the headless ones run in parallel.
 
 ## Architecture
 

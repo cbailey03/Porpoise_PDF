@@ -101,6 +101,14 @@ cargo run -p porpoise-app -- render path/to/file.pdf --page 1 --dpi 150 -o page1
 `--dpi` is a friendlier spelling of `--scale` (`--scale 1.0` is 72 DPI); the two conflict and
 cannot be combined.
 
+Drive it from a script or an AI agent, with a window or without one (newline-delimited JSON on
+stdin and stdout; see [CONTRIBUTING.md](CONTRIBUTING.md#driving-it-from-another-program)):
+
+```bash
+cargo run -p porpoise-app -- serve path/to/file.pdf
+cargo run -p porpoise-app -- serve --headless path/to/file.pdf
+```
+
 ## License
 
 Licensed under either of

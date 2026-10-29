@@ -40,8 +40,10 @@ cargo deny check bans licenses sources advisories
 
 Three more that used to run only in CI, and are easy to forget for that reason.
 
-The end-to-end tests open a real window and are skipped unless asked for, so a plain `cargo test`
-reports them as passing without running them:
+The end-to-end tests run headless, so a plain `cargo test` already runs them with nothing on
+screen (their captures need a GPU or a software renderer such as Mesa's llvmpipe). Three smoke
+tests also run in a real window, to cover what headless skips. Those need a display and are
+skipped unless asked for, so a plain `cargo test` reports them as passing without running them:
 
 ```bash
 PORPOISE_E2E=1 cargo test --workspace --all-features
@@ -122,6 +124,7 @@ JSON on stdin, replying and reporting events on stdout:
 
 ```bash
 porpoise serve document.pdf
+porpoise serve --headless document.pdf   # the same, with no window or display
 ```
 
 ```text
@@ -138,7 +141,7 @@ Send `{"command":"commands"}` for the full list and `{"command":"snapshot"}` for
 current state. The file argument is optional - send `{"command":"open","path":"..."}`
 instead.
 
-Four things worth knowing:
+Five things worth knowing:
 
 - **Wait for `idle` before capturing or asserting.** It means nothing is queued and
   everything visible is drawn. Acting before it gets you placeholder tiles.
@@ -150,6 +153,10 @@ Four things worth knowing:
   protection a person does, for the same reason.
 - **Closing stdin exits the program**, the way every other stdio protocol behaves -
   including with unsaved changes, because by then there is nobody left to ask.
+- **`--headless` changes nothing but the window.** Every command takes the same path,
+  on a 1024x768 screen at 60 frames a second. `capture` renders off-screen, so it needs
+  a GPU or a software renderer such as Mesa's llvmpipe; with neither, it is refused
+  with the reason and everything else still works.
 
 This is off unless you ask for it, and it is stdio only - no port is opened. Be
 clear about what you are granting: the controlling process can open any file you can

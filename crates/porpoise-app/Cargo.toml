@@ -28,6 +28,7 @@ serde_json.workspace = true
 # plus AccessKit, so there is nothing to override.
 eframe.workspace = true
 rfd.workspace = true
+pollster.workspace = true
 
 [dev-dependencies]
 # Fixtures for the end-to-end control test. Dev-only, so it cannot reach the

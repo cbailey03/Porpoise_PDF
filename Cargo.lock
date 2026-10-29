@@ -2874,6 +2874,7 @@ dependencies = [
  "clap",
  "eframe",
  "png",
+ "pollster",
  "porpoise-doc",
  "porpoise-render",
  "porpoise-testkit",

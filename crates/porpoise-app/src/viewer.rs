@@ -283,6 +283,11 @@ pub(crate) struct ViewerOptions {
     pub(crate) control: Option<Control>,
     /// See [`DevOptions`].
     pub(crate) devtools: DevOptions,
+    /// Why capture cannot work in this process, if it cannot.
+    ///
+    /// Set by headless mode when no GPU or software renderer was found; the window path
+    /// always has one, so it always leaves this `None`.
+    pub(crate) capture_unavailable: Option<String>,
 }
 
 /// Opens the viewer window. Blocks until the window closes.
@@ -322,7 +327,7 @@ pub(crate) fn run(options: ViewerOptions) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-struct Viewer {
+pub(crate) struct Viewer {
     /// `None` until a document is opened.
     open: Option<OpenDocument>,
     /// Everything a command can change. The single source of truth for the view.
@@ -410,6 +415,8 @@ struct Viewer {
     benchmark: Option<ScrollBenchmark>,
     screenshot: Option<Screenshotter>,
     screenshot_outcome: ScreenshotOutcome,
+    /// See [`ViewerOptions::capture_unavailable`].
+    capture_unavailable: Option<String>,
     /// Set when asked to report launch-to-first-page; cleared once reported.
     first_page_from: Option<Instant>,
 
@@ -425,7 +432,7 @@ struct Viewer {
 }
 
 impl Viewer {
-    fn new(options: ViewerOptions, screenshot_outcome: ScreenshotOutcome) -> Self {
+    pub(crate) fn new(options: ViewerOptions, screenshot_outcome: ScreenshotOutcome) -> Self {
         let state = ViewState::new();
         let open = options
             .document
@@ -478,6 +485,7 @@ impl Viewer {
             benchmark,
             screenshot,
             screenshot_outcome,
+            capture_unavailable: options.capture_unavailable,
             first_page_from: options.devtools.report_first_page_from,
             control: options.control,
             pending_events: Vec::new(),
@@ -614,6 +622,10 @@ impl Viewer {
         if control.hung_up() {
             // Every other stdio protocol treats a closed stdin as "we are done".
             tracing::info!("control channel closed; exiting");
+            // Past the guard on purpose, as `confirm` records: there is nobody left to
+            // answer. Without this, `intercept_close` asked about unsaved changes and
+            // cancelled the close every frame, and a headless process never exited.
+            self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -854,6 +866,11 @@ impl Viewer {
                 DispatchResult::View(Outcome::Changed)
             }
             Command::Capture { path } => {
+                // Refused up front rather than started and left to time out: a capture
+                // that cannot happen should say so now, not after its frame budget.
+                if let Some(reason) = &self.capture_unavailable {
+                    return DispatchResult::Failed(reason.clone());
+                }
                 // Clear any previous result, so "the slot holds the outcome of the
                 // most recent capture" is true by construction rather than by an
                 // argument about when `drive_screenshot` happens to read it.
@@ -1941,11 +1958,18 @@ impl DispatchResult {
     }
 }
 
-impl eframe::App for Viewer {
-    // egui 0.34 replaced `App::update(ctx, frame)` with `App::ui(ui, frame)` plus
-    // this optional pre-pass. `logic` may not paint, which makes it the right
-    // place to absorb finished renders and drive the screenshot state machine.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+/// One frame, in two halves, for whoever is supplying frames.
+///
+/// Two callers: the `eframe::App` impl below, for a window, and [`crate::headless`],
+/// for no window at all. Neither half takes anything from eframe, which is what lets
+/// a headless process run exactly the code a window does.
+impl Viewer {
+    /// The half of a frame that may not paint.
+    ///
+    /// egui 0.34 replaced `App::update(ctx, frame)` with `App::ui(ui, frame)` plus an
+    /// optional `logic` pre-pass. This is that pre-pass: the right place to absorb
+    /// finished renders and drive the screenshot state machine.
+    pub(crate) fn frame_logic(&mut self, ctx: &egui::Context) {
         self.frame = self.frame.saturating_add(1);
         // `stable_dt` is the interval the user actually perceives, including any
         // wait for vsync - which is the number that decides whether scrolling
@@ -1977,7 +2001,8 @@ impl eframe::App for Viewer {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// The half of a frame that paints.
+    pub(crate) fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let started = Instant::now();
 
         // `TopBottomPanel` and `SidePanel` were unified into `Panel` in 0.34. The
@@ -2012,6 +2037,16 @@ impl eframe::App for Viewer {
         // Our own cost, as distinct from the frame interval. If this stays well
         // under the frame budget, the pipeline has headroom.
         self.timing.ui_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+}
+
+impl eframe::App for Viewer {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_logic(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame_ui(ui);
     }
 }
 
@@ -2112,5 +2147,35 @@ mod tests {
             !ctx.text_edit_focused(),
             "a focused button must not silence the keyboard"
         );
+    }
+
+    #[test]
+    fn capture_is_refused_when_it_is_unavailable() {
+        // Without this, a headless process with no GPU would accept the capture and
+        // then sit out the whole frame budget before admitting it never could.
+        let mut viewer = Viewer::new(
+            ViewerOptions {
+                document: None,
+                start_page: None,
+                control: None,
+                devtools: DevOptions::default(),
+                capture_unavailable: Some("no adapter".to_owned()),
+            },
+            Arc::new(Mutex::new(None)),
+        );
+        let path = std::env::temp_dir().join("porpoise-viewer-refused-capture.png");
+        let _ = std::fs::remove_file(&path);
+
+        let result = viewer.dispatch(
+            &egui::Context::default(),
+            Command::Capture { path: path.clone() },
+        );
+
+        assert_eq!(result, DispatchResult::Failed("no adapter".to_owned()));
+        assert!(
+            viewer.screenshot.is_none(),
+            "a refused capture still started"
+        );
+        assert!(!path.exists());
     }
 }
